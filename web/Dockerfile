@@ -38,11 +38,9 @@ RUN corepack enable
 
 # Install dependencies and build
 RUN yarn install --immutable
-RUN yarn build
 
 
 EXPOSE 3000
-
 ENV PORT=3000
 ENV HOSTNAME="0.0.0.0"
 
