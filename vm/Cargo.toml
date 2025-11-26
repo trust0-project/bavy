@@ -19,6 +19,13 @@ bincode = "1.3"
 sha2 = "0.10"
 wasm-bindgen = "0.2"
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tun-tap = "0.1"
+tungstenite = "0.21"
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 console_error_panic_hook = "0.1"
+web-sys = { version = "0.3", features = ["WebSocket", "MessageEvent", "BinaryType", "ErrorEvent", "CloseEvent"] }
+js-sys = "0.3"
+wasm-bindgen-futures = "0.4"
 

@@ -1,0 +1,17 @@
+[package]
+name = "net-relay"
+version = "0.1.0"
+edition = "2021"
+description = "WebSocket relay server for RISC-V VM networking"
+
+[workspace]
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.21"
+futures-util = "0.3"
+log = "0.4"
+env_logger = "0.10"
+clap = { version = "4.4", features = ["derive"] }
+socket2 = "0.5"
+

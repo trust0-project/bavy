@@ -157,6 +157,26 @@ impl SystemBus {
         }
         None
     }
+    
+    /// Check if an address is in the VirtIO MMIO region (even if no device present).
+    /// Returns the offset within the device region if in range.
+    fn is_virtio_region(&self, addr: u64) -> Option<u64> {
+        if addr >= VIRTIO_BASE && addr < VIRTIO_BASE + VIRTIO_STRIDE * 8 {
+            Some((addr - VIRTIO_BASE) % VIRTIO_STRIDE)
+        } else {
+            None
+        }
+    }
+    
+    /// Poll all VirtIO devices for pending work (e.g., incoming network packets).
+    /// Should be called periodically from the main emulation loop.
+    pub fn poll_virtio(&mut self) {
+        for device in &mut self.virtio_devices {
+            if let Err(e) = device.poll(&mut self.dram) {
+                log::warn!("[Bus] VirtIO poll error: {:?}", e);
+            }
+        }
+    }
 }
 
 impl Bus for SystemBus {
@@ -198,6 +218,11 @@ impl Bus for SystemBus {
             let word = self.virtio_devices[idx].read(aligned).map_err(|_| Trap::LoadAccessFault(addr))?;
             let shift = ((offset & 3) * 8) as u64;
             return Ok(((word >> shift) & 0xff) as u8);
+        }
+        
+        // Unmapped VirtIO slots return 0 (allows safe probing)
+        if self.is_virtio_region(addr).is_some() {
+            return Ok(0);
         }
 
         Err(Trap::LoadAccessFault(addr))
@@ -244,6 +269,11 @@ impl Bus for SystemBus {
             let shift = ((offset & 3) * 8) as u64;
             return Ok(((word >> shift) & 0xffff) as u16);
         }
+        
+        // Unmapped VirtIO slots return 0 (allows safe probing)
+        if self.is_virtio_region(addr).is_some() {
+            return Ok(0);
+        }
 
         Err(Trap::LoadAccessFault(addr))
     }
@@ -286,6 +316,11 @@ impl Bus for SystemBus {
         if let Some((idx, offset)) = self.get_virtio_device(addr) {
             let val = self.virtio_devices[idx].read(offset).map_err(|_| Trap::LoadAccessFault(addr))?;
             return Ok(val as u32);
+        }
+        
+        // Unmapped VirtIO slots return 0 (allows safe probing)
+        if self.is_virtio_region(addr).is_some() {
+            return Ok(0);
         }
 
         Err(Trap::LoadAccessFault(addr))
@@ -330,6 +365,11 @@ impl Bus for SystemBus {
             let low = self.virtio_devices[idx].read(offset).map_err(|_| Trap::LoadAccessFault(addr))?;
             let high = self.virtio_devices[idx].read(offset + 4).map_err(|_| Trap::LoadAccessFault(addr + 4))?;
             return Ok((low as u64) | ((high as u64) << 32));
+        }
+        
+        // Unmapped VirtIO slots return 0 (allows safe probing)
+        if self.is_virtio_region(addr).is_some() {
+            return Ok(0);
         }
 
         Err(Trap::LoadAccessFault(addr))
@@ -457,6 +497,11 @@ impl Bus for SystemBus {
                 .map_err(|_| Trap::StoreAccessFault(addr))?;
             return Ok(());
         }
+        
+        // Writes to unmapped VirtIO slots are silently ignored (allows safe probing)
+        if self.is_virtio_region(addr).is_some() {
+            return Ok(());
+        }
 
         Err(Trap::StoreAccessFault(addr))
     }
@@ -500,6 +545,11 @@ impl Bus for SystemBus {
         if let Some((_idx, _offset)) = self.get_virtio_device(addr) {
             // VirtIO registers are 32-bit. 64-bit writes are not typically supported directly via MMIO
             // except for legacy queue PFN which is 32-bit anyway.
+            return Ok(());
+        }
+        
+        // Writes to unmapped VirtIO slots are silently ignored (allows safe probing)
+        if self.is_virtio_region(addr).is_some() {
             return Ok(());
         }
 

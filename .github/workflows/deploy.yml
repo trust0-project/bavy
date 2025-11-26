@@ -25,7 +25,15 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ===== Rust Setup =====
+      # ===== Node.js Setup =====
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Enable Corepack (for Yarn)
+        run: corepack enable
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -42,50 +50,26 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      # ===== Build Custom Kernel =====
-      - name: Build custom kernel
-        run: |
-          cd kernel
-          cargo build --target riscv64gc-unknown-none-elf --release
-
-      # ===== Install wasm-pack =====
       - name: Install wasm-pack
         run: cargo install wasm-pack
 
-      # ===== Build WASM VM =====
-      - name: Build WASM VM
+      - name: Build
         run: |
-          cd vm
-          wasm-pack build --target web --out-dir ../web/src/pkg
+          sh build.sh
 
-      # ===== Copy artifacts to web/public =====
-      - name: Copy build artifacts
-        run: |
-          cp target/riscv64gc-unknown-none-elf/release/kernel web/public/custom_kernel
-          cp web/src/pkg/riscv_vm_bg.wasm web/public/riscv_vm_bg.wasm
-
-      # ===== Node.js Setup =====
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Enable Corepack (for Yarn)
-        run: corepack enable
 
       - name: Install dependencies
         working-directory: ./web
         run: yarn install --immutable
 
-      # ===== Build Next.js =====
       - name: Build Next.js site
         working-directory: ./web
         env:
           NODE_ENV: production
           GITHUB_REPOSITORY: ${{ github.repository }}
+          NEXT_PUBLIC_RELAY_URL: ${{ vars.RELAY_URL }}
         run: yarn build
 
-      # ===== Upload artifact =====
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:

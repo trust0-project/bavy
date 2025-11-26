@@ -79,6 +79,39 @@ pub fn write_u64(mut n: u64) {
     }
 }
 
+/// Write an unsigned integer in hexadecimal.
+pub fn write_hex(mut n: u64) {
+    let mut console = Console::new();
+    let hex_digits = b"0123456789abcdef";
+
+    if n == 0 {
+        console.write_byte(b'0');
+        return;
+    }
+
+    let mut buf = [0u8; 16]; // enough for u64 hex
+    let mut i = 0;
+
+    while n > 0 && i < buf.len() {
+        buf[i] = hex_digits[(n & 0xf) as usize];
+        n >>= 4;
+        i += 1;
+    }
+
+    while i > 0 {
+        i -= 1;
+        console.write_byte(buf[i]);
+    }
+}
+
+/// Write a single byte in hexadecimal (2 characters).
+pub fn write_hex_byte(b: u8) {
+    let mut console = Console::new();
+    let hex_digits = b"0123456789abcdef";
+    console.write_byte(hex_digits[(b >> 4) as usize]);
+    console.write_byte(hex_digits[(b & 0xf) as usize]);
+}
+
 #[macro_export]
 macro_rules! print {
     ($($arg:tt)*) => ({

@@ -1,56 +1,107 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { useVM, KernelType, VMStatus } from "../hooks/useVM";
+import { useVM, KernelType, VMStatus, NetworkStatus } from "../hooks/useVM";
 
-// Power icon SVG
-const PowerIcon = () => (
-  <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-    <path d="M12 2v10" strokeLinecap="round" />
-    <path d="M18.4 6.6a9 9 0 1 1-12.8 0" strokeLinecap="round" />
-  </svg>
-);
-
-// CPU chip icon
-const CpuIcon = () => (
-  <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-    <rect x="4" y="4" width="16" height="16" rx="2" stroke="currentColor" strokeWidth="1.5" fill="none" />
-    <rect x="8" y="8" width="8" height="8" rx="1" fill="currentColor" />
-    <path d="M9 1v3M15 1v3M9 20v3M15 20v3M1 9h3M1 15h3M20 9h3M20 15h3" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-  </svg>
-);
-
-// Memory chip icon
-const MemoryIcon = () => (
-  <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-    <rect x="2" y="6" width="20" height="12" rx="2" stroke="currentColor" strokeWidth="1.5" fill="none" />
-    <rect x="5" y="9" width="3" height="6" rx="0.5" fill="currentColor" />
-    <rect x="10" y="9" width="3" height="6" rx="0.5" fill="currentColor" />
-    <rect x="15" y="9" width="3" height="6" rx="0.5" fill="currentColor" />
-  </svg>
-);
-
-// Floppy disk icon
-const FloppyIcon = () => (
-  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
-    <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" />
-    <polyline points="17 21 17 13 7 13 7 21" />
-    <polyline points="7 3 7 8 15 8" />
-  </svg>
-);
-
-// RISC-V Logo/Badge
-const RiscVBadge = () => (
-  <div className="flex items-center gap-2">
-    <div className="w-8 h-8 rounded bg-gradient-to-br from-amber-600 to-amber-800 flex items-center justify-center shadow-lg">
-      <span className="text-white font-bold text-xs">RV</span>
+// 3D Computer SVG Component
+const Computer3D = ({ 
+  children, 
+  isOn, 
+  powerLed, 
+  actLed, 
+  netLed,
+  onPowerClick 
+}: { 
+  children: React.ReactNode;
+  isOn: boolean;
+  powerLed: string;
+  actLed: string;
+  netLed: string;
+  onPowerClick: () => void;
+}) => {
+  return (
+    <div className="computer-3d-container">
+      {/* Main monitor body */}
+      <div className="monitor-3d">
+        {/* Top face (creates depth) */}
+        <div className="monitor-top-face" />
+        
+        {/* Left face (creates depth) */}
+        <div className="monitor-left-face" />
+        
+        {/* Front face with screen */}
+        <div className="monitor-front-face">
+          {/* Bezel */}
+          <div className="monitor-bezel-3d">
+            {/* Screen area */}
+            <div className="screen-container-3d">
+              {children}
+            </div>
+          </div>
+          
+          {/* Bottom bezel with LEDs and brand */}
+          <div className="monitor-bottom-strip">
+            <div className="led-cluster">
+              <div className={`led-3d ${powerLed}`} title="Power" />
+              <div className={`led-3d ${actLed}`} title="Activity" />
+              <div className={`led-3d ${netLed}`} title="Network" />
+            </div>
+            <span className="brand-emboss">RISK-V</span>
+            <button 
+              onClick={onPowerClick}
+              className={`power-btn-3d ${isOn ? 'on' : ''}`}
+              title={isOn ? "Shutdown" : "Power On"}
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                <path d="M12 2v10" strokeLinecap="round" />
+                <path d="M18.4 6.6a9 9 0 1 1-12.8 0" strokeLinecap="round" />
+              </svg>
+            </button>
+          </div>
+        </div>
+      </div>
+      
+      {/* Stand/Neck */}
+      <div className="monitor-stand">
+        <div className="stand-neck" />
+        <div className="stand-base">
+          <div className="stand-base-top" />
+        </div>
+      </div>
     </div>
-    <div className="flex flex-col">
-      <span className="text-[10px] text-gray-500 leading-none">RISC-V</span>
-      <span className="text-[8px] text-gray-600 leading-none">64-bit</span>
-    </div>
-  </div>
-);
+  );
+};
+
+// Minimal network indicator
+const NetworkBadge = ({ status, enabled, onClick }: { 
+  status: NetworkStatus; 
+  enabled: boolean;
+  onClick: () => void;
+}) => {
+  const getStatusInfo = () => {
+    if (status === 'connected') return { color: '#22c55e', label: 'Connected' };
+    if (status === 'connecting') return { color: '#eab308', label: 'Connecting...' };
+    if (status === 'error') return { color: '#ef4444', label: 'Error' };
+    if (enabled) return { color: '#3b82f6', label: 'Ready' };
+    return { color: '#6b7280', label: 'Offline' };
+  };
+  
+  const { color, label } = getStatusInfo();
+  
+  return (
+    <button 
+      onClick={onClick}
+      className="network-badge"
+      title="Network settings"
+    >
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2">
+        <circle cx="12" cy="12" r="10" />
+        <path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" />
+      </svg>
+      <span style={{ color }}>{label}</span>
+    </button>
+  );
+};
 
 function getStatusLed(status: VMStatus): { power: string; activity: string } {
   switch (status) {
@@ -67,6 +118,16 @@ function getStatusLed(status: VMStatus): { power: string; activity: string } {
   }
 }
 
+function getNetworkLed(netStatus: NetworkStatus, vmStatus: VMStatus, netEnabled: boolean): string {
+  if (vmStatus === 'off' && netEnabled) return "led-on-blue";
+  switch (netStatus) {
+    case "connected": return "led-on-green";
+    case "connecting": return "led-on-amber";
+    case "error": return "led-on-red";
+    default: return "led-off";
+  }
+}
+
 export default function Home() {
   const { 
     output, 
@@ -77,18 +138,25 @@ export default function Home() {
     memUsage,
     currentKernel,
     startVM,
-    shutdownVM
+    shutdownVM,
+    networkStatus,
+    networkEnabled,
+    wsUrl,
+    updateWsUrl,
+    connectNetwork,
+    disconnectNetwork,
+    toggleNetworkEnabled,
   } = useVM();
   
   const endRef = useRef<HTMLDivElement>(null);
   const [selectedKernel, setSelectedKernel] = useState<KernelType>("custom_kernel");
+  const [showNetworkPanel, setShowNetworkPanel] = useState(false);
+  const [localWsUrl, setLocalWsUrl] = useState(wsUrl);
 
-  // Auto scroll
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [output]);
 
-  // Global key handler
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.metaKey || e.ctrlKey || e.altKey) return;
@@ -120,164 +188,169 @@ export default function Home() {
     }
   };
 
+  const handleNetworkToggle = () => {
+    if (status === 'off') {
+      updateWsUrl(localWsUrl);
+      toggleNetworkEnabled(!networkEnabled);
+    } else if (networkStatus === 'connected') {
+      disconnectNetwork();
+    } else if (networkStatus === 'disconnected' && status === 'running') {
+      updateWsUrl(localWsUrl);
+      connectNetwork(localWsUrl);
+    }
+  };
+
   const leds = getStatusLed(status);
+  const netLed = getNetworkLed(networkStatus, status, networkEnabled);
   const isOn = status === "running" || status === "booting";
 
   return (
-    <div className="min-h-screen flex items-center justify-center p-4 md:p-8">
-      {/* Computer Assembly */}
-      <div className="flex flex-col items-center gap-4">
-        
-        {/* Monitor */}
-        <div className="computer-case rounded-3xl p-6 md:p-8">
-          {/* Brand name */}
-          <div className="flex justify-between items-center mb-4 px-2">
-            <span className="brand-text text-sm md:text-base">RISK-V</span>
-            <RiscVBadge />
-          </div>
-
-          {/* Monitor bezel */}
-          <div className="monitor-bezel">
-            {/* CRT Screen */}
-            <div className="crt-screen w-[320px] h-[240px] md:w-[600px] md:h-[400px] lg:w-[720px] lg:h-[480px]">
-              {/* Screen content */}
-              <div 
-                className="screen-content h-full p-4 overflow-y-auto whitespace-pre-wrap break-all focus:outline-none"
-                tabIndex={0}
-              >
-                {status === "off" && (
-                  <div className="h-full flex items-center justify-center text-gray-600">
-                    <div className="text-center">
-                      <div className="text-2xl mb-2">⏻</div>
-                      <div className="text-sm">Press power to boot</div>
-                    </div>
+    <div className="scene">
+      {/* Ambient glow effects */}
+      <div className="ambient-glow" />
+      
+      <div className="content-wrapper">
+        <Computer3D 
+          isOn={isOn}
+          powerLed={leds.power}
+          actLed={leds.activity}
+          netLed={netLed}
+          onPowerClick={handlePowerClick}
+        >
+          {/* CRT Screen */}
+          <div className="crt-screen-3d">
+            <div className="screen-content-3d" tabIndex={0}>
+              {status === "off" && (
+                <div className="screen-off-state">
+                  <div className="boot-prompt">
+                    <span className="boot-icon">⏻</span>
+                    <span>Press power to boot</span>
                   </div>
-                )}
-                {status === "booting" && (
-                  <div className="h-full flex items-center justify-center">
-                    <div className="text-center">
-                      <div className="text-xl mb-2">Booting...</div>
-                      <div className="text-sm text-[var(--screen-green-dim)]">
-                        Loading {selectedKernel === "custom_kernel" ? "Custom Kernel" : "xv6 Linux"}
-                      </div>
-                    </div>
+                </div>
+              )}
+              {status === "booting" && (
+                <div className="screen-boot-state">
+                  <div className="boot-animation">
+                    <div className="boot-spinner" />
+                    <span>Booting {selectedKernel === "custom_kernel" ? "Custom Kernel" : "xv6"}...</span>
                   </div>
-                )}
-                {status === "error" && (
-                  <div className="h-full flex items-center justify-center text-red-500">
-                    <div className="text-center">
-                      <div className="text-xl mb-2">SYSTEM ERROR</div>
-                      <div className="text-sm">{errorMessage}</div>
-                      <div className="text-xs mt-4 text-gray-500">Press power to restart</div>
-                    </div>
-                  </div>
-                )}
-                {status === "running" && (
-                  <>
-                    {output}
-                    <span className="cursor-blink">█</span>
-                    <div ref={endRef} />
-                  </>
-                )}
-              </div>
+                </div>
+              )}
+              {status === "error" && (
+                <div className="screen-error-state">
+                  <span className="error-icon">⚠</span>
+                  <span className="error-title">SYSTEM ERROR</span>
+                  <span className="error-msg">{errorMessage}</span>
+                  <span className="error-hint">Press power to restart</span>
+                </div>
+              )}
+              {status === "running" && (
+                <>
+                  {output}
+                  <span className="cursor-blink">█</span>
+                  <div ref={endRef} />
+                </>
+              )}
             </div>
           </div>
+        </Computer3D>
 
-          {/* Monitor controls */}
-          <div className="flex items-center justify-between mt-4 px-2">
-            {/* Left side - Status LEDs */}
-            <div className="flex items-center gap-4">
-              <div className="flex items-center gap-2">
-                <div className={`led ${leds.power}`} />
-                <span className="label-text">PWR</span>
-              </div>
-              <div className="flex items-center gap-2">
-                <div className={`led ${leds.activity}`} />
-                <span className="label-text">ACT</span>
-              </div>
-            </div>
+        {/* Control Panel (below computer) */}
+        <div className="control-panel">
+          {/* Kernel selector */}
+          <div className="control-group">
+            <label className="control-label">BOOT</label>
+            <select
+              value={selectedKernel}
+              onChange={(e) => setSelectedKernel(e.target.value as KernelType)}
+              disabled={isOn}
+              className="kernel-select-3d"
+            >
+              <option value="custom_kernel">Custom Kernel</option>
+              <option value="kernel">xv6 Linux</option>
+            </select>
+          </div>
 
-            {/* Center - Model info */}
-            <div className="hidden md:flex flex-col items-center">
-              <span className="label-text">MODEL VM-64</span>
+          {/* Stats */}
+          <div className="stats-group">
+            <div className="stat-item">
+              <span className="stat-label">CPU</span>
+              <div className="stat-bar">
+                <div className="stat-fill cpu" style={{ width: `${cpuLoad}%` }} />
+              </div>
+              <span className="stat-value">{cpuLoad.toFixed(0)}%</span>
             </div>
+            <div className="stat-item">
+              <span className="stat-label">MEM</span>
+              <div className="stat-bar">
+                <div className="stat-fill mem" style={{ width: `${Math.min(100, (memUsage / (128 * 1024 * 1024)) * 100)}%` }} />
+              </div>
+              <span className="stat-value">{(memUsage / (1024 * 1024)).toFixed(0)}M</span>
+            </div>
+          </div>
 
-            {/* Right side - Performance stats */}
-            <div className="flex items-center gap-4">
-              <div className="flex items-center gap-1 text-xs text-gray-600">
-                <CpuIcon />
-                <span className="font-mono">{cpuLoad.toFixed(0)}%</span>
-              </div>
-              <div className="flex items-center gap-1 text-xs text-gray-600">
-                <MemoryIcon />
-                <span className="font-mono">{(memUsage / (1024 * 1024)).toFixed(0)}M</span>
-              </div>
-            </div>
+          {/* Network */}
+          <div className="control-group">
+            <NetworkBadge 
+              status={networkStatus} 
+              enabled={networkEnabled}
+              onClick={() => setShowNetworkPanel(!showNetworkPanel)}
+            />
           </div>
         </div>
 
-        {/* Base Unit */}
-        <div className="computer-case rounded-2xl p-4 md:p-6 w-full max-w-[320px] md:max-w-[600px] lg:max-w-[720px]">
-          <div className="flex items-center justify-between">
-            {/* Left - Floppy drive / Kernel selector */}
-            <div className="flex items-center gap-3">
-              <div className="floppy-slot w-32 md:w-40 h-8 flex items-center px-2">
-                <select
-                  value={selectedKernel}
-                  onChange={(e) => setSelectedKernel(e.target.value as KernelType)}
+        {/* Network Panel (expandable) */}
+        {showNetworkPanel && (
+          <div className="network-panel">
+            <div className="network-panel-header">
+              <span className="network-panel-title">Network Configuration</span>
+              <button onClick={() => setShowNetworkPanel(false)} className="close-btn">×</button>
+            </div>
+            <div className="network-panel-body">
+              <div className="network-row">
+                <label>Relay URL</label>
+                <input
+                  type="text"
+                  value={localWsUrl}
+                  onChange={(e) => setLocalWsUrl(e.target.value)}
                   disabled={isOn}
-                  className="kernel-select w-full h-6 text-xs disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  <option value="custom_kernel">Custom Kernel</option>
-                  <option value="kernel">xv6 Linux</option>
-                </select>
+                  placeholder="ws://localhost:8765"
+                  className="network-input"
+                />
               </div>
-              <div className="hidden md:flex items-center gap-1 text-gray-500">
-                <FloppyIcon />
-                <span className="label-text">BOOT</span>
-              </div>
-            </div>
-
-            {/* Center - Vent grille */}
-            <div className="hidden lg:block vent-grille w-32 h-8" />
-
-            {/* Right - Power button */}
-            <div className="flex items-center gap-3">
-              <span className="label-text hidden md:inline">POWER</span>
-              <button
-                onClick={handlePowerClick}
-                className={`power-button ${isOn ? "on" : ""}`}
-                title={isOn ? "Shut down" : "Power on"}
-              >
-                <span className={isOn ? "text-green-400" : "text-gray-400"}>
-                  <PowerIcon />
+              <div className="network-row">
+                <span className="network-status-text">
+                  {status === 'off' 
+                    ? (networkEnabled ? '✓ Will connect on boot' : '○ Disabled')
+                    : networkStatus === 'connected' ? '● Connected' : '○ Disconnected'
+                  }
                 </span>
-              </button>
+                <button
+                  onClick={handleNetworkToggle}
+                  disabled={networkStatus === 'connecting'}
+                  className={`network-toggle-btn ${networkEnabled || networkStatus === 'connected' ? 'active' : ''}`}
+                >
+                  {status === 'off' 
+                    ? (networkEnabled ? 'Disable' : 'Enable')
+                    : (networkStatus === 'connected' ? 'Disconnect' : 'Connect')}
+                </button>
+              </div>
             </div>
           </div>
+        )}
 
-          {/* Bottom label */}
-          <div className="flex justify-center mt-3">
-            <div className="flex items-center gap-2 text-[10px] text-gray-500">
-              <span>RISC-V 64-BIT VIRTUAL MACHINE</span>
-              <span>•</span>
-              <span>128 MiB RAM</span>
-              <span>•</span>
-              <span>{currentKernel === "kernel" ? "xv6" : currentKernel === "custom_kernel" ? "Custom" : "No OS"}</span>
-            </div>
-          </div>
-        </div>
-
-        {/* Instructions */}
-        <div className="text-center text-gray-500 text-xs mt-2 max-w-md">
-          {status === "running" ? (
-            <span>Type anywhere to send input to the VM. Press power button to shut down.</span>
-          ) : status === "off" ? (
-            <span>Select a kernel and press the power button to boot the virtual machine.</span>
-          ) : status === "booting" ? (
-            <span>System is starting up...</span>
-          ) : (
-            <span>An error occurred. Press power to restart.</span>
+        {/* Footer info */}
+        <div className="footer-info">
+          <span>RISC-V 64-bit</span>
+          <span className="sep">•</span>
+          <span>128 MiB</span>
+          <span className="sep">•</span>
+          <span>{currentKernel === "kernel" ? "xv6" : currentKernel === "custom_kernel" ? "Custom" : "Ready"}</span>
+          {networkStatus === 'connected' && (
+            <>
+              <span className="sep">•</span>
+              <span className="net-active">Online</span>
+            </>
           )}
         </div>
       </div>

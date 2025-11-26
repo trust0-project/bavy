@@ -1,1 +1,3 @@
 target
+public/*.wasm
+public/custom_kernel

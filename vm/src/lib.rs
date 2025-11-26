@@ -7,11 +7,16 @@ pub mod dram;
 pub mod clint;
 pub mod plic;
 pub mod uart;
+pub mod net;
+pub mod net_ws;
 pub mod virtio;
 pub mod emulator;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod console;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod net_tap;
 
 use serde::{Deserialize, Serialize};
 
@@ -22,12 +27,25 @@ use wasm_bindgen::prelude::*;
 #[cfg(target_arch = "wasm32")]
 use crate::bus::{SystemBus, DRAM_BASE};
 
+/// Network connection status for the WASM VM.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum NetworkStatus {
+    Disconnected = 0,
+    Connecting = 1,
+    Connected = 2,
+    Error = 3,
+}
+
 /// WASM-exposed VM wrapper for running RISC-V kernels in the browser.
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub struct WasmVm {
     bus: SystemBus,
     cpu: cpu::Cpu,
+    net_status: NetworkStatus,
+    poll_counter: u32,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -39,7 +57,7 @@ impl WasmVm {
         // Set up panic hook for better error messages in the browser console
         console_error_panic_hook::set_once();
 
-        const DRAM_SIZE: usize = 128 * 1024 * 1024; // 128 MiB
+        const DRAM_SIZE: usize = 512 * 1024 * 1024; // 512 MiB
         let mut bus = SystemBus::new(DRAM_BASE, DRAM_SIZE);
         
         // Check if it's an ELF file and load appropriately
@@ -57,7 +75,12 @@ impl WasmVm {
 
         let cpu = cpu::Cpu::new(entry_pc);
 
-        Ok(WasmVm { bus, cpu })
+        Ok(WasmVm { 
+            bus, 
+            cpu, 
+            net_status: NetworkStatus::Disconnected,
+            poll_counter: 0,
+        })
     }
 
     /// Load a disk image and attach it as a VirtIO block device.
@@ -67,8 +90,45 @@ impl WasmVm {
         self.bus.virtio_devices.push(Box::new(vblk));
     }
 
+    /// Connect to a WebSocket relay server for networking.
+    /// The URL should be like "ws://localhost:8765".
+    pub fn connect_network(&mut self, ws_url: &str) -> Result<(), JsValue> {
+        use crate::net_ws::WsBackend;
+        use crate::virtio::VirtioNet;
+        
+        self.net_status = NetworkStatus::Connecting;
+        
+        let backend = WsBackend::new(ws_url);
+        let mut vnet = VirtioNet::new(Box::new(backend));
+        vnet.debug = false; // Set to true for debugging
+        
+        self.bus.virtio_devices.push(Box::new(vnet));
+        self.net_status = NetworkStatus::Connected;
+        
+        Ok(())
+    }
+    
+    /// Disconnect from the network.
+    pub fn disconnect_network(&mut self) {
+        // Remove VirtioNet devices (device_id == 1)
+        self.bus.virtio_devices.retain(|dev| dev.device_id() != 1);
+        self.net_status = NetworkStatus::Disconnected;
+    }
+    
+    /// Get the current network connection status.
+    pub fn network_status(&self) -> NetworkStatus {
+        self.net_status
+    }
+
     /// Execute a single instruction.
     pub fn step(&mut self) {
+        // Poll VirtIO devices periodically for incoming network packets
+        // Poll every 100 instructions for good network responsiveness
+        self.poll_counter = self.poll_counter.wrapping_add(1);
+        if self.poll_counter % 100 == 0 {
+            self.bus.poll_virtio();
+        }
+        
         // Ignore traps for now - the kernel handles them
         let _ = self.cpu.step(&mut self.bus);
     }

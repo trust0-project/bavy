@@ -2,9 +2,9 @@ MEMORY
 {
     /* 
      * RAM starts at 0x80000000.
-     * We allocate 128MB to match the VM's DRAM size.
+     * We allocate 512MB to match the VM's DRAM size.
      */
-    RAM : ORIGIN = 0x80000000, LENGTH = 128M
+    RAM : ORIGIN = 0x80000000, LENGTH = 512M
 }
 
 REGION_ALIAS("REGION_TEXT", RAM);

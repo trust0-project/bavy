@@ -1,62 +1,35 @@
-use core::alloc::{GlobalAlloc, Layout};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use linked_list_allocator::LockedHeap;
 
 unsafe extern "C" {
     static mut _sheap: u8;
     static mut _eheap: u8;
 }
 
-static HEAP_PTR: AtomicUsize = AtomicUsize::new(0);
-static HEAP_START: AtomicUsize = AtomicUsize::new(0);
-static HEAP_END: AtomicUsize = AtomicUsize::new(0);
+#[global_allocator]
+static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
+/// Initialize the heap allocator.
+/// Must be called before any heap allocations occur.
 pub fn init() {
     unsafe {
-        let start = _sheap as *const u8 as usize;
-        let end = _eheap as *const u8 as usize;
-        HEAP_START.store(start, Ordering::Relaxed);
-        HEAP_END.store(end, Ordering::Relaxed);
-        HEAP_PTR.store(start, Ordering::Relaxed);
+        let heap_start = &raw mut _sheap as *mut u8;
+        let heap_end = &raw const _eheap as usize;
+        let heap_size = heap_end - (heap_start as usize);
+        ALLOCATOR.lock().init(heap_start, heap_size);
     }
 }
 
-pub struct BumpAllocator;
-
-#[inline]
-fn align_up(addr: usize, align: usize) -> usize {
-    let mask = align - 1;
-    (addr + mask) & !mask
+/// Returns (used, free) bytes in the heap, if the allocator supports introspection.
+pub fn heap_stats() -> (usize, usize) {
+    let allocator = ALLOCATOR.lock();
+    let used = allocator.used();
+    let free = allocator.free();
+    (used, free)
 }
 
-unsafe impl GlobalAlloc for BumpAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let _start = HEAP_START.load(Ordering::Relaxed);
-        let end = HEAP_END.load(Ordering::Relaxed);
-
-        loop {
-            let current = HEAP_PTR.load(Ordering::Relaxed);
-            let aligned = align_up(current, layout.align());
-            let next = match aligned.checked_add(layout.size()) {
-                Some(n) => n,
-                None => return core::ptr::null_mut(),
-            };
-            if next > end {
-                return core::ptr::null_mut();
-            }
-            if HEAP_PTR
-                .compare_exchange(current, next, Ordering::SeqCst, Ordering::Relaxed)
-                .is_ok()
-            {
-                return aligned as *mut u8;
-            }
-        }
-    }
-
-    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
-        // No-op: simple bump allocator does not support free.
-        // Optionally, could report here as well, but we keep usage monotonic.
-    }
+/// Returns the total heap size.
+pub fn heap_size() -> usize {
+    let heap_start = &raw const _sheap as usize;
+    let heap_end = &raw const _eheap as usize;
+    heap_end - heap_start
 }
-
-#[global_allocator]
-static GLOBAL_ALLOCATOR: BumpAllocator = BumpAllocator;

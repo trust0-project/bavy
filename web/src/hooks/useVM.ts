@@ -1,10 +1,14 @@
 import { useRef, useState, useCallback } from 'react';
 import init, { WasmVm } from '../pkg/riscv_vm';
 
-export type KernelType = 'custom_kernel' | 'kernel';
+export type KernelType = 'custom' | 'kernel';
 export type VMStatus = 'off' | 'booting' | 'running' | 'error';
+export type NetworkStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
 
 let wasmInitialized = false;
+
+// Default relay server URL
+const DEFAULT_WS_URL = process.env.NEXT_PUBLIC_RELAY_URL || 'ws://localhost:8765';
 
 // Get the base path for assets (handles GitHub Pages deployment)
 function getBasePath(): string {
@@ -35,6 +39,11 @@ export function useVM() {
   const [memUsage, setMemUsage] = useState<number>(0);
   const [currentKernel, setCurrentKernel] = useState<KernelType | null>(null);
   const activeRef = useRef<boolean>(false);
+  
+  // Network state - enabled by default for better UX
+  const [networkStatus, setNetworkStatus] = useState<NetworkStatus>("disconnected");
+  const [wsUrl, setWsUrl] = useState<string>(DEFAULT_WS_URL);
+  const [networkEnabled, setNetworkEnabled] = useState<boolean>(true);
 
   const loop = useCallback(() => {
     const vm = vmRef.current;
@@ -117,7 +126,7 @@ export function useVM() {
       }
 
       // Load kernel
-      const kernelRes = await fetch(assetPath(`/${kernelType}`));
+      const kernelRes = await fetch(assetPath(`/images/${kernelType}/kernel`));
       if (!kernelRes.ok) throw new Error(`Failed to load kernel: ${kernelRes.statusText}`);
       const kernelBuf = await kernelRes.arrayBuffer();
       const kernelBytes = new Uint8Array(kernelBuf);
@@ -127,7 +136,7 @@ export function useVM() {
       // Load disk image for xv6 kernel
       if (kernelType === 'kernel') {
         try {
-          const diskRes = await fetch(assetPath('/fs.img'));
+          const diskRes = await fetch(assetPath('/images/fs.img'));
           if (diskRes.ok) {
             const diskBuf = await diskRes.arrayBuffer();
             const diskBytes = new Uint8Array(diskBuf);
@@ -135,6 +144,21 @@ export function useVM() {
           }
         } catch {
           // Disk image not available, continue without it
+        }
+      }
+      
+      // Connect network BEFORE starting execution (so kernel sees VirtIO device at boot)
+      if (networkEnabled) {
+        try {
+          const anyVm = vm;
+          if (typeof anyVm.connect_network === 'function') {
+            anyVm.connect_network(wsUrl);
+            setNetworkStatus('connected');
+            console.log(`[Network] Connected to ${wsUrl} (pre-boot)`);
+          }
+        } catch (err: any) {
+          console.warn('[Network] Pre-boot connection failed:', err);
+          setNetworkStatus('error');
         }
       }
 
@@ -148,7 +172,7 @@ export function useVM() {
       setStatus('error');
       setErrorMessage(err.message || String(err));
     }
-  }, [loop]);
+  }, [loop, networkEnabled, wsUrl]);
 
   const shutdownVM = useCallback(() => {
     activeRef.current = false;
@@ -163,6 +187,7 @@ export function useVM() {
     setMemUsage(0);
     setCurrentKernel(null);
     setErrorMessage("");
+    setNetworkStatus("disconnected");
   }, []);
 
   const sendInput = useCallback((key: string) => {
@@ -186,6 +211,66 @@ export function useVM() {
     }
   }, [status]);
 
+  // Connect to network relay server
+  const connectNetwork = useCallback((url?: string) => {
+    const vm = vmRef.current;
+    if (!vm || status !== 'running') {
+      console.warn('Cannot connect network: VM not running');
+      return;
+    }
+
+    const targetUrl = url || wsUrl;
+    setNetworkStatus('connecting');
+    
+    try {
+      // Check if the method exists on the VM
+      const anyVm = vm as any;
+      if (typeof anyVm.connect_network === 'function') {
+        anyVm.connect_network(targetUrl);
+        setNetworkStatus('connected');
+        console.log(`[Network] Connected to ${targetUrl}`);
+      } else {
+        console.warn('[Network] connect_network method not available - rebuild WASM');
+        setNetworkStatus('error');
+      }
+    } catch (err: any) {
+      console.error('[Network] Connection error:', err);
+      setNetworkStatus('error');
+    }
+  }, [status, wsUrl]);
+
+  // Disconnect from network
+  const disconnectNetwork = useCallback(() => {
+    const vm = vmRef.current;
+    if (!vm) return;
+
+    try {
+      const anyVm = vm;
+      if (typeof anyVm.disconnect_network === 'function') {
+        anyVm.disconnect_network();
+        setNetworkStatus('disconnected');
+        console.log('[Network] Disconnected');
+      }
+    } catch (err: any) {
+      console.error('[Network] Disconnect error:', err);
+    }
+  }, []);
+
+  // Update WebSocket URL
+  const updateWsUrl = useCallback((url: string) => {
+    setWsUrl(url);
+  }, []);
+
+  // Toggle network enabled (before boot)
+  const toggleNetworkEnabled = useCallback((enabled: boolean) => {
+    if (status === 'off') {
+      setNetworkEnabled(enabled);
+      if (!enabled) {
+        setNetworkStatus('disconnected');
+      }
+    }
+  }, [status]);
+
   return { 
     output, 
     status, 
@@ -195,6 +280,14 @@ export function useVM() {
     memUsage, 
     currentKernel,
     startVM,
-    shutdownVM
+    shutdownVM,
+    // Network exports
+    networkStatus,
+    networkEnabled,
+    wsUrl,
+    updateWsUrl,
+    connectNetwork,
+    disconnectNetwork,
+    toggleNetworkEnabled,
   };
 }

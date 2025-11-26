@@ -390,6 +390,7 @@ grep -A 50 "^[0-9a-f]* <scheduler>:" xv6/kernel.asm
 ```bash
 # Run with trace logging
 RUST_LOG=trace cargo run --release -- --kernel xv6/kernel --disk xv6/fs.img
+RUST_LOG=trace cargo run --release -- --kernel target/riscv64gc-unknown-none-elf/release/kernel
 ```
 
 ### Common Issues

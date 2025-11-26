@@ -28,6 +28,20 @@ struct Args {
     /// Optional path to a VirtIO Block disk image (e.g. xv6 fs.img)
     #[arg(long)]
     disk: Option<PathBuf>,
+
+    /// Optional TAP interface name for VirtIO network device (e.g. tap0)
+    /// Requires the interface to exist: sudo ip tuntap add dev tap0 mode tap
+    #[arg(long)]
+    net_tap: Option<String>,
+
+    /// Enable VirtIO network device with a dummy backend (for testing, no actual packets)
+    #[arg(long)]
+    net_dummy: bool,
+
+    /// Connect to a WebSocket server for networking (e.g. ws://localhost:8765)
+    /// Works on macOS and in browser/WASM
+    #[arg(long)]
+    net_ws: Option<String>,
 }
 
 // Debug helper: dump VirtIO MMIO identity registers expected by xv6.
@@ -71,6 +85,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let vblk = riscv_vm::virtio::VirtioBlock::new(disk_buf);
         bus.virtio_devices.push(Box::new(vblk));
         println!("VirtIO Block device attached at 0x1000_1000 (IRQ 1)");
+    }
+
+    // If a TAP interface is provided, wire up VirtIO Net with TAP backend
+    if let Some(tap_name) = &args.net_tap {
+        let tap_backend = riscv_vm::net_tap::TapBackend::new(tap_name);
+        let vnet = riscv_vm::virtio::VirtioNet::new(Box::new(tap_backend));
+        let device_idx = bus.virtio_devices.len();
+        let irq = 1 + device_idx; // IRQ 1 for first device, 2 for second, etc.
+        bus.virtio_devices.push(Box::new(vnet));
+        let base_addr = 0x1000_1000 + (device_idx as u64) * 0x1000;
+        println!("VirtIO Net device (TAP: {}) attached at 0x{:x} (IRQ {})", tap_name, base_addr, irq);
+    } else if let Some(ws_url) = &args.net_ws {
+        // Wire up VirtIO Net with WebSocket backend
+        let ws_backend = riscv_vm::net_ws::WsBackend::new(ws_url);
+        let vnet = riscv_vm::virtio::VirtioNet::new(Box::new(ws_backend));
+        let device_idx = bus.virtio_devices.len();
+        let irq = 1 + device_idx;
+        bus.virtio_devices.push(Box::new(vnet));
+        let base_addr = 0x1000_1000 + (device_idx as u64) * 0x1000;
+        println!("VirtIO Net device (WebSocket: {}) attached at 0x{:x} (IRQ {})", ws_url, base_addr, irq);
+    } else if args.net_dummy {
+        // Wire up VirtIO Net with dummy backend (for testing)
+        let dummy_backend = riscv_vm::net::DummyBackend::new();
+        let vnet = riscv_vm::virtio::VirtioNet::new(Box::new(dummy_backend));
+        let device_idx = bus.virtio_devices.len();
+        let irq = 1 + device_idx;
+        bus.virtio_devices.push(Box::new(vnet));
+        let base_addr = 0x1000_1000 + (device_idx as u64) * 0x1000;
+        println!("VirtIO Net device (Dummy) attached at 0x{:x} (IRQ {})", base_addr, irq);
     }
 
     let entry_pc = if buffer.starts_with(b"\x7FELF") {
@@ -133,6 +176,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let step_result = cpu.step(&mut bus);
         step_count += 1;
+        
+        // Poll VirtIO devices for incoming network packets every 100 instructions
+        // More frequent polling improves network responsiveness for interactive protocols
+        if step_count % 100 == 0 {
+            bus.poll_virtio();
+        }
         
         // Progress report every 10M instructions (not every instruction!)
         if step_count - last_report_step >= 10_000_000 {
