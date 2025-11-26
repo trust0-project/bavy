@@ -1,6 +1,8 @@
 FROM node:20-slim AS web-builder
 
 ENV NODE_ENV=production
+ARG NEXT_PUBLIC_RELAY_URL=ws://localhost:8765
+ENV NEXT_PUBLIC_RELAY_URL=${NEXT_PUBLIC_RELAY_URL}
 
 # Install dependencies
 RUN apt-get update && apt-get install -y \
