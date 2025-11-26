@@ -6,6 +6,10 @@ const repoName = process.env.GITHUB_REPOSITORY?.split("/")[1] || "risk-v";
 const nextConfig: NextConfig = {
   // Enable static export for GitHub Pages
   output: "export",
+
+  env: {
+    NEXT_PUBLIC_RELAY_URL: process.env.NEXT_PUBLIC_RELAY_URL,
+  },
   
   // Set base path for GitHub Pages (repo name)
   basePath: isProd ? `/${repoName}` : "",
