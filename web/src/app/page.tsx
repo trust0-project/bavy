@@ -149,7 +149,7 @@ export default function Home() {
   } = useVM();
   
   const endRef = useRef<HTMLDivElement>(null);
-  const [selectedKernel, setSelectedKernel] = useState<KernelType>("custom_kernel");
+  const [selectedKernel, setSelectedKernel] = useState<KernelType>("custom");
   const [showNetworkPanel, setShowNetworkPanel] = useState(false);
   const [localWsUrl, setLocalWsUrl] = useState(wsUrl);
 
