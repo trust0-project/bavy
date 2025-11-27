@@ -1,7 +1,7 @@
 FROM node:20-slim AS web-builder
 
 ENV NODE_ENV=production
-ARG NEXT_PUBLIC_RELAY_URL=https://localhost:4433
+ARG NEXT_PUBLIC_RELAY_URL=
 ARG NEXT_PUBLIC_RELAY_CERT_HASH=
 ENV NEXT_PUBLIC_RELAY_URL=${NEXT_PUBLIC_RELAY_URL}
 ENV NEXT_PUBLIC_RELAY_CERT_HASH=${NEXT_PUBLIC_RELAY_CERT_HASH}
@@ -27,9 +27,9 @@ RUN rustup target add riscv64gc-unknown-none-elf
 
 WORKDIR /app
 
-# Copy local project into the container (expect build context to be repo root)
-COPY . .
 
+# Copy entire project
+RUN git clone https://github.com/elribonazo/riscv-vm.git .
 # Build kernel and VM (WASM)
 RUN chmod +x build.sh && ./build.sh
 
