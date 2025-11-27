@@ -41,6 +41,16 @@ struct Args {
     #[arg(short, long, default_value = "0.0.0.0")]
     bind: String,
 
+    /// Path to TLS certificate PEM file (optional). If not set, a self-signed
+    /// certificate will be generated on startup.
+    #[arg(long, env = "RELAY_CERT_PEM")]
+    cert_pem: Option<String>,
+
+    /// Path to TLS private key PEM file (optional). Must be provided when
+    /// using --cert-pem/RELAY_CERT_PEM.
+    #[arg(long, env = "RELAY_KEY_PEM")]
+    key_pem: Option<String>,
+
     /// Heartbeat interval in seconds
     #[arg(long, default_value_t = 30)]
     heartbeat_interval: u64,
@@ -48,6 +58,27 @@ struct Args {
     /// Peer timeout in seconds
     #[arg(long, default_value_t = 90)]
     peer_timeout: u64,
+}
+
+/// Build the TLS identity either from provided PEM files (certificate + key) or
+/// by generating a new self-signed certificate.
+async fn build_identity(args: &Args) -> Result<Identity> {
+    if let (Some(cert_pem), Some(key_pem)) = (&args.cert_pem, &args.key_pem) {
+        info!(
+            "Loading TLS identity from PEM files: cert='{}', key='{}'",
+            cert_pem, key_pem
+        );
+        let identity = Identity::load_pemfiles(cert_pem, key_pem).await?;
+        Ok(identity)
+    } else if args.cert_pem.is_some() || args.key_pem.is_some() {
+        anyhow::bail!(
+            "Both --cert-pem/RELAY_CERT_PEM and --key-pem/RELAY_KEY_PEM must be set \
+             to use a custom certificate"
+        );
+    } else {
+        info!("No certificate/key provided; generating ephemeral self-signed identity");
+        Ok(Identity::self_signed(["localhost", "127.0.0.1", "::1"])?)
+    }
 }
 
 #[tokio::main]
@@ -64,8 +95,8 @@ async fn main() -> Result<()> {
     info!("Starting P2P WebTransport Relay Server...");
     info!("Virtual Network: 10.0.2.0/24, Gateway: 10.0.2.2");
 
-    // Generate self-signed certificate
-    let identity = Identity::self_signed(["localhost", "127.0.0.1", "::1"])?;
+    // Load a provided TLS identity or generate a self-signed one
+    let identity = build_identity(&args).await?;
     let cert_hash = identity
         .certificate_chain()
         .as_slice()
@@ -73,7 +104,7 @@ async fn main() -> Result<()> {
         .unwrap()
         .hash();
     // Format hash without colons for easy copy-paste
-    let cert_hash_hex = format!("{}", cert_hash).replace(":", "");
+    let cert_hash_hex = format!("{}", cert_hash);
     info!("Certificate Hash: {}", cert_hash_hex);
     info!("Use this hash with --net-cert-hash when connecting");
 
