@@ -66,31 +66,8 @@ jobs:
           toolchain: stable
           targets: wasm32-unknown-unknown
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          registry-url: 'https://registry.npmjs.org'
-
-      - name: Enable Corepack
-        run: corepack enable
-
-      - name: Install wasm-pack
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
-
-      - name: Install dependencies
-        run: cd riscv-vm && yarn install
-
-      - name: Update version
-        run: |
-          cd riscv-vm
-          npm version ${{ inputs.version }} --no-git-tag-version
-
-      - name: Build JS/Wasm
-        run: |
-          cd riscv-vm
-          chmod +x build.sh
-          ./build.sh
+      - name: Build 
+        run: cargo build -p riscv-vm --release
 
   create-release:
     needs: [build-binaries, publish-npm]
