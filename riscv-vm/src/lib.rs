@@ -9,6 +9,7 @@ pub mod plic;
 pub mod uart;
 pub mod net;
 pub mod net_ws;
+pub mod net_webtransport;
 pub mod virtio;
 pub mod emulator;
 
@@ -17,9 +18,6 @@ pub mod console;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod net_tap;
-
-#[cfg(not(target_arch = "wasm32"))]
-pub mod net_libp2p;
 
 use serde::{Deserialize, Serialize};
 
@@ -111,6 +109,25 @@ impl WasmVm {
         Ok(())
     }
     
+    /// Connect to a WebTransport relay server.
+    pub fn connect_webtransport(&mut self, url: &str, cert_hash: Option<String>) -> Result<(), JsValue> {
+        use crate::net_webtransport::WebTransportBackend;
+        use crate::virtio::VirtioNet;
+
+        self.net_status = NetworkStatus::Connecting;
+
+        let backend = WebTransportBackend::new(url, cert_hash);
+        // Note: WebTransport connect is async, so backend.init() will start connection
+        // but actual connection happens in background.
+        let mut vnet = VirtioNet::new(Box::new(backend));
+        vnet.debug = false;
+
+        self.bus.virtio_devices.push(Box::new(vnet));
+        self.net_status = NetworkStatus::Connected;
+
+        Ok(())
+    }
+
     /// Disconnect from the network.
     pub fn disconnect_network(&mut self) {
         // Remove VirtioNet devices (device_id == 1)

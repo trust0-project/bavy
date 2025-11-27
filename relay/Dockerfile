@@ -32,6 +32,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl3 \
+    iputils-ping \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -40,10 +41,8 @@ WORKDIR /app
 COPY --from=builder /usr/src/relay/target/release/relay /app/relay
 
 # Expose ports:
-# 4001/udp - QUIC transport
-# 4002     - TCP transport
-EXPOSE 4001/udp
-EXPOSE 4002
+# 4433/udp - WebTransport (QUIC)
+EXPOSE 4433/udp
 
 # Default environment
 ENV RUST_LOG=info
@@ -54,4 +53,4 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
 
 # Run the relay server
 # --bind 0.0.0.0 ensures it listens on all interfaces in container
-CMD ["/app/relay", "--bind", "0.0.0.0", "--port", "4001", "--tcp-port", "4002"]
+CMD ["/app/relay", "--bind", "0.0.0.0", "--port", "4433"]

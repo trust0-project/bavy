@@ -1,37 +1,15 @@
 [package]
 name = "relay"
 version = "0.1.0"
-edition = "2024"
-description = "libp2p QUIC relay server for NAT traversal and peer connectivity"
+edition = "2021"
+description = "WebTransport Relay Server for RISC-V VM"
 
 [dependencies]
-# libp2p with required features for relay functionality
-libp2p = { version = "0.54", features = [
-    "tokio",
-    "quic",
-    "relay",
-    "dcutr",
-    "identify",
-    "ping",
-    "gossipsub",
-    "noise",
-    "yamux",
-    "macros",
-    "tcp",
-    "dns",
-    "websocket",
-    "request-response",
-    "cbor",
-    "kad",
-    "autonat",
-] }
-
 # Async runtime
 tokio = { version = "1", features = ["full"] }
-futures = "0.3"
 
-# WebSocket server for browser bridge
-tokio-tungstenite = "0.24"
+# WebTransport
+wtransport = "0.6.1"
 
 # Logging
 tracing = "0.1"
@@ -40,17 +18,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # CLI
 clap = { version = "4.4", features = ["derive"] }
 
-# Serialization for messages
-serde = { version = "1.0", features = ["derive"] }
-
 # Error handling
 anyhow = "1.0"
-thiserror = "1.0"
 
 # Utilities
 rand = "0.8"
-base64 = "0.22"
-hex = "0.4"
 
-# For peer ID generation
-bs58 = "0.5"
+# Serialization (if needed for structured messages)
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+smoltcp = "0.12.0"

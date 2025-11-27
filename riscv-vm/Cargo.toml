@@ -22,24 +22,27 @@ wasm-bindgen = "0.2"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tun-tap = "0.1"
 tungstenite = "0.21"
-# libp2p for connecting to the QUIC relay
-libp2p = { version = "0.54", features = [
-    "tokio",
-    "quic",
-    "tcp",
-    "relay",
-    "identify",
-    "ping",
-    "gossipsub",
-    "noise",
-    "yamux",
-    "macros",
-] }
+# WebTransport for connecting to the relay
+wtransport = { version = "0.6", features = ["dangerous-configuration"] }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 console_error_panic_hook = "0.1"
-web-sys = { version = "0.3", features = ["WebSocket", "MessageEvent", "BinaryType", "ErrorEvent", "CloseEvent"] }
+web-sys = { version = "0.3", features = [
+    "WebSocket", 
+    "MessageEvent", 
+    "BinaryType", 
+    "ErrorEvent", 
+    "CloseEvent",
+    "WebTransport",
+    "WebTransportOptions",
+    "WebTransportHash",
+    "WebTransportDatagramDuplexStream",
+    "ReadableStream",
+    "WritableStream",
+    "ReadableStreamDefaultReader",
+    "WritableStreamDefaultWriter"
+] }
 js-sys = "0.3"
 wasm-bindgen-futures = "0.4"
