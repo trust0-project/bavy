@@ -27,9 +27,9 @@ RUN rustup target add riscv64gc-unknown-none-elf
 
 WORKDIR /app
 
+# Copy local project into the container (expect build context to be repo root)
+COPY . .
 
-# Copy entire project
-RUN git clone https://github.com/elribonazo/riscv-vm.git .
 # Build kernel and VM (WASM)
 RUN chmod +x build.sh && ./build.sh
 

@@ -337,7 +337,8 @@ mod wasm {
                         // Send registration message
                         let register_msg = make_register_message(&mac);
                         let array = Uint8Array::from(&register_msg[..]);
-                        if let Err(e) = writer_clone.write_with_chunk(&array) {
+                        let promise = writer_clone.write_with_chunk(&array);
+                        if let Err(e) = JsFuture::from(promise).await {
                             log::error!("Failed to send registration: {:?}", e);
                             return;
                         }

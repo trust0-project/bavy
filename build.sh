@@ -2,7 +2,7 @@
 
 cargo build -p kernel --target riscv64gc-unknown-none-elf --release
 cargo build -p relay --release
-npx wasm-pack build  --target web --out-dir ../web/src/pkg riscv-vm
+RUSTFLAGS=--cfg=web_sys_unstable_apis npx wasm-pack build  --target web --out-dir ../web/src/pkg riscv-vm
 
 
 
