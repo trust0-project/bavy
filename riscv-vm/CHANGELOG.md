@@ -1,3 +1,13 @@
+## 0.0.6 (2025-11-28)
+
+### 🩹 Fixes
+
+- vm Bavy Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([fbb9a43](https://github.com/elribonazo/riscv-vm/commit/fbb9a43))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.0.5 (2025-11-28)
 
 ### 🩹 Fixes
