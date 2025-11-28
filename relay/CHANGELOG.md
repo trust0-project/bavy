@@ -1,3 +1,13 @@
+## 0.0.2 (2025-11-28)
+
+### 🩹 Fixes
+
+- relay improvements Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([1c17123](https://github.com/elribonazo/riscv-vm/commit/1c17123))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.0.1 (2025-11-28)
 
 ### 🩹 Fixes
