@@ -1,3 +1,13 @@
+## 0.0.8 (2025-11-28)
+
+### 🩹 Fixes
+
+- improve riscv Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([34b1767](https://github.com/elribonazo/riscv-vm/commit/34b1767))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.0.7 (2025-11-28)
 
 ### 🩹 Fixes
