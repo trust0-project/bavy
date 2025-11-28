@@ -1,0 +1,22 @@
+## 0.0.1 (2025-11-28)
+
+### 🩹 Fixes
+
+- build release Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([94ad7a1](https://github.com/elribonazo/riscv-vm/commit/94ad7a1))
+- pipelines Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([34664a9](https://github.com/elribonazo/riscv-vm/commit/34664a9))
+- improve kernel Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([39a361a](https://github.com/elribonazo/riscv-vm/commit/39a361a))
+- versions Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([b715645](https://github.com/elribonazo/riscv-vm/commit/b715645))
+- test ci Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([7d15c50](https://github.com/elribonazo/riscv-vm/commit/7d15c50))
+- build images and certificates Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([8fc8377](https://github.com/elribonazo/riscv-vm/commit/8fc8377))
+- refactor images and context Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([7ec91b6](https://github.com/elribonazo/riscv-vm/commit/7ec91b6))
+- relay service Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([bc45c89](https://github.com/elribonazo/riscv-vm/commit/bc45c89))
+- wip network Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([bec5717](https://github.com/elribonazo/riscv-vm/commit/bec5717))
+- image Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([951af5f](https://github.com/elribonazo/riscv-vm/commit/951af5f))
+- networking improvement Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([2929223](https://github.com/elribonazo/riscv-vm/commit/2929223))
+- relay improvements Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([9170737](https://github.com/elribonazo/riscv-vm/commit/9170737))
+- ui changes Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([207c9e1](https://github.com/elribonazo/riscv-vm/commit/207c9e1))
+- implement networking Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([217fcdb](https://github.com/elribonazo/riscv-vm/commit/217fcdb))
+
+### ❤️ Thank You
+
+- Javier Ribó
