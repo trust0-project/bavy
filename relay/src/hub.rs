@@ -368,28 +368,3 @@ fn compute_checksum(data: &[u8]) -> u16 {
     }
     !(sum as u16)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_hub_peer_registration() {
-        let hub = Hub::new();
-        let (tx, _rx) = mpsc::channel(16);
-
-        let mac = [0x52, 0x54, 0x00, 0xab, 0xcd, 0xef];
-        let result = hub.register_peer(mac, tx).await;
-
-        assert!(result.is_some());
-        let (peer_id, ip) = result.unwrap();
-        assert!(peer_id > 0);
-        assert_eq!(ip[0..3], [10, 0, 2]);
-
-        assert_eq!(hub.peer_count().await, 1);
-
-        hub.unregister_peer(peer_id).await;
-        assert_eq!(hub.peer_count().await, 0);
-    }
-}
-

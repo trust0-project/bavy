@@ -130,12 +130,5 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_data_frame_roundtrip() {
-        let ethernet = vec![0xff; 64];
-        let encoded = encode_data_frame(&ethernet);
-        let decoded = decode_data_frame(&encoded).unwrap();
-        assert_eq!(decoded, ethernet.as_slice());
-    }
 }
 

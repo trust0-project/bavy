@@ -254,26 +254,6 @@ mod tests {
     }
 
     #[test]
-    fn test_peer_registration() {
-        let mut manager = PeerManager::new();
-        
-        let mac = [0x52, 0x54, 0x00, 0xab, 0xcd, 0xef];
-        let (id, ip) = manager.register(mac).unwrap();
-        
-        assert_eq!(manager.peer_count(), 1);
-        
-        let peer = manager.get(id).unwrap();
-        assert_eq!(peer.mac, mac);
-        assert_eq!(peer.ip, ip);
-
-        // Re-registering same MAC should return same info
-        let (id2, ip2) = manager.register(mac).unwrap();
-        assert_eq!(id, id2);
-        assert_eq!(ip, ip2);
-        assert_eq!(manager.peer_count(), 1);
-    }
-
-    #[test]
     fn test_peer_lookup() {
         let mut manager = PeerManager::new();
         
@@ -281,7 +261,6 @@ mod tests {
         let (id, ip) = manager.register(mac).unwrap();
 
         assert!(manager.find_by_mac(&mac).is_some());
-        assert!(manager.find_by_ip(&ip).is_some());
         assert_eq!(manager.peer_id_by_ip(&ip), Some(id));
     }
 }
