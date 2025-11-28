@@ -29,6 +29,14 @@ jobs:
           registry-url: "https://registry.npmjs.org"
           always-auth: true
 
+      - name: Configure npm authentication
+        # Configure npm authentication using token if available
+        # For trusted publishing with --provenance, npm can use OIDC automatically
+        run: |
+          if [ -n "${{ secrets.NPM_TOKEN }}" ]; then
+            echo "//registry.npmjs.org/:_authToken=${{ secrets.NPM_TOKEN }}" >> ~/.npmrc
+          fi
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -43,6 +51,7 @@ jobs:
       - name: Run Nx Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           NPM_CONFIG_PROVENANCE: true
         run: npx nx release --yes
