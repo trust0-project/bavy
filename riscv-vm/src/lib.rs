@@ -56,16 +56,27 @@ impl WasmVm {
     pub fn new(kernel: &[u8]) -> Result<WasmVm, JsValue> {
         // Set up panic hook for better error messages in the browser console
         console_error_panic_hook::set_once();
+        
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
+            &format!("[VM] Creating new VM, kernel size: {} bytes", kernel.len())));
 
         const DRAM_SIZE: usize = 512 * 1024 * 1024; // 512 MiB
         let mut bus = SystemBus::new(DRAM_BASE, DRAM_SIZE);
         
         // Check if it's an ELF file and load appropriately
         let entry_pc = if kernel.starts_with(b"\x7FELF") {
+            web_sys::console::log_1(&wasm_bindgen::JsValue::from_str("[VM] Detected ELF kernel"));
             // Parse and load ELF
-            load_elf_wasm(kernel, &mut bus)
-                .map_err(|e| JsValue::from_str(&format!("Failed to load ELF kernel: {}", e)))?
+            let entry = load_elf_wasm(kernel, &mut bus)
+                .map_err(|e| JsValue::from_str(&format!("Failed to load ELF kernel: {}", e)))?;
+            web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
+                &format!("[VM] ELF loaded, entry point: 0x{:x}", entry)));
+            entry
         } else {
+            // Not an ELF - this is likely an error (HTML error page, corrupted file, etc.)
+            web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(
+                &format!("[VM] Warning: kernel does not appear to be an ELF file (magic: {:02x?}). Loading as raw binary.",
+                    &kernel[..kernel.len().min(4)])));
             // Load raw binary at DRAM_BASE
             bus.dram
                 .load(kernel, 0)
@@ -74,6 +85,9 @@ impl WasmVm {
         };
 
         let cpu = cpu::Cpu::new(entry_pc);
+        
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
+            &format!("[VM] CPU initialized, starting at PC=0x{:x}", entry_pc)));
 
         Ok(WasmVm { 
             bus, 
@@ -174,8 +188,17 @@ impl WasmVm {
                     &format!("[VM] Halted by guest request (code: {:#x})", code)));
                 false
             }
+            Err(Trap::Fatal(msg)) => {
+                // Fatal emulator error - log and halt
+                web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(
+                    &format!("[VM] Fatal error: {} at PC=0x{:x}", msg, self.cpu.pc)));
+                self.halted = true;
+                false
+            }
             Err(_trap) => {
-                // Other traps are handled by the kernel's trap handler
+                // Architectural traps (interrupts, page faults, ecalls) are handled
+                // by the CPU's trap handler which updates CSRs and redirects PC.
+                // These are normal operation - continue execution.
                 true
             }
         }
@@ -194,7 +217,56 @@ impl WasmVm {
 
     /// Get a byte from the UART output buffer, if available.
     pub fn get_output(&mut self) -> Option<u8> {
-        self.bus.uart.pop_output()
+        let byte = self.bus.uart.pop_output();
+        // Uncomment for debugging UART output:
+        // if let Some(b) = byte {
+        //     web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
+        //         &format!("[UART] Output: {:02x} '{}'", b, if b.is_ascii_graphic() { b as char } else { '.' })));
+        // }
+        byte
+    }
+    
+    /// Check how many bytes are pending in the UART output buffer.
+    /// Useful for debugging output issues.
+    pub fn uart_output_pending(&self) -> usize {
+        self.bus.uart.output.len()
+    }
+    
+    /// Write a string to the UART output buffer (VM host message).
+    /// This allows the VM to emit its own messages that the browser can display
+    /// alongside kernel output.
+    fn emit_to_uart(&mut self, s: &str) {
+        for byte in s.bytes() {
+            self.bus.uart.output.push_back(byte);
+        }
+    }
+    
+    /// Print the VM banner to UART output (visible in browser).
+    /// Call this after creating the VM to show a boot banner.
+    pub fn print_banner(&mut self) {
+        const BANNER: &str = "\x1b[1;36m\
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│   ██████╗  █████╗ ██╗   ██╗██╗   ██╗    ██╗   ██╗███╗   ███╗            │
+│   ██╔══██╗██╔══██╗██║   ██║╚██╗ ██╔╝    ██║   ██║████╗ ████║            │
+│   ██████╔╝███████║██║   ██║ ╚████╔╝     ██║   ██║██╔████╔██║            │
+│   ██╔══██╗██╔══██║╚██╗ ██╔╝  ╚██╔╝      ╚██╗ ██╔╝██║╚██╔╝██║            │
+│   ██████╔╝██║  ██║ ╚████╔╝    ██║        ╚████╔╝ ██║ ╚═╝ ██║            │
+│   ╚═════╝ ╚═╝  ╚═╝  ╚═══╝     ╚═╝         ╚═══╝  ╚═╝     ╚═╝            │
+│                                                                         │
+│   \x1b[1;97mBavy Virtual Machine v0.1.0\x1b[1;36m                                          │
+│   \x1b[0;90m64-bit RISC-V Emulator with VirtIO Support\x1b[1;36m                           │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+\x1b[0m\n";
+        self.emit_to_uart(BANNER);
+    }
+    
+    /// Print a status message to UART output (visible in browser).
+    pub fn print_status(&mut self, message: &str) {
+        self.emit_to_uart("\x1b[1;33m[VM]\x1b[0m ");
+        self.emit_to_uart(message);
+        self.emit_to_uart("\n");
     }
 
     /// Push an input byte to the UART.

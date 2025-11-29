@@ -5,9 +5,6 @@ use crate::virtio::VirtioDevice;
 use crate::Trap;
 use crate::dram::Dram;
 
-#[cfg(target_arch = "wasm32")]
-use wasm_bindgen;
-
 /// Default DRAM base for the virt platform.
 pub const DRAM_BASE: u64 = 0x8000_0000;
 

@@ -5,10 +5,33 @@ use riscv_vm::cpu::Cpu;
 use riscv_vm::Trap;
 use riscv_vm::csr::{CSR_MCAUSE, CSR_MEPC, CSR_MTVAL, CSR_MTVEC, CSR_SCAUSE, CSR_SEPC, CSR_STVAL, CSR_STVEC};
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 
 use riscv_vm::console::Console;
+
+/// Write to stdout with \r\n line endings (for raw terminal mode)
+fn uart_print(s: &str) {
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    for byte in s.bytes() {
+        if byte == b'\n' {
+            let _ = out.write_all(b"\r\n");
+        } else {
+            let _ = out.write_all(&[byte]);
+        }
+    }
+    let _ = out.flush();
+}
+
+/// Write formatted output to stdout with \r\n, adding a newline at the end
+macro_rules! uart_println {
+    () => { uart_print("\n") };
+    ($($arg:tt)*) => {{
+        uart_print(&format!($($arg)*));
+        uart_print("\n");
+    }};
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -64,7 +87,7 @@ fn dump_virtio_id(bus: &mut SystemBus) {
     let ver = r32(bus, 0x004);
     let devid = r32(bus, 0x008);
     let vendor = r32(bus, 0x00c);
-    eprintln!(
+    uart_println!(
         "VirtIO ID: MAGIC=0x{:08x} VERSION={} DEVICE_ID={} VENDOR=0x{:08x}",
         magic, ver, devid, vendor
     );
@@ -86,23 +109,23 @@ fn print_vm_banner() {
     │                                                                         │
     └─────────────────────────────────────────────────────────────────────────┘
 "#;
-    eprintln!("{}", BANNER);
+    uart_print(BANNER);
 }
 
 fn print_section(title: &str) {
-    eprintln!("\n\x1b[1;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m");
-    eprintln!("\x1b[1;33m  ▸ {}\x1b[0m", title);
-    eprintln!("\x1b[1;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m");
+    uart_println!("\n\x1b[1;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m");
+    uart_println!("\x1b[1;33m  ▸ {}\x1b[0m", title);
+    uart_println!("\x1b[1;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m");
 }
 
 fn print_status(component: &str, status: &str, ok: bool) {
     let status_color = if ok { "\x1b[1;32m" } else { "\x1b[1;31m" };
     let check = if ok { "✓" } else { "✗" };
-    eprintln!("    \x1b[0;37m{:<40}\x1b[0m {}[{}] {}\x1b[0m", component, status_color, check, status);
+    uart_println!("    \x1b[0;37m{:<40}\x1b[0m {}[{}] {}\x1b[0m", component, status_color, check, status);
 }
 
 fn print_info(key: &str, value: &str) {
-    eprintln!("    \x1b[0;90m├─\x1b[0m \x1b[0;37m{:<20}\x1b[0m \x1b[1;97m{}\x1b[0m", key, value);
+    uart_println!("    \x1b[0;90m├─\x1b[0m \x1b[0;37m{:<20}\x1b[0m \x1b[1;97m{}\x1b[0m", key, value);
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -139,7 +162,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let buffer = if args.kernel.starts_with("http://") || args.kernel.starts_with("https://") {
         print_info("Source", "Remote (HTTP/HTTPS)");
         print_info("URL", &args.kernel);
-        eprintln!("    \x1b[0;90m├─\x1b[0m \x1b[0;33mDownloading...\x1b[0m");
+        uart_println!("    \x1b[0;90m├─\x1b[0m \x1b[0;33mDownloading...\x1b[0m");
         let response = reqwest::blocking::get(&args.kernel)?;
         if !response.status().is_success() {
             print_status("Download", "FAILED", false);
@@ -173,13 +196,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let disk_size_mib = disk_buf.len() / (1024 * 1024);
         let vblk = riscv_vm::virtio::VirtioBlock::new(disk_buf);
         bus.virtio_devices.push(Box::new(vblk));
-        eprintln!();
-        eprintln!("    \x1b[1;35m┌─ VirtIO Block Device ─────────────────────────────────┐\x1b[0m");
-        eprintln!("    \x1b[1;35m│\x1b[0m  Address:    \x1b[1;97m0x10001000\x1b[0m                              \x1b[1;35m│\x1b[0m");
-        eprintln!("    \x1b[1;35m│\x1b[0m  IRQ:        \x1b[1;97m1\x1b[0m                                       \x1b[1;35m│\x1b[0m");
-        eprintln!("    \x1b[1;35m│\x1b[0m  Disk Size:  \x1b[1;97m{} MiB\x1b[0m                                  \x1b[1;35m│\x1b[0m", disk_size_mib);
-        eprintln!("    \x1b[1;35m│\x1b[0m  Image:      \x1b[0;90m{}\x1b[0m", disk_path.display());
-        eprintln!("    \x1b[1;35m└────────────────────────────────────────────────────────┘\x1b[0m");
+        uart_println!();
+        uart_println!("    \x1b[1;35m┌─ VirtIO Block Device ─────────────────────────────────┐\x1b[0m");
+        uart_println!("    \x1b[1;35m│\x1b[0m  Address:    \x1b[1;97m0x10001000\x1b[0m                              \x1b[1;35m│\x1b[0m");
+        uart_println!("    \x1b[1;35m│\x1b[0m  IRQ:        \x1b[1;97m1\x1b[0m                                       \x1b[1;35m│\x1b[0m");
+        uart_println!("    \x1b[1;35m│\x1b[0m  Disk Size:  \x1b[1;97m{} MiB\x1b[0m                                  \x1b[1;35m│\x1b[0m", disk_size_mib);
+        uart_println!("    \x1b[1;35m│\x1b[0m  Image:      \x1b[0;90m{}\x1b[0m", disk_path.display());
+        uart_println!("    \x1b[1;35m└────────────────────────────────────────────────────────┘\x1b[0m");
         print_status("VirtIO Block", "ATTACHED", true);
     }
 
@@ -191,13 +214,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let irq = 1 + device_idx;
         bus.virtio_devices.push(Box::new(vnet));
         let base_addr = 0x1000_1000 + (device_idx as u64) * 0x1000;
-        eprintln!();
-        eprintln!("    \x1b[1;34m┌─ VirtIO Network Device ───────────────────────────────┐\x1b[0m");
-        eprintln!("    \x1b[1;34m│\x1b[0m  Address:    \x1b[1;97m0x{:08X}\x1b[0m                            \x1b[1;34m│\x1b[0m", base_addr);
-        eprintln!("    \x1b[1;34m│\x1b[0m  IRQ:        \x1b[1;97m{}\x1b[0m                                       \x1b[1;34m│\x1b[0m", irq);
-        eprintln!("    \x1b[1;34m│\x1b[0m  Backend:    \x1b[1;97mWebTransport\x1b[0m                            \x1b[1;34m│\x1b[0m");
-        eprintln!("    \x1b[1;34m│\x1b[0m  Relay:      \x1b[0;90m{}\x1b[0m", wt_url);
-        eprintln!("    \x1b[1;34m└────────────────────────────────────────────────────────┘\x1b[0m");
+        uart_println!();
+        uart_println!("    \x1b[1;34m┌─ VirtIO Network Device ───────────────────────────────┐\x1b[0m");
+        uart_println!("    \x1b[1;34m│\x1b[0m  Address:    \x1b[1;97m0x{:08X}\x1b[0m                            \x1b[1;34m│\x1b[0m", base_addr);
+        uart_println!("    \x1b[1;34m│\x1b[0m  IRQ:        \x1b[1;97m{}\x1b[0m                                       \x1b[1;34m│\x1b[0m", irq);
+        uart_println!("    \x1b[1;34m│\x1b[0m  Backend:    \x1b[1;97mWebTransport\x1b[0m                            \x1b[1;34m│\x1b[0m");
+        uart_println!("    \x1b[1;34m│\x1b[0m  Relay:      \x1b[0;90m{}\x1b[0m", wt_url);
+        uart_println!("    \x1b[1;34m└────────────────────────────────────────────────────────┘\x1b[0m");
         print_status("VirtIO Network", "ATTACHED", true);
     } 
 
@@ -235,15 +258,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ─── BOOT SEQUENCE COMPLETE ───────────────────────────────────────────────
     print_section("BOOT SEQUENCE COMPLETE");
-    eprintln!();
-    eprintln!("    \x1b[1;32m╔══════════════════════════════════════════════════════════════════════╗\x1b[0m");
-    eprintln!("    \x1b[1;32m║\x1b[0m                                                                      \x1b[1;32m║\x1b[0m");
-    eprintln!("    \x1b[1;32m║\x1b[0m   \x1b[1;97mStarting RISC-V Kernel at 0x{:08X}\x1b[0m                           \x1b[1;32m║\x1b[0m", entry_pc);
-    eprintln!("    \x1b[1;32m║\x1b[0m   \x1b[0;90mPress Ctrl-A then 'x' to terminate\x1b[0m                              \x1b[1;32m║\x1b[0m");
-    eprintln!("    \x1b[1;32m║\x1b[0m                                                                      \x1b[1;32m║\x1b[0m");
-    eprintln!("    \x1b[1;32m╚══════════════════════════════════════════════════════════════════════╝\x1b[0m");
-    eprintln!();
-    eprintln!();
+    uart_println!();
+    uart_println!("    \x1b[1;32m╔══════════════════════════════════════════════════════════════════════╗\x1b[0m");
+    uart_println!("    \x1b[1;32m║\x1b[0m                                                                      \x1b[1;32m║\x1b[0m");
+    uart_println!("    \x1b[1;32m║\x1b[0m   \x1b[1;97mStarting RISC-V Kernel at 0x{:08X}\x1b[0m                           \x1b[1;32m║\x1b[0m", entry_pc);
+    uart_println!("    \x1b[1;32m║\x1b[0m   \x1b[0;90mPress Ctrl-A then 'x' to terminate\x1b[0m                              \x1b[1;32m║\x1b[0m");
+    uart_println!("    \x1b[1;32m║\x1b[0m                                                                      \x1b[1;32m║\x1b[0m");
+    uart_println!("    \x1b[1;32m╚══════════════════════════════════════════════════════════════════════╝\x1b[0m");
+    uart_println!();
+    uart_println!();
 
     let mut step_count = 0u64;
     let mut last_report_step = 0u64;
@@ -257,7 +280,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(b) = console.poll() {
             if escaped {
                 if b == b'x' {
-                    eprintln!("\nTerminated by user.");
+                    uart_println!("\nTerminated by user.");
                     break;
                 } else if b == 1 {
                     // Ctrl-A twice -> send Ctrl-A to guest
@@ -301,15 +324,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 // Non-recoverable emulator error: dump state and exit.
                 Trap::Fatal(msg) => {
-                    eprintln!("Fatal emulator error: {msg}");
-                    eprintln!("PC: 0x{:x}", cpu.pc);
+                    uart_println!("Fatal emulator error: {msg}");
+                    uart_println!("PC: 0x{:x}", cpu.pc);
                     for i in 0..32 {
                         if i % 4 == 0 {
-                            eprintln!();
+                            uart_println!();
                         }
-                        eprint!("x{:<2}: 0x{:<16x} ", i, cpu.regs[i]);
+                        uart_print(&format!("x{:<2}: 0x{:<16x} ", i, cpu.regs[i]));
                     }
-                    eprintln!();
+                    uart_println!();
                     break;
                 }
                 // Architectural traps (interrupts, page faults, ecalls, etc.)
@@ -362,8 +385,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let scause = cpu.read_csr(CSR_SCAUSE).unwrap_or(0);
             let stval = cpu.read_csr(CSR_STVAL).unwrap_or(0);
             let stvec = cpu.read_csr(CSR_STVEC).unwrap_or(0);
-            eprintln!("PC reached 0, stopping.");
-            eprintln!(
+            uart_println!("PC reached 0, stopping.");
+            uart_println!(
                 "Final state:\n  pc=0x{:016x} mode={:?}\n  M: mepc=0x{:016x} mcause=0x{:016x} mtval=0x{:016x} mtvec=0x{:016x}\n  S: sepc=0x{:016x} scause=0x{:016x} stval=0x{:016x} stvec=0x{:016x}",
                 cpu.pc, cpu.mode, mepc, mcause, mtval, mtvec, sepc, scause, stval, stvec
             );
