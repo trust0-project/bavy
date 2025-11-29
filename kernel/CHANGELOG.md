@@ -1,3 +1,13 @@
+## 0.0.11 (2025-11-29)
+
+### 🩹 Fixes
+
+- improve kernel and operating system Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([fe4ec30](https://github.com/elribonazo/riscv-vm/commit/fe4ec30))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.0.10 (2025-11-29)
 
 ### 🩹 Fixes
