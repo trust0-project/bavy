@@ -1,3 +1,13 @@
+## 0.0.5 (2025-11-29)
+
+### 🩹 Fixes
+
+- relay improvement + vm reconnect Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([91300e7](https://github.com/elribonazo/riscv-vm/commit/91300e7))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.0.4 (2025-11-29)
 
 This was a version bump only for relay to align it with other projects, there were no code changes.
