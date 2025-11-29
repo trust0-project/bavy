@@ -1,6 +1,5 @@
 // kernel/src/sfs.rs
 use alloc::vec::Vec;
-use alloc::string::String;
 use crate::virtio_blk::VirtioBlock;
 
 // Must match mkfs constants
