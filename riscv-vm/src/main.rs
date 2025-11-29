@@ -247,6 +247,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\x1b[1;33m                           KERNEL OUTPUT BEGINS\x1b[0m");
     println!("\x1b[1;36m══════════════════════════════════════════════════════════════════════════════\x1b[0m");
     println!();
+    println!();
 
     let mut step_count = 0u64;
     let mut last_report_step = 0u64;
