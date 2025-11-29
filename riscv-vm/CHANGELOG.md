@@ -1,3 +1,13 @@
+## 0.0.23 (2025-11-29)
+
+### 🩹 Fixes
+
+- improve VM scripting utf-8 Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([99a872a](https://github.com/elribonazo/riscv-vm/commit/99a872a))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.0.22 (2025-11-29)
 
 ### 🩹 Fixes
