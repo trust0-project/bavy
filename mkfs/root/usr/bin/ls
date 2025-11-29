@@ -9,6 +9,17 @@ if !fs.available() {
     return;
 }
 
+fn resolve_path(path) {
+    if path.starts_with("/") {
+        return path;
+    }
+    let cwd = sys.cwd();
+    if cwd == "/" {
+        return "/" + path;
+    }
+    return cwd + "/" + path;
+}
+
 // Parse options
 let show_long = false;
 let show_all = false;
@@ -27,10 +38,8 @@ for arg in ARGS {
             if ch == 'R' { recursive = true; }
         }
     } else {
-        path_filter = arg;
-        if !path_filter.starts_with("/") {
-            path_filter = "/" + path_filter;
-        }
+        // Resolve path relative to CWD
+        path_filter = resolve_path(arg);
         if path_filter.len() > 1 && path_filter.ends_with("/") {
             path_filter = path_filter.sub_string(0, path_filter.len() - 1);
         }

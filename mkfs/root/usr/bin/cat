@@ -2,11 +2,23 @@
 // Usage: cat <filename>
 
 import * as fs from "os:fs"
+import * as sys from "os:sys"
+
+fn resolve_path(path) {
+    if path.starts_with("/") {
+        return path;
+    }
+    let cwd = sys.cwd();
+    if cwd == "/" {
+        return "/" + path;
+    }
+    return cwd + "/" + path;
+}
 
 if ARGS.len() < 1 {
     print("Usage: cat <filename>");
 } else {
-    let filename = ARGS[0];
+    let filename = resolve_path(ARGS[0]);
     
     if !fs.exists(filename) {
         print("Error: File not found: " + filename);

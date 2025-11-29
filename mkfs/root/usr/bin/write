@@ -2,12 +2,24 @@
 // Usage: write <filename> <content...>
 
 import * as fs from "os:fs"
+import * as sys from "os:sys"
+
+fn resolve_path(path) {
+    if path.starts_with("/") {
+        return path;
+    }
+    let cwd = sys.cwd();
+    if cwd == "/" {
+        return "/" + path;
+    }
+    return cwd + "/" + path;
+}
 
 if ARGS.len() < 2 {
     print("Usage: write <filename> <content...>");
     print("Example: write test.txt Hello World!");
 } else {
-    let filename = ARGS[0];
+    let filename = resolve_path(ARGS[0]);
     // Join remaining args as content
     let content_parts = [];
     let i = 1;
