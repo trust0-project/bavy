@@ -84,6 +84,7 @@ pub struct NetState {
 impl NetState {
     /// Initialize the network stack
     /// Note: After storing this in a static, call finalize() to complete RX buffer setup!
+    /// Returns Err if no IP is assigned by the relay (networking will be disabled).
     pub fn new(mut device: VirtioNet) -> Result<Self, &'static str> {
         // Initialize the VirtIO device (phase 1 - configures queues but doesn't populate RX)
         device.init()?;
@@ -96,25 +97,29 @@ impl NetState {
         let mut got_ip = false;
         
         crate::uart::write_str("    \x1b[0;90m├─\x1b[0m Waiting for IP assignment");
-        // 100 iterations with shorter delays = more chances for async tasks in WASM
-        for i in 0..100 {
+        // 200 iterations with shorter delays = more chances for async tasks in WASM
+        // Total wait time is roughly 2-3 seconds
+        for i in 0..200 {
             if let Some(ip_bytes) = device.get_config_ip() {
                 my_ip = Ipv4Address::from_bytes(&ip_bytes);
                 got_ip = true;
                 crate::uart::write_line(" \x1b[1;32m[OK]\x1b[0m");
                 break;
             }
-            // Print a dot every 5 iterations to show progress
-            if i % 5 == 0 {
+            // Print a dot every 10 iterations to show progress
+            if i % 10 == 0 {
                 crate::uart::write_str(".");
             }
             // Shorter delay to allow more frequent checks and JS event loop to run in WASM
             for _ in 0..200_000 { core::hint::spin_loop(); } 
         }
         
-        // If we didn't get an IP, show fallback message
+        // If we didn't get an IP, network is unavailable - return error
         if !got_ip {
-            crate::uart::write_line(" \x1b[1;33m[using default]\x1b[0m");
+            crate::uart::write_line(" \x1b[1;31m[FAILED]\x1b[0m");
+            crate::uart::write_line("    \x1b[1;31m[✗]\x1b[0m No IP address assigned by relay");
+            crate::uart::write_line("    \x1b[0;90m    └─ Check relay connection and certificate hash\x1b[0m");
+            return Err("No IP address assigned - networking disabled");
         }
         
         // Save to global for other modules to use

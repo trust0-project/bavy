@@ -264,9 +264,10 @@ fn init_network() {
                     print_boot_status("Network stack initialized (smoltcp)", true);
                     print_boot_status("VirtIO-Net driver loaded", true);
                 }
-                Err(e) => {
-                    uart::write_str("    \x1b[1;31m[✗]\x1b[0m Network init failed: ");
-                    uart::write_line(e);
+                Err(_e) => {
+                    // Network initialization failed - no IP assigned
+                    // Networking is disabled, NET_STATE remains None
+                    uart::write_line("    \x1b[0;90m    └─ Network features will be unavailable\x1b[0m");
                 }
             }
         }
