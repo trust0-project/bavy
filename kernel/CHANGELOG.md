@@ -1,3 +1,13 @@
+## 0.0.3 (2025-11-29)
+
+### 🩹 Fixes
+
+- minimal filesystem Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([8df2d70](https://github.com/elribonazo/riscv-vm/commit/8df2d70))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.0.2 (2025-11-28)
 
 ### 🩹 Fixes
