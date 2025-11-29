@@ -1,3 +1,13 @@
+## 0.0.7 (2025-11-29)
+
+### 🩹 Fixes
+
+- implement basic dhcp and interconnect nodes in p2p network Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([7e9991c](https://github.com/elribonazo/riscv-vm/commit/7e9991c))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.0.6 (2025-11-29)
 
 This was a version bump only for kernel to align it with other projects, there were no code changes.
