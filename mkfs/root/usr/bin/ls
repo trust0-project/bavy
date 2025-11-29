@@ -9,17 +9,6 @@ if !fs.available() {
     return;
 }
 
-fn resolve_path(path) {
-    if path.starts_with("/") {
-        return path;
-    }
-    let cwd = sys.cwd();
-    if cwd == "/" {
-        return "/" + path;
-    }
-    return cwd + "/" + path;
-}
-
 // Parse options
 let show_long = false;
 let show_all = false;
@@ -39,7 +28,16 @@ for arg in ARGS {
         }
     } else {
         // Resolve path relative to CWD
-        path_filter = resolve_path(arg);
+        if arg.starts_with("/") {
+            path_filter = arg;
+        } else {
+            let cwd = sys.cwd();
+            if cwd == "/" {
+                path_filter = "/" + arg;
+            } else {
+                path_filter = cwd + "/" + arg;
+            }
+        }
         if path_filter.len() > 1 && path_filter.ends_with("/") {
             path_filter = path_filter.sub_string(0, path_filter.len() - 1);
         }

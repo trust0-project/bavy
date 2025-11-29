@@ -504,6 +504,12 @@ fn main() -> ! {
                     uart::write_str("\u{8} \u{8}");
                 }
             }
+            // Tab - autocomplete
+            b'\t' => {
+                last_newline = 0;
+                let new_len = handle_tab_completion(&mut buffer, len);
+                len = new_len;
+            }
             _ => {
                 last_newline = 0; // Reset newline tracking on regular input
                 if len < buffer.len() {
@@ -522,6 +528,253 @@ fn clear_input_line(len: usize) {
     for _ in 0..len {
         uart::write_str("\u{8} \u{8}");
     }
+}
+
+/// Handle tab completion
+/// Returns the new buffer length after completion
+fn handle_tab_completion(buffer: &mut [u8], len: usize) -> usize {
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    
+    if len == 0 {
+        return 0;
+    }
+    
+    let input = match core::str::from_utf8(&buffer[..len]) {
+        Ok(s) => s,
+        Err(_) => return len,
+    };
+    
+    // Find the word being completed (last space-separated token)
+    let last_space = input.rfind(' ');
+    let (prefix, word_to_complete) = match last_space {
+        Some(pos) => (&input[..=pos], &input[pos+1..]),
+        None => ("", input),
+    };
+    
+    let is_command = prefix.is_empty();
+    
+    let mut matches: Vec<String> = Vec::new();
+    
+    if is_command {
+        // Complete commands - check built-ins first
+        let builtins = [
+            "clear", "shutdown", "cd", "pwd", "ping", "nslookup", "node", "help",
+            "ls", "cat", "echo", "cowsay", "sysinfo", "ip", "netstat", "memstats",
+            "uptime", "write",
+        ];
+        
+        for cmd in builtins.iter() {
+            if cmd.starts_with(word_to_complete) {
+                matches.push(String::from(*cmd));
+            }
+        }
+        
+        // Also check /usr/bin/ for scripts
+        unsafe {
+            if let (Some(fs), Some(dev)) = (FS_STATE.as_ref(), BLK_DEV.as_mut()) {
+                let files = fs.list_dir(dev, "/");
+                for f in files {
+                    if f.name.starts_with("/usr/bin/") {
+                        let script_name = &f.name[9..]; // Strip "/usr/bin/"
+                        if script_name.starts_with(word_to_complete) {
+                            // Avoid duplicates with builtins
+                            if !matches.iter().any(|m| m == script_name) {
+                                matches.push(String::from(script_name));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        // Complete file/directory paths
+        let path_to_complete = if word_to_complete.starts_with('/') {
+            String::from(word_to_complete)
+        } else {
+            resolve_path(word_to_complete)
+        };
+        
+        // Find the directory part and file prefix
+        let (dir_path, file_prefix) = if let Some(last_slash) = path_to_complete.rfind('/') {
+            if last_slash == 0 {
+                ("/", &path_to_complete[1..])
+            } else {
+                (&path_to_complete[..last_slash], &path_to_complete[last_slash+1..])
+            }
+        } else {
+            ("/", path_to_complete.as_str())
+        };
+        
+        unsafe {
+            if let (Some(fs), Some(dev)) = (FS_STATE.as_ref(), BLK_DEV.as_mut()) {
+                let files = fs.list_dir(dev, "/");
+                let mut seen_dirs: Vec<String> = Vec::new();
+                
+                for f in files {
+                    // Check if file is in the target directory
+                    let check_prefix = if dir_path == "/" {
+                        "/"
+                    } else {
+                        dir_path
+                    };
+                    
+                    if !f.name.starts_with(check_prefix) {
+                        continue;
+                    }
+                    
+                    // Get the part after the directory
+                    let relative = if dir_path == "/" {
+                        &f.name[1..]
+                    } else if f.name.len() > check_prefix.len() + 1 {
+                        &f.name[check_prefix.len() + 1..]
+                    } else {
+                        continue;
+                    };
+                    
+                    // Get just the immediate child (first path component)
+                    let child_name = if let Some(slash_pos) = relative.find('/') {
+                        &relative[..slash_pos]
+                    } else {
+                        relative
+                    };
+                    
+                    if child_name.is_empty() {
+                        continue;
+                    }
+                    
+                    // Check if it matches the prefix
+                    if !child_name.starts_with(file_prefix) {
+                        continue;
+                    }
+                    
+                    // Check if this is a directory (has more path after)
+                    let is_dir = relative.len() > child_name.len();
+                    
+                    let completion = if is_dir {
+                        let dir_name = String::from(child_name) + "/";
+                        if seen_dirs.contains(&dir_name) {
+                            continue;
+                        }
+                        seen_dirs.push(dir_name.clone());
+                        dir_name
+                    } else {
+                        String::from(child_name)
+                    };
+                    
+                    if !matches.iter().any(|m| m == &completion) {
+                        matches.push(completion);
+                    }
+                }
+            }
+        }
+    }
+    
+    matches.sort();
+    
+    if matches.is_empty() {
+        // No matches - beep or do nothing
+        return len;
+    }
+    
+    if matches.len() == 1 {
+        // Single match - complete it
+        let completion = &matches[0];
+        let to_add = &completion[word_to_complete.len()..];
+        
+        // Add completion to buffer
+        let new_len = len + to_add.len();
+        if new_len <= buffer.len() {
+            for (i, b) in to_add.bytes().enumerate() {
+                buffer[len + i] = b;
+            }
+            uart::write_str(to_add);
+            
+            // Add space after command completion (not for paths ending in /)
+            if is_command && new_len + 1 <= buffer.len() {
+                buffer[new_len] = b' ';
+                uart::write_str(" ");
+                return new_len + 1;
+            }
+            
+            return new_len;
+        }
+        return len;
+    }
+    
+    // Multiple matches - find common prefix and show options
+    let common = find_common_prefix(&matches);
+    
+    if common.len() > word_to_complete.len() {
+        // Complete up to common prefix
+        let to_add = &common[word_to_complete.len()..];
+        let new_len = len + to_add.len();
+        if new_len <= buffer.len() {
+            for (i, b) in to_add.bytes().enumerate() {
+                buffer[len + i] = b;
+            }
+            uart::write_str(to_add);
+            return new_len;
+        }
+        return len;
+    }
+    
+    // Show all matches
+    uart::write_line("");
+    let mut col = 0;
+    let col_width = 16;
+    let num_cols = 4;
+    
+    for m in &matches {
+        let display_len = m.len();
+        uart::write_str(m);
+        
+        col += 1;
+        if col >= num_cols {
+            uart::write_line("");
+            col = 0;
+        } else {
+            // Pad to column width
+            for _ in display_len..col_width {
+                uart::write_str(" ");
+            }
+        }
+    }
+    if col > 0 {
+        uart::write_line("");
+    }
+    
+    // Redraw prompt and current input
+    print_prompt();
+    uart::write_bytes(&buffer[..len]);
+    
+    len
+}
+
+/// Find common prefix among strings
+fn find_common_prefix(strings: &[alloc::string::String]) -> alloc::string::String {
+    use alloc::string::String;
+    
+    if strings.is_empty() {
+        return String::new();
+    }
+    
+    let first = &strings[0];
+    let mut prefix_len = first.len();
+    
+    for s in strings.iter().skip(1) {
+        let mut common = 0;
+        for (a, b) in first.chars().zip(s.chars()) {
+            if a == b && common < prefix_len {
+                common += 1;
+            } else {
+                break;
+            }
+        }
+        prefix_len = common;
+    }
+    
+    String::from(&first[..prefix_len])
 }
 
 
@@ -849,12 +1102,14 @@ fn handle_line(buffer: &[u8], len: usize, _count: &mut usize) {
         
         if let Ok(filename) = core::str::from_utf8(redirect_file) {
             let filename = filename.trim();
+            // Resolve path relative to CWD
+            let resolved_path = resolve_path(filename);
             
             unsafe {
                 if let (Some(fs), Some(dev)) = (FS_STATE.as_mut(), BLK_DEV.as_mut()) {
                     let final_data = if redirect_mode == RedirectMode::Append {
                         // Read existing file content and append
-                        let mut combined = match fs.read_file(dev, filename) {
+                        let mut combined = match fs.read_file(dev, &resolved_path) {
                             Some(existing) => existing,
                             None => Vec::new(),
                         };
@@ -865,11 +1120,11 @@ fn handle_line(buffer: &[u8], len: usize, _count: &mut usize) {
                         Vec::from(output)
                     };
                     
-                    match fs.write_file(dev, filename, &final_data) {
+                    match fs.write_file(dev, &resolved_path, &final_data) {
                         Ok(()) => {
                             uart::write_line("");
                             uart::write_str("\x1b[1;32m✓\x1b[0m Output written to ");
-                            uart::write_line(filename);
+                            uart::write_line(&resolved_path);
                         }
                         Err(e) => {
                             uart::write_line("");
