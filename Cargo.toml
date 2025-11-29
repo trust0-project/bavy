@@ -1,5 +1,5 @@
 [workspace]
-members = ["riscv-vm", "kernel", "relay"]
+members = ["riscv-vm", "kernel", "relay", "fs"]
 resolver = "2"
 
 

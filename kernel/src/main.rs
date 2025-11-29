@@ -6,21 +6,19 @@ mod dns;
 mod net;
 mod uart;
 mod virtio_net;
+mod virtio_blk;
+mod fs;
+
 extern crate alloc;
 use alloc::vec::Vec;
 use panic_halt as _;
 use riscv_rt::entry;
 
-/// CLINT mtime register address (for timestamps)
 const CLINT_MTIME: usize = 0x0200_BFF8;
-
-/// Test finisher address - writing here shuts down the VM
 const TEST_FINISHER: usize = 0x0010_0000;
-
-/// Global network state (initialized lazily)
 static mut NET_STATE: Option<net::NetState> = None;
+static mut FS_STATE: Option<fs::FileSystem> = None;
 
-/// Ping state for tracking echo requests
 struct PingState {
     #[allow(dead_code)]
     target: smoltcp::wire::Ipv4Address,
@@ -29,11 +27,11 @@ struct PingState {
     waiting: bool,
 }
 
+static mut BLK_DEV: Option<virtio_blk::VirtioBlock> = None;
 static mut PING_STATE: Option<PingState> = None;
 
 /// Read current time in milliseconds from CLINT mtime register
 fn get_time_ms() -> i64 {
-    // mtime runs at 10MHz typically, convert to ms
     let mtime = unsafe { core::ptr::read_volatile(CLINT_MTIME as *const u64) };
     (mtime / 10_000) as i64
 }
@@ -109,6 +107,9 @@ fn main() -> ! {
     uart::write_line(" KiB\x1b[0m");
     print_boot_status("Heap allocator ready", true);
     
+    // ─── STORAGE SUBSYSTEM ────────────────────────────────────────────────────
+    init_storage();
+    
     // ─── NETWORK SUBSYSTEM ────────────────────────────────────────────────────
     print_section("NETWORK SUBSYSTEM");
     init_network();
@@ -172,6 +173,41 @@ fn main() -> ! {
                     buffer[len] = byte;
                     len += 1;
                     uart::Console::new().write_byte(byte);
+                }
+            }
+        }
+    }
+}
+
+
+fn init_storage() {
+    print_section("STORAGE SUBSYSTEM");
+    if let Some(blk) = virtio_blk::VirtioBlock::probe() {
+        uart::write_str("    \x1b[0;90m├─\x1b[0m Block Device: \x1b[1;97m");
+        uart::write_u64(blk.capacity() * 512 / 1024 / 1024);
+        uart::write_line(" MiB\x1b[0m");
+        unsafe { BLK_DEV = Some(blk); }
+        print_boot_status("VirtIO-Block driver loaded", true);
+    } else {
+        print_boot_status("No storage device found", false);
+    }
+    if let Some(ref mut blk) = unsafe { BLK_DEV.as_mut() } {
+        if let Some(fs) = fs::FileSystem::init(blk) {
+            uart::write_line("    \x1b[1;32m[✓]\x1b[0m SFS Mounted (R/W)");
+            unsafe { FS_STATE = Some(fs); }
+        }
+    }
+}
+
+fn init_fs() {
+    if let Some(blk) = virtio_blk::VirtioBlock::probe() {
+        uart::write_line("    \x1b[1;32m[✓]\x1b[0m VirtIO Block found");
+        unsafe { 
+            BLK_DEV = Some(blk);
+            if let Some(ref mut dev) = BLK_DEV {
+                if let Some(fs) = fs::FileSystem::init(dev) {
+                    FS_STATE = Some(fs);
+                    uart::write_line("    \x1b[1;32m[✓]\x1b[0m FileSystem Mounted");
                 }
             }
         }
@@ -282,7 +318,7 @@ fn print_prompt() {
     uart::write_str("\x1b[1;35mrisk-v\x1b[0m:\x1b[1;34m~\x1b[0m$ ");
 }
 
-fn handle_line(buffer: &[u8], len: usize, count: &mut usize) {
+fn handle_line(buffer: &[u8], len: usize, _count: &mut usize) {
     // Trim leading/trailing whitespace (spaces and tabs only)
     let mut start = 0;
     let mut end = len;
@@ -334,6 +370,36 @@ fn handle_line(buffer: &[u8], len: usize, count: &mut usize) {
         cmd_netstat();
     } else if eq_cmd(cmd, b"shutdown") || eq_cmd(cmd, b"poweroff") {
         cmd_shutdown();
+    }else if eq_cmd(cmd, b"ls") {
+            unsafe {
+                if let (Some(fs), Some(dev)) = (FS_STATE.as_ref(), BLK_DEV.as_mut()) {
+                    fs.ls(dev);
+                }
+            }
+        } else if eq_cmd(cmd, b"cat") {
+            let filename = core::str::from_utf8(args).unwrap_or("").trim();
+            unsafe {
+                if let (Some(fs), Some(dev)) = (FS_STATE.as_ref(), BLK_DEV.as_mut()) {
+                    match fs.read_file(dev, filename) {
+                        Some(data) => if let Ok(s) = core::str::from_utf8(&data) { uart::write_line(s); },
+                        None => uart::write_line("File not found"),
+                    }
+                }
+            }
+        } else if eq_cmd(cmd, b"write") {
+            // Basic write: write filename content...
+            let line = core::str::from_utf8(args).unwrap_or("");
+            if let Some((name, data)) = line.split_once(' ') {
+                unsafe {
+                    if let (Some(fs), Some(dev)) = (FS_STATE.as_mut(), BLK_DEV.as_mut()) {
+                        if fs.write_file(dev, name, data.as_bytes()).is_ok() {
+                            uart::write_line("Written.");
+                        } else {
+                            uart::write_line("Write failed.");
+                        }
+                    }
+                }
+            }
     } else {
         uart::write_str("Unknown command: ");
         uart::write_bytes(cmd);
@@ -378,6 +444,27 @@ fn cmd_alloc(args: &[u8]) {
         uart::write_line(" bytes (leaked).");
     } else {
         uart::write_line("Usage: alloc <bytes>");
+    }
+}
+
+fn cmd_readsec(args: &[u8]) {
+    let sector = parse_usize(args) as u64;
+    unsafe {
+        if let Some(ref mut blk) = BLK_DEV {
+            let mut buf = [0u8; 512];
+            if blk.read_sector(sector, &mut buf).is_ok() {
+                uart::write_line("Sector contents (first 64 bytes):");
+                for i in 0..64 {
+                   uart::write_hex_byte(buf[i]);
+                   if (i+1) % 16 == 0 { uart::write_line(""); }
+                   else { uart::write_str(" "); }
+                }
+            } else {
+                uart::write_line("Read failed.");
+            }
+        } else {
+            uart::write_line("No block device.");
+        }
     }
 }
 

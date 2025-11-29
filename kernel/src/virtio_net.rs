@@ -139,7 +139,7 @@ pub struct VirtQueue {
 impl VirtQueue {
     /// Create a new virtqueue at the given memory address.
     /// Memory must be page-aligned and zeroed.
-    unsafe fn new(mem: *mut u8, queue_idx: u16) -> Self {
+    pub unsafe fn new(mem: *mut u8, queue_idx: u16) -> Self {
         // Layout: Descriptors | Avail | padding | Used
         let desc = &mut *(mem as *mut [VirtqDesc; QUEUE_SIZE]);
         let avail = &mut *(mem.add(QUEUE_SIZE * 16) as *mut VirtqAvail);
@@ -166,7 +166,7 @@ impl VirtQueue {
     }
     
     /// Allocate a descriptor from the free list
-    fn alloc_desc(&mut self) -> Option<u16> {
+    pub fn alloc_desc(&mut self) -> Option<u16> {
         if self.num_free == 0 {
             return None;
         }
@@ -177,14 +177,14 @@ impl VirtQueue {
     }
     
     /// Free a descriptor back to the free list
-    fn free_desc(&mut self, idx: u16) {
+    pub fn free_desc(&mut self, idx: u16) {
         self.desc[idx as usize].next = self.free_head;
         self.free_head = idx;
         self.num_free += 1;
     }
     
     /// Add a buffer to the available ring
-    fn push_avail(&mut self, desc_idx: u16) {
+    pub fn push_avail(&mut self, desc_idx: u16) {
         let avail_idx = unsafe { read_volatile(&self.avail.idx) };
         self.avail.ring[(avail_idx as usize) % QUEUE_SIZE] = desc_idx;
         // Memory barrier
@@ -194,13 +194,13 @@ impl VirtQueue {
     
     /// Check if there are used buffers to process
     #[allow(dead_code)]
-    fn has_used(&self) -> bool {
+    pub fn has_used(&self) -> bool {
         let used_idx = unsafe { read_volatile(&self.used.idx) };
         self.last_used_idx != used_idx
     }
     
     /// Pop a used buffer (returns descriptor index and length)
-    fn pop_used(&mut self) -> Option<(u16, u32)> {
+    pub fn pop_used(&mut self) -> Option<(u16, u32)> {
         let used_idx = unsafe { read_volatile(&self.used.idx) };
         if self.last_used_idx == used_idx {
             return None;

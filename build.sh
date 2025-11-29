@@ -2,4 +2,6 @@
 cargo build -p kernel --target riscv64gc-unknown-none-elf --release
 cargo build -p relay --release
 cargo build -p riscv-vm --release
+cargo run -p fs -- --output fs/disk.img --dir fs/root --size 512
+
 cd riscv-vm && yarn build && cd ..
