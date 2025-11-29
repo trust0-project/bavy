@@ -1,3 +1,13 @@
+## 0.0.4 (2025-11-29)
+
+### 🩹 Fixes
+
+- kernel Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([2b7e53a](https://github.com/elribonazo/riscv-vm/commit/2b7e53a))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.0.3 (2025-11-29)
 
 ### 🩹 Fixes
