@@ -1,3 +1,7 @@
+## 0.0.6 (2025-11-29)
+
+This was a version bump only for kernel to align it with other projects, there were no code changes.
+
 ## 0.0.5 (2025-11-29)
 
 This was a version bump only for kernel to align it with other projects, there were no code changes.
