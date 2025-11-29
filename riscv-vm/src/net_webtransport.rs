@@ -15,6 +15,10 @@ const MSG_TYPE_DATA: u8 = 0x01;
 /// Heartbeat interval in seconds (reduced for better keepalive in browsers)
 const HEARTBEAT_INTERVAL_SECS: u64 = 15;
 
+/// QUIC keep-alive interval in seconds.
+/// Client sends QUIC PING frames at this interval to keep the connection alive.
+const QUIC_KEEP_ALIVE_SECS: u64 = 10;
+
 /// Control message for registration
 fn make_register_message(mac: &[u8; 6]) -> Vec<u8> {
     let json = format!(
@@ -186,14 +190,20 @@ mod native {
                         ClientConfig::builder()
                             .with_bind_default()
                             .with_server_certificate_hashes(vec![digest])
+                            // CRITICAL: Send QUIC PING frames to keep connection alive
+                            .keep_alive_interval(Some(Duration::from_secs(QUIC_KEEP_ALIVE_SECS)))
                             .build()
                     } else {
                         eprintln!("[WebTransport] WARNING: No certificate hash provided, disabling cert validation");
                         ClientConfig::builder()
                             .with_bind_default()
                             .with_no_cert_validation()
+                            // CRITICAL: Send QUIC PING frames to keep connection alive
+                            .keep_alive_interval(Some(Duration::from_secs(QUIC_KEEP_ALIVE_SECS)))
                             .build()
                     };
+                    
+                    eprintln!("[WebTransport] QUIC keep-alive interval: {}s", QUIC_KEEP_ALIVE_SECS);
 
                     let endpoint = match Endpoint::client(config) {
                         Ok(ep) => ep,

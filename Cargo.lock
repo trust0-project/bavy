@@ -1045,7 +1045,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "linked_list_allocator",
  "panic-halt",
@@ -1852,7 +1852,7 @@ dependencies = [
 
 [[package]]
 name = "riscv-vm"
-version = "0.0.15"
+version = "0.0.16"
 dependencies = [
  "bincode",
  "clap",
