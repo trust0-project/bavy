@@ -31,6 +31,46 @@ features = [
     "socket-udp",
 ]
 
+# TLS support for HTTPS
+[dependencies.embedded-tls]
+version = "0.17"
+default-features = false
+features = ["alloc"]
+
+[dependencies.embedded-io]
+version = "0.6"
+
+[dependencies.embedded-io-async]
+version = "0.6"
+
+[dependencies.rand_core]
+version = "0.6"
+default-features = false
+
+# Crypto primitives for TLS (RustCrypto stack)
+[dependencies.sha2]
+version = "0.10"
+default-features = false
+
+[dependencies.hmac]
+version = "0.12"
+default-features = false
+
+[dependencies.aes-gcm]
+version = "0.10"
+default-features = false
+features = ["alloc", "aes"]
+
+[dependencies.p256]
+version = "0.13"
+default-features = false
+features = ["ecdh", "arithmetic"]
+
+[dependencies.x25519-dalek]
+version = "2"
+default-features = false
+features = ["static_secrets", "alloc"]
+
 [profile.release]
 strip = true
 lto = true

@@ -128,7 +128,13 @@ async fn main() -> Result<()> {
     // Spawn the UDP response receiver for external proxy
     let hub_clone = hub.clone();
     tokio::spawn(async move {
-        run_proxy_receiver(hub_clone).await;
+        run_udp_proxy_receiver(hub_clone).await;
+    });
+
+    // Spawn the TCP response receiver for external proxy
+    let hub_clone = hub.clone();
+    tokio::spawn(async move {
+        run_tcp_proxy_receiver(hub_clone).await;
     });
 
     // Spawn the peer cleanup task
@@ -304,7 +310,7 @@ async fn handle_connection(
 }
 
 /// Run the external proxy UDP receiver loop
-async fn run_proxy_receiver(hub: Arc<Hub>) {
+async fn run_udp_proxy_receiver(hub: Arc<Hub>) {
     loop {
         let socket = hub.proxy().udp_socket().await;
 
@@ -331,6 +337,21 @@ async fn run_proxy_receiver(hub: Arc<Hub>) {
         }
 
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Run the external proxy TCP receiver loop
+async fn run_tcp_proxy_receiver(hub: Arc<Hub>) {
+    loop {
+        // Poll for TCP responses from active connections
+        while let Some(response_frame) = hub.proxy().poll_tcp_response().await {
+            info!("TCP receiver: got {} byte frame from proxy, routing to peer", response_frame.len());
+            // Route the response frame to the appropriate peer
+            broadcast_response(&hub, &response_frame).await;
+        }
+        
+        // Small delay to avoid busy-waiting
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 

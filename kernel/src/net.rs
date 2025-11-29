@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 use alloc::collections::VecDeque;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
-use smoltcp::socket::{icmp, udp};
+use smoltcp::socket::{icmp, tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address};
 
@@ -49,7 +49,7 @@ struct LoopbackReply {
 }
 
 /// Static storage for sockets
-static mut SOCKET_STORAGE: [SocketStorage<'static>; 4] = [SocketStorage::EMPTY; 4];
+static mut SOCKET_STORAGE: [SocketStorage<'static>; 8] = [SocketStorage::EMPTY; 8];
 
 /// Static storage for ICMP buffers - need larger buffers for proper ICMP
 static mut ICMP_RX_META: [icmp::PacketMetadata; 8] = [icmp::PacketMetadata::EMPTY; 8];
@@ -62,6 +62,10 @@ static mut UDP_RX_META: [udp::PacketMetadata; 8] = [udp::PacketMetadata::EMPTY; 
 static mut UDP_TX_META: [udp::PacketMetadata; 8] = [udp::PacketMetadata::EMPTY; 8];
 static mut UDP_RX_DATA: [u8; 1024] = [0; 1024];
 static mut UDP_TX_DATA: [u8; 1024] = [0; 1024];
+
+/// Static storage for TCP buffers (for HTTP connections)
+static mut TCP_RX_DATA: [u8; 8192] = [0; 8192];
+static mut TCP_TX_DATA: [u8; 4096] = [0; 4096];
 
 /// Cached ARP entry
 struct ArpCache {
@@ -76,6 +80,7 @@ pub struct NetState {
     sockets: SocketSet<'static>,
     icmp_handle: SocketHandle,
     udp_handle: SocketHandle,
+    tcp_handle: SocketHandle,
     arp_cache: Option<ArpCache>,
     /// Pending loopback ping replies (delivered on next poll)
     loopback_replies: VecDeque<LoopbackReply>,
@@ -171,18 +176,29 @@ impl NetState {
         // Bind UDP socket to local port for DNS
         udp_socket.bind(DNS_LOCAL_PORT).ok();
         
+        // Create TCP socket for HTTP connections
+        let tcp_rx_buffer = unsafe {
+            tcp::SocketBuffer::new(&mut TCP_RX_DATA[..])
+        };
+        let tcp_tx_buffer = unsafe {
+            tcp::SocketBuffer::new(&mut TCP_TX_DATA[..])
+        };
+        let tcp_socket = tcp::Socket::new(tcp_rx_buffer, tcp_tx_buffer);
+        
         let mut state = NetState {
             device,
             iface,
             sockets,
             icmp_handle: SocketHandle::default(),
             udp_handle: SocketHandle::default(),
+            tcp_handle: SocketHandle::default(),
             arp_cache: None,
             loopback_replies: VecDeque::new(),
         };
         
         state.icmp_handle = state.sockets.add(icmp_socket);
         state.udp_handle = state.sockets.add(udp_socket);
+        state.tcp_handle = state.sockets.add(tcp_socket);
         
         Ok(state)
     }
@@ -504,6 +520,142 @@ impl NetState {
     pub fn udp_can_recv(&mut self) -> bool {
         let socket = self.sockets.get_mut::<udp::Socket>(self.udp_handle);
         socket.can_recv()
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // TCP METHODS (for HTTP connections)
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Connect TCP socket to a remote host
+    pub fn tcp_connect(&mut self, dest_ip: Ipv4Address, dest_port: u16, timestamp_ms: i64) -> Result<(), &'static str> {
+        let timestamp = Instant::from_millis(timestamp_ms);
+        
+        // Get the TCP socket
+        let socket = self.sockets.get_mut::<tcp::Socket>(self.tcp_handle);
+        
+        // Close any existing connection
+        if socket.state() != tcp::State::Closed {
+            socket.abort();
+            // Poll to process the abort
+            self.iface.poll(timestamp, &mut DeviceWrapper(&mut self.device), &mut self.sockets);
+        }
+        
+        // Use a random-ish local port based on timestamp
+        let local_port = 49152 + ((timestamp_ms as u16) % 16383);
+        
+        // Create destination endpoint
+        let remote = IpEndpoint::new(IpAddress::Ipv4(dest_ip), dest_port);
+        
+        // Get the socket again after the iface poll
+        let socket = self.sockets.get_mut::<tcp::Socket>(self.tcp_handle);
+        
+        // Connect to remote
+        socket.connect(self.iface.context(), remote, local_port)
+            .map_err(|_| "Failed to initiate TCP connection")?;
+        
+        Ok(())
+    }
+    
+    /// Check if TCP socket is connected
+    pub fn tcp_is_connected(&mut self) -> bool {
+        let socket = self.sockets.get_mut::<tcp::Socket>(self.tcp_handle);
+        socket.state() == tcp::State::Established
+    }
+    
+    /// Check if TCP socket is connecting (SYN sent)
+    pub fn tcp_is_connecting(&mut self) -> bool {
+        let socket = self.sockets.get_mut::<tcp::Socket>(self.tcp_handle);
+        matches!(socket.state(), tcp::State::SynSent | tcp::State::SynReceived)
+    }
+    
+    /// Check if TCP connection failed
+    pub fn tcp_connection_failed(&mut self) -> bool {
+        let socket = self.sockets.get_mut::<tcp::Socket>(self.tcp_handle);
+        matches!(socket.state(), tcp::State::Closed | tcp::State::TimeWait)
+    }
+    
+    /// Send data over TCP connection
+    pub fn tcp_send(&mut self, data: &[u8], timestamp_ms: i64) -> Result<usize, &'static str> {
+        let timestamp = Instant::from_millis(timestamp_ms);
+        
+        // Get the TCP socket
+        let socket = self.sockets.get_mut::<tcp::Socket>(self.tcp_handle);
+        
+        if !socket.may_send() {
+            return Err("TCP socket cannot send");
+        }
+        
+        let sent = socket.send_slice(data)
+            .map_err(|_| "Failed to send TCP data")?;
+        
+        // Poll to transmit
+        self.iface.poll(timestamp, &mut DeviceWrapper(&mut self.device), &mut self.sockets);
+        
+        Ok(sent)
+    }
+    
+    /// Receive data from TCP connection (non-blocking)
+    pub fn tcp_recv(&mut self, buf: &mut [u8], timestamp_ms: i64) -> Result<usize, &'static str> {
+        let timestamp = Instant::from_millis(timestamp_ms);
+        
+        // Poll to receive any pending packets
+        self.iface.poll(timestamp, &mut DeviceWrapper(&mut self.device), &mut self.sockets);
+        
+        // Get the TCP socket
+        let socket = self.sockets.get_mut::<tcp::Socket>(self.tcp_handle);
+        
+        if !socket.may_recv() {
+            if socket.state() == tcp::State::CloseWait || socket.state() == tcp::State::Closed {
+                return Err("Connection closed by peer");
+            }
+            return Ok(0);
+        }
+        
+        match socket.recv_slice(buf) {
+            Ok(len) => Ok(len),
+            Err(_) => Ok(0),
+        }
+    }
+    
+    /// Check if TCP socket can receive data
+    pub fn tcp_can_recv(&mut self) -> bool {
+        let socket = self.sockets.get_mut::<tcp::Socket>(self.tcp_handle);
+        socket.may_recv() && socket.recv_queue() > 0
+    }
+    
+    /// Close TCP connection gracefully
+    pub fn tcp_close(&mut self, timestamp_ms: i64) {
+        let timestamp = Instant::from_millis(timestamp_ms);
+        
+        let socket = self.sockets.get_mut::<tcp::Socket>(self.tcp_handle);
+        socket.close();
+        
+        // Poll to process the close
+        self.iface.poll(timestamp, &mut DeviceWrapper(&mut self.device), &mut self.sockets);
+    }
+    
+    /// Abort TCP connection immediately
+    pub fn tcp_abort(&mut self) {
+        let socket = self.sockets.get_mut::<tcp::Socket>(self.tcp_handle);
+        socket.abort();
+    }
+    
+    /// Get TCP socket state (for debugging)
+    pub fn tcp_state(&mut self) -> &'static str {
+        let socket = self.sockets.get_mut::<tcp::Socket>(self.tcp_handle);
+        match socket.state() {
+            tcp::State::Closed => "Closed",
+            tcp::State::Listen => "Listen",
+            tcp::State::SynSent => "SynSent",
+            tcp::State::SynReceived => "SynReceived",
+            tcp::State::Established => "Established",
+            tcp::State::FinWait1 => "FinWait1",
+            tcp::State::FinWait2 => "FinWait2",
+            tcp::State::CloseWait => "CloseWait",
+            tcp::State::Closing => "Closing",
+            tcp::State::LastAck => "LastAck",
+            tcp::State::TimeWait => "TimeWait",
+        }
     }
 }
 

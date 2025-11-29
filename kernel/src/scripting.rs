@@ -38,6 +38,10 @@ pub struct SysModule;
 #[derive(Clone)]
 pub struct MemModule;
 
+/// HTTP module object - os:http
+#[derive(Clone)]
+pub struct HttpModule;
+
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // LOGGING
@@ -329,6 +333,7 @@ fn preprocess_imports(script: &str) -> PreprocessResult {
             "os:net" => "__module_net",
             "os:sys" => "__module_sys",
             "os:mem" => "__module_mem",
+            "os:http" => "__module_http",
             _ => {
                 output.push_str("// Error: Unknown module\n");
                 continue;
@@ -599,6 +604,195 @@ impl ScriptRuntime {
     }
     
     // ═══════════════════════════════════════════════════════════════════════
+    // os:http MODULE - HTTP client functions
+    // ═══════════════════════════════════════════════════════════════════════
+    
+    fn register_http_module(engine: &mut Engine) {
+        /// Helper to get time in milliseconds
+        fn get_time_ms() -> i64 {
+            const CLINT_MTIME: usize = 0x0200_BFF8;
+            let mtime = unsafe { core::ptr::read_volatile(CLINT_MTIME as *const u64) };
+            (mtime / 10_000) as i64
+        }
+        
+        // http_request(options) -> {ok, status, statusText, headers, body}
+        // options = {url, method?, headers?, body?, timeout?}
+        engine.register_fn("http_request", |options: Map| -> Map {
+            let mut result = Map::new();
+            
+            // Extract URL (required)
+            let url = match options.get("url") {
+                Some(v) => v.clone().into_string().unwrap_or_default(),
+                None => {
+                    result.insert("ok".into(), Dynamic::from(false));
+                    result.insert("error".into(), Dynamic::from("Missing 'url' in options"));
+                    return result;
+                }
+            };
+            
+            // Extract method (default: GET)
+            let method_str = options.get("method")
+                .map(|v| v.clone().into_string().unwrap_or_default())
+                .unwrap_or_else(|| "GET".to_string());
+            
+            let method = match method_str.to_uppercase().as_str() {
+                "GET" => crate::http::HttpMethod::Get,
+                "POST" => crate::http::HttpMethod::Post,
+                "PUT" => crate::http::HttpMethod::Put,
+                "DELETE" => crate::http::HttpMethod::Delete,
+                "HEAD" => crate::http::HttpMethod::Head,
+                _ => {
+                    result.insert("ok".into(), Dynamic::from(false));
+                    result.insert("error".into(), Dynamic::from("Invalid HTTP method"));
+                    return result;
+                }
+            };
+            
+            // Extract timeout (default: 10000ms)
+            let timeout = options.get("timeout")
+                .and_then(|v| v.clone().try_cast::<i64>())
+                .unwrap_or(10000);
+            
+            // Build the request
+            let mut request = match crate::http::HttpRequest::new(method, &url) {
+                Ok(r) => r,
+                Err(e) => {
+                    result.insert("ok".into(), Dynamic::from(false));
+                    result.insert("error".into(), Dynamic::from(e));
+                    return result;
+                }
+            };
+            
+            // Extract custom headers
+            if let Some(headers_val) = options.get("headers") {
+                if let Some(headers_map) = headers_val.clone().try_cast::<Map>() {
+                    for (key, value) in headers_map.iter() {
+                        if let Ok(v) = value.clone().into_string() {
+                            request.headers.insert(key.to_string(), v);
+                        }
+                    }
+                }
+            }
+            
+            // Extract body
+            if let Some(body_val) = options.get("body") {
+                if let Ok(body_str) = body_val.clone().into_string() {
+                    request = request.body_str(&body_str);
+                }
+            }
+            
+            // Perform the request
+            unsafe {
+                if let Some(ref mut net) = crate::NET_STATE {
+                    match crate::http::http_request(net, &request, timeout, get_time_ms) {
+                        Ok(response) => {
+                            // Extract body first (needs borrow), then move other fields
+                            let body_text = response.text();
+                            let status_code = response.status_code;
+                            let status_text = response.status_text;
+                            
+                            result.insert("ok".into(), Dynamic::from(true));
+                            result.insert("status".into(), Dynamic::from(status_code as i64));
+                            result.insert("statusText".into(), Dynamic::from(status_text));
+                            
+                            // Convert headers to Map
+                            let mut headers_map = Map::new();
+                            for (key, value) in response.headers {
+                                headers_map.insert(key.into(), Dynamic::from(value));
+                            }
+                            result.insert("headers".into(), Dynamic::from(headers_map));
+                            result.insert("body".into(), Dynamic::from(body_text));
+                        }
+                        Err(e) => {
+                            result.insert("ok".into(), Dynamic::from(false));
+                            result.insert("error".into(), Dynamic::from(e));
+                        }
+                    }
+                } else {
+                    result.insert("ok".into(), Dynamic::from(false));
+                    result.insert("error".into(), Dynamic::from("Network not available"));
+                }
+            }
+            
+            result
+        });
+        
+        // http_get(url) -> {ok, status, body, ...}
+        engine.register_fn("http_get", |url: ImmutableString| -> Map {
+            let mut result = Map::new();
+            
+            unsafe {
+                if let Some(ref mut net) = crate::NET_STATE {
+                    match crate::http::get(net, url.as_str(), 10000, get_time_ms) {
+                        Ok(response) => {
+                            let body_text = response.text();
+                            let status_code = response.status_code;
+                            let status_text = response.status_text;
+                            
+                            result.insert("ok".into(), Dynamic::from(true));
+                            result.insert("status".into(), Dynamic::from(status_code as i64));
+                            result.insert("statusText".into(), Dynamic::from(status_text));
+                            
+                            let mut headers_map = Map::new();
+                            for (key, value) in response.headers {
+                                headers_map.insert(key.into(), Dynamic::from(value));
+                            }
+                            result.insert("headers".into(), Dynamic::from(headers_map));
+                            result.insert("body".into(), Dynamic::from(body_text));
+                        }
+                        Err(e) => {
+                            result.insert("ok".into(), Dynamic::from(false));
+                            result.insert("error".into(), Dynamic::from(e));
+                        }
+                    }
+                } else {
+                    result.insert("ok".into(), Dynamic::from(false));
+                    result.insert("error".into(), Dynamic::from("Network not available"));
+                }
+            }
+            
+            result
+        });
+        
+        // http_post(url, body, content_type) -> {ok, status, body, ...}
+        engine.register_fn("http_post", |url: ImmutableString, body: ImmutableString, content_type: ImmutableString| -> Map {
+            let mut result = Map::new();
+            
+            unsafe {
+                if let Some(ref mut net) = crate::NET_STATE {
+                    match crate::http::post(net, url.as_str(), body.as_str(), content_type.as_str(), 10000, get_time_ms) {
+                        Ok(response) => {
+                            let body_text = response.text();
+                            let status_code = response.status_code;
+                            let status_text = response.status_text;
+                            
+                            result.insert("ok".into(), Dynamic::from(true));
+                            result.insert("status".into(), Dynamic::from(status_code as i64));
+                            result.insert("statusText".into(), Dynamic::from(status_text));
+                            
+                            let mut headers_map = Map::new();
+                            for (key, value) in response.headers {
+                                headers_map.insert(key.into(), Dynamic::from(value));
+                            }
+                            result.insert("headers".into(), Dynamic::from(headers_map));
+                            result.insert("body".into(), Dynamic::from(body_text));
+                        }
+                        Err(e) => {
+                            result.insert("ok".into(), Dynamic::from(false));
+                            result.insert("error".into(), Dynamic::from(e));
+                        }
+                    }
+                } else {
+                    result.insert("ok".into(), Dynamic::from(false));
+                    result.insert("error".into(), Dynamic::from("Network not available"));
+                }
+            }
+            
+            result
+        });
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════
     // MODULE OBJECTS - For namespace imports (import * as X from "...")
     // ═══════════════════════════════════════════════════════════════════════
     
@@ -608,6 +802,7 @@ impl ScriptRuntime {
         engine.register_type_with_name::<NetModule>("NetModule");
         engine.register_type_with_name::<SysModule>("SysModule");
         engine.register_type_with_name::<MemModule>("MemModule");
+        engine.register_type_with_name::<HttpModule>("HttpModule");
         
         // __module_fs() -> FsModule
         engine.register_fn("__module_fs", || FsModule);
@@ -750,6 +945,195 @@ impl ScriptRuntime {
             map.insert("free".into(), Dynamic::from(free as i64));
             map
         });
+        
+        // __module_http() -> HttpModule
+        engine.register_fn("__module_http", || HttpModule);
+        
+        /// Helper to get time in milliseconds
+        fn get_time_ms_mod() -> i64 {
+            const CLINT_MTIME: usize = 0x0200_BFF8;
+            let mtime = unsafe { core::ptr::read_volatile(CLINT_MTIME as *const u64) };
+            (mtime / 10_000) as i64
+        }
+        
+        // HttpModule methods
+        // http.get(url) -> response object
+        engine.register_fn("get", |_: &mut HttpModule, url: ImmutableString| -> Map {
+            let mut result = Map::new();
+            
+            unsafe {
+                if let Some(ref mut net) = crate::NET_STATE {
+                    match crate::http::get(net, url.as_str(), 10000, get_time_ms_mod) {
+                        Ok(response) => {
+                            let body_text = response.text();
+                            let status_code = response.status_code;
+                            let status_text = response.status_text;
+                            
+                            result.insert("ok".into(), Dynamic::from(true));
+                            result.insert("status".into(), Dynamic::from(status_code as i64));
+                            result.insert("statusText".into(), Dynamic::from(status_text));
+                            
+                            let mut headers_map = Map::new();
+                            for (key, value) in response.headers {
+                                headers_map.insert(key.into(), Dynamic::from(value));
+                            }
+                            result.insert("headers".into(), Dynamic::from(headers_map));
+                            result.insert("body".into(), Dynamic::from(body_text));
+                        }
+                        Err(e) => {
+                            result.insert("ok".into(), Dynamic::from(false));
+                            result.insert("error".into(), Dynamic::from(e));
+                        }
+                    }
+                } else {
+                    result.insert("ok".into(), Dynamic::from(false));
+                    result.insert("error".into(), Dynamic::from("Network not available"));
+                }
+            }
+            
+            result
+        });
+        
+        // http.post(url, body, content_type) -> response object
+        engine.register_fn("post", |_: &mut HttpModule, url: ImmutableString, body: ImmutableString, content_type: ImmutableString| -> Map {
+            let mut result = Map::new();
+            
+            unsafe {
+                if let Some(ref mut net) = crate::NET_STATE {
+                    match crate::http::post(net, url.as_str(), body.as_str(), content_type.as_str(), 10000, get_time_ms_mod) {
+                        Ok(response) => {
+                            let body_text = response.text();
+                            let status_code = response.status_code;
+                            let status_text = response.status_text;
+                            
+                            result.insert("ok".into(), Dynamic::from(true));
+                            result.insert("status".into(), Dynamic::from(status_code as i64));
+                            result.insert("statusText".into(), Dynamic::from(status_text));
+                            
+                            let mut headers_map = Map::new();
+                            for (key, value) in response.headers {
+                                headers_map.insert(key.into(), Dynamic::from(value));
+                            }
+                            result.insert("headers".into(), Dynamic::from(headers_map));
+                            result.insert("body".into(), Dynamic::from(body_text));
+                        }
+                        Err(e) => {
+                            result.insert("ok".into(), Dynamic::from(false));
+                            result.insert("error".into(), Dynamic::from(e));
+                        }
+                    }
+                } else {
+                    result.insert("ok".into(), Dynamic::from(false));
+                    result.insert("error".into(), Dynamic::from("Network not available"));
+                }
+            }
+            
+            result
+        });
+        
+        // http.request(options) -> response object
+        engine.register_fn("request", |_: &mut HttpModule, options: Map| -> Map {
+            let mut result = Map::new();
+            
+            // Extract URL (required)
+            let url = match options.get("url") {
+                Some(v) => v.clone().into_string().unwrap_or_default(),
+                None => {
+                    result.insert("ok".into(), Dynamic::from(false));
+                    result.insert("error".into(), Dynamic::from("Missing 'url' in options"));
+                    return result;
+                }
+            };
+            
+            // Extract method (default: GET)
+            let method_str = options.get("method")
+                .map(|v| v.clone().into_string().unwrap_or_default())
+                .unwrap_or_else(|| "GET".to_string());
+            
+            let method = match method_str.to_uppercase().as_str() {
+                "GET" => crate::http::HttpMethod::Get,
+                "POST" => crate::http::HttpMethod::Post,
+                "PUT" => crate::http::HttpMethod::Put,
+                "DELETE" => crate::http::HttpMethod::Delete,
+                "HEAD" => crate::http::HttpMethod::Head,
+                _ => {
+                    result.insert("ok".into(), Dynamic::from(false));
+                    result.insert("error".into(), Dynamic::from("Invalid HTTP method"));
+                    return result;
+                }
+            };
+            
+            // Extract timeout (default: 10000ms)
+            let timeout = options.get("timeout")
+                .and_then(|v| v.clone().try_cast::<i64>())
+                .unwrap_or(10000);
+            
+            // Build the request
+            let mut request = match crate::http::HttpRequest::new(method, &url) {
+                Ok(r) => r,
+                Err(e) => {
+                    result.insert("ok".into(), Dynamic::from(false));
+                    result.insert("error".into(), Dynamic::from(e));
+                    return result;
+                }
+            };
+            
+            // Extract custom headers
+            if let Some(headers_val) = options.get("headers") {
+                if let Some(headers_map) = headers_val.clone().try_cast::<Map>() {
+                    for (key, value) in headers_map.iter() {
+                        if let Ok(v) = value.clone().into_string() {
+                            request.headers.insert(key.to_string(), v);
+                        }
+                    }
+                }
+            }
+            
+            // Extract body
+            if let Some(body_val) = options.get("body") {
+                if let Ok(body_str) = body_val.clone().into_string() {
+                    request = request.body_str(&body_str);
+                }
+            }
+            
+            // Perform the request
+            unsafe {
+                if let Some(ref mut net) = crate::NET_STATE {
+                    match crate::http::http_request(net, &request, timeout, get_time_ms_mod) {
+                        Ok(response) => {
+                            let body_text = response.text();
+                            let status_code = response.status_code;
+                            let status_text = response.status_text;
+                            
+                            result.insert("ok".into(), Dynamic::from(true));
+                            result.insert("status".into(), Dynamic::from(status_code as i64));
+                            result.insert("statusText".into(), Dynamic::from(status_text));
+                            
+                            let mut headers_map = Map::new();
+                            for (key, value) in response.headers {
+                                headers_map.insert(key.into(), Dynamic::from(value));
+                            }
+                            result.insert("headers".into(), Dynamic::from(headers_map));
+                            result.insert("body".into(), Dynamic::from(body_text));
+                        }
+                        Err(e) => {
+                            result.insert("ok".into(), Dynamic::from(false));
+                            result.insert("error".into(), Dynamic::from(e));
+                        }
+                    }
+                } else {
+                    result.insert("ok".into(), Dynamic::from(false));
+                    result.insert("error".into(), Dynamic::from("Network not available"));
+                }
+            }
+            
+            result
+        });
+        
+        // http.available() -> bool
+        engine.register_fn("available", |_: &mut HttpModule| -> bool {
+            unsafe { crate::NET_STATE.is_some() }
+        });
     }
     
     /// Create a new runtime (internal, use get_runtime() for cached access)
@@ -775,6 +1159,7 @@ impl ScriptRuntime {
         Self::register_net_module(&mut engine);
         Self::register_sys_module(&mut engine);
         Self::register_mem_module(&mut engine);
+        Self::register_http_module(&mut engine);
         
         // Register module object constructors for namespace imports
         Self::register_module_objects(&mut engine);
@@ -1079,6 +1464,9 @@ pub fn print_info() {
     crate::uart::write_line("\x1b[1;36m│\x1b[0m    \x1b[1;32mos:net\x1b[0m  ip() mac() gateway() dns() prefix() available() \x1b[1;36m│\x1b[0m");
     crate::uart::write_line("\x1b[1;36m│\x1b[0m    \x1b[1;32mos:sys\x1b[0m  time() sleep(ms) cwd() version() arch()        \x1b[1;36m│\x1b[0m");
     crate::uart::write_line("\x1b[1;36m│\x1b[0m    \x1b[1;32mos:mem\x1b[0m  total() used() free() stats()                   \x1b[1;36m│\x1b[0m");
+    crate::uart::write_line("\x1b[1;36m│\x1b[0m    \x1b[1;32mos:http\x1b[0m get(url) post(url,body,ct) request(opts)      \x1b[1;36m│\x1b[0m");
+    crate::uart::write_line("\x1b[1;36m│\x1b[0m                                                             \x1b[1;36m│\x1b[0m");
+    crate::uart::write_line("\x1b[1;36m│\x1b[0m  \x1b[1;33mHTTP Response:\x1b[0m  {ok, status, statusText, headers, body}  \x1b[1;36m│\x1b[0m");
     crate::uart::write_line("\x1b[1;36m│\x1b[0m                                                             \x1b[1;36m│\x1b[0m");
     crate::uart::write_line("\x1b[1;36m│\x1b[0m  \x1b[1;33mGlobals:\x1b[0m  print() write() debug() ARGS                    \x1b[1;36m│\x1b[0m");
     crate::uart::write_line("\x1b[1;36m│\x1b[0m            parse_int() parse_float() join() range()...      \x1b[1;36m│\x1b[0m");

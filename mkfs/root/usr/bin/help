@@ -18,6 +18,7 @@ print("\x1b[1;36m|\x1b[0m    help            This help message                  
 print("\x1b[1;36m|\x1b[0m    ls              List files                               \x1b[1;36m|\x1b[0m");
 print("\x1b[1;36m|\x1b[0m    cat <file>      Display file contents                    \x1b[1;36m|\x1b[0m");
 print("\x1b[1;36m|\x1b[0m    echo [text...]  Print text                               \x1b[1;36m|\x1b[0m");
+print("\x1b[1;36m|\x1b[0m    wget <url>      Download from URL (HTTP/HTTPS)            \x1b[1;36m|\x1b[0m");
 print("\x1b[1;36m|\x1b[0m    cowsay [msg]    ASCII cow says message                   \x1b[1;36m|\x1b[0m");
 print("\x1b[1;36m|\x1b[0m    sysinfo         Display system information               \x1b[1;36m|\x1b[0m");
 print("\x1b[1;36m|\x1b[0m    ip [addr]       Show network configuration               \x1b[1;36m|\x1b[0m");
@@ -30,7 +31,13 @@ print("\x1b[1;36m|\x1b[0m  \x1b[1;33mImport Syntax:\x1b[0m                      
 print("\x1b[1;36m|\x1b[0m    import * as fs from \"os:fs\"    \x1b[0;90m// namespace import\x1b[0m     \x1b[1;36m|\x1b[0m");
 print("\x1b[1;36m|\x1b[0m    import { ls } from \"os:fs\"     \x1b[0;90m// named import\x1b[0m         \x1b[1;36m|\x1b[0m");
 print("\x1b[1;36m|\x1b[0m                                                             \x1b[1;36m|\x1b[0m");
-print("\x1b[1;36m|\x1b[0m  \x1b[1;33mOS Modules:\x1b[0m  os:fs, os:net, os:sys, os:mem               \x1b[1;36m|\x1b[0m");
+print("\x1b[1;36m|\x1b[0m  \x1b[1;33mOS Modules:\x1b[0m  os:fs, os:net, os:sys, os:mem, os:http      \x1b[1;36m|\x1b[0m");
+print("\x1b[1;36m|\x1b[0m                                                             \x1b[1;36m|\x1b[0m");
+print("\x1b[1;36m|\x1b[0m  \x1b[1;33mHTTP Module:\x1b[0m  \x1b[0;90m(import * as http from \"os:http\")\x1b[0m         \x1b[1;36m|\x1b[0m");
+print("\x1b[1;36m|\x1b[0m    http.get(url)         GET request -> response object     \x1b[1;36m|\x1b[0m");
+print("\x1b[1;36m|\x1b[0m    http.post(url,body,t) POST request -> response object    \x1b[1;36m|\x1b[0m");
+print("\x1b[1;36m|\x1b[0m    http.request(opts)    Custom request with options        \x1b[1;36m|\x1b[0m");
+print("\x1b[1;36m|\x1b[0m    Response: {ok, status, statusText, headers, body}        \x1b[1;36m|\x1b[0m");
 print("\x1b[1;36m|\x1b[0m                                                             \x1b[1;36m|\x1b[0m");
 print("\x1b[1;36m|\x1b[0m  \x1b[1;32mTip:\x1b[0m  \x1b[1;97mCtrl+C\x1b[0m cancel  |  \x1b[1;97m^/v\x1b[0m history  |  \x1b[1;97mnode info\x1b[0m API  \x1b[1;36m|\x1b[0m");
 print("\x1b[1;36m+-------------------------------------------------------------+\x1b[0m");

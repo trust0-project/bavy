@@ -4,8 +4,11 @@
 mod allocator;
 mod dns;
 mod fs;
+mod http;
 mod net;
 mod scripting;
+mod tls;
+mod tls12;
 mod uart;
 mod virtio_blk;
 mod virtio_net;
@@ -566,7 +569,7 @@ fn handle_tab_completion(buffer: &mut [u8], len: usize) -> usize {
         let builtins = [
             "clear", "shutdown", "cd", "pwd", "ping", "nslookup", "node", "help",
             "ls", "cat", "echo", "cowsay", "sysinfo", "ip", "netstat", "memstats",
-            "uptime", "write",
+            "uptime", "write", "wget",
         ];
         
         for cmd in builtins.iter() {
