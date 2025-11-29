@@ -105,8 +105,8 @@ fn parse_ip_from_json(json_str: &str) -> Option<[u8; 4]> {
 mod native {
     use super::*;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::mpsc::{channel, Receiver, Sender};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
     use std::sync::Mutex;
     use std::thread;
     use std::time::Duration;
@@ -115,6 +115,11 @@ mod native {
     use wtransport::ClientConfig;
     use wtransport::Endpoint;
 
+    /// Maximum reconnection delay in seconds
+    const MAX_RECONNECT_DELAY_SECS: u64 = 30;
+    /// Initial reconnection delay in seconds
+    const INITIAL_RECONNECT_DELAY_SECS: u64 = 2;
+
     pub struct WebTransportBackend {
         tx_to_transport: Option<Sender<Vec<u8>>>,
         rx_from_transport: Option<Receiver<Vec<u8>>>,
@@ -122,6 +127,8 @@ mod native {
         registered: Arc<AtomicBool>,
         /// IP address assigned by the relay server
         assigned_ip: Arc<Mutex<Option<[u8; 4]>>>,
+        /// Connection attempt counter (for debugging)
+        connection_attempts: Arc<AtomicU32>,
     }
 
     impl WebTransportBackend {
@@ -162,14 +169,14 @@ mod native {
             let registered_clone = registered.clone();
             let assigned_ip = Arc::new(Mutex::new(None));
             let assigned_ip_clone = assigned_ip.clone();
+            let connection_attempts = Arc::new(AtomicU32::new(0));
+            let connection_attempts_clone = connection_attempts.clone();
 
             thread::spawn(move || {
                 let rt = Runtime::new().unwrap();
                 rt.block_on(async move {
-                    eprintln!("[WebTransport] Starting connection to {}...", url);
-                    
-                    let config = if let Some(hash_str) = cert_hash {
-                        // Parse hex hash
+                    // Parse cert hash once outside the reconnection loop
+                    let cert_digest = if let Some(hash_str) = &cert_hash {
                         eprintln!("[WebTransport] Using certificate hash: {}", hash_str);
                         let bytes = match hex::decode(hash_str.replace(":", "")) {
                             Ok(b) => b,
@@ -186,123 +193,166 @@ mod native {
                                 return;
                             }
                         };
-                        let digest = Sha256Digest::from(array);
-                        ClientConfig::builder()
-                            .with_bind_default()
-                            .with_server_certificate_hashes(vec![digest])
-                            // CRITICAL: Send QUIC PING frames to keep connection alive
-                            .keep_alive_interval(Some(Duration::from_secs(QUIC_KEEP_ALIVE_SECS)))
-                            .build()
+                        Some(Sha256Digest::from(array))
                     } else {
                         eprintln!("[WebTransport] WARNING: No certificate hash provided, disabling cert validation");
-                        ClientConfig::builder()
-                            .with_bind_default()
-                            .with_no_cert_validation()
-                            // CRITICAL: Send QUIC PING frames to keep connection alive
-                            .keep_alive_interval(Some(Duration::from_secs(QUIC_KEEP_ALIVE_SECS)))
-                            .build()
+                        None
                     };
                     
                     eprintln!("[WebTransport] QUIC keep-alive interval: {}s", QUIC_KEEP_ALIVE_SECS);
 
-                    let endpoint = match Endpoint::client(config) {
-                        Ok(ep) => ep,
-                        Err(e) => {
-                            eprintln!("[WebTransport] ERROR: Failed to create endpoint: {}", e);
-                            return;
-                        }
-                    };
-
-                    eprintln!("[WebTransport] Connecting to {}...", url);
-                    let connection = match endpoint.connect(&url).await {
-                        Ok(conn) => conn,
-                        Err(e) => {
-                            eprintln!("[WebTransport] ERROR: Connection failed: {}", e);
-                            log::error!("[WebTransport] Connection failed: {}", e);
-                            return;
-                        }
-                    };
-                    eprintln!("[WebTransport] Connected successfully!");
-
-                    // Send registration message
-                    let register_msg = make_register_message(&mac_copy);
-                    if let Err(e) = connection.send_datagram(register_msg) {
-                        eprintln!("[WebTransport] ERROR: Failed to send registration: {}", e);
-                        return;
-                    }
-                    eprintln!("[WebTransport] Registration sent, MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                        mac_copy[0], mac_copy[1], mac_copy[2], mac_copy[3], mac_copy[4], mac_copy[5]);
-
-                    let connection = Arc::new(connection);
-                    let conn_send = connection.clone();
-                    let conn_recv = connection.clone();
-                    let conn_heartbeat = connection.clone();
-
-                    // Sender task - frames Ethernet data with protocol prefix
-                    tokio::spawn(async move {
-                        loop {
-                            if let Ok(data) = rx_to_transport.try_recv() {
-                                // Data from VM is already framed by send()
-                                if let Err(e) = conn_send.send_datagram(data) {
-                                    log::error!("Failed to send datagram: {}", e);
-                                    break;
-                                }
-                            } else {
-                                tokio::time::sleep(Duration::from_millis(1)).await;
-                            }
-                        }
-                    });
-
-                    // Heartbeat task - sends periodic heartbeats to keep connection alive
-                    tokio::spawn(async move {
-                        let mut interval = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
-                        loop {
-                            interval.tick().await;
-                            let heartbeat = make_heartbeat_message();
-                            if let Err(e) = conn_heartbeat.send_datagram(heartbeat) {
-                                log::warn!("[WebTransport] Failed to send heartbeat: {}", e);
-                                break;
-                            }
-                            log::trace!("[WebTransport] Heartbeat sent");
-                        }
-                    });
-
-                    // Receiver loop - decodes protocol and passes Ethernet frames to VM
+                    // Reconnection loop - keeps trying to connect/reconnect forever
+                    let mut reconnect_delay = INITIAL_RECONNECT_DELAY_SECS;
+                    
                     loop {
-                        match conn_recv.receive_datagram().await {
-                            Ok(datagram) => {
-                                let data = datagram.to_vec();
-                                
-                                // Check for Assigned message to confirm registration and extract IP
-                                if !data.is_empty() && data[0] == MSG_TYPE_CONTROL {
-                                    if let Ok(json_str) = std::str::from_utf8(&data[1..]) {
-                                        if json_str.contains("\"type\":\"Assigned\"") {
-                                            registered_clone.store(true, Ordering::SeqCst);
-                                            
-                                            // Parse IP from JSON: {"type":"Assigned","ip":[10,0,2,X],...}
-                                            if let Some(ip) = parse_ip_from_json(json_str) {
-                                                if let Ok(mut guard) = assigned_ip_clone.lock() {
-                                                    *guard = Some(ip);
+                        let attempt = connection_attempts_clone.fetch_add(1, Ordering::SeqCst) + 1;
+                        
+                        if attempt > 1 {
+                            eprintln!("[WebTransport] Reconnection attempt {} (delay was {}s)...", attempt, reconnect_delay);
+                        } else {
+                            eprintln!("[WebTransport] Starting connection to {}...", url);
+                        }
+                        
+                        // Reset registered state on reconnection
+                        registered_clone.store(false, Ordering::SeqCst);
+                        
+                        // Build config for this connection attempt
+                        let config = if let Some(ref digest) = cert_digest {
+                            ClientConfig::builder()
+                                .with_bind_default()
+                                .with_server_certificate_hashes(vec![digest.clone()])
+                                .keep_alive_interval(Some(Duration::from_secs(QUIC_KEEP_ALIVE_SECS)))
+                                .build()
+                        } else {
+                            ClientConfig::builder()
+                                .with_bind_default()
+                                .with_no_cert_validation()
+                                .keep_alive_interval(Some(Duration::from_secs(QUIC_KEEP_ALIVE_SECS)))
+                                .build()
+                        };
+
+                        let endpoint = match Endpoint::client(config) {
+                            Ok(ep) => ep,
+                            Err(e) => {
+                                eprintln!("[WebTransport] ERROR: Failed to create endpoint: {}", e);
+                                tokio::time::sleep(Duration::from_secs(reconnect_delay)).await;
+                                reconnect_delay = (reconnect_delay * 2).min(MAX_RECONNECT_DELAY_SECS);
+                                continue;
+                            }
+                        };
+
+                        eprintln!("[WebTransport] Connecting to {}...", url);
+                        let connection = match endpoint.connect(&url).await {
+                            Ok(conn) => {
+                                // Reset delay on successful connection
+                                reconnect_delay = INITIAL_RECONNECT_DELAY_SECS;
+                                conn
+                            }
+                            Err(e) => {
+                                eprintln!("[WebTransport] ERROR: Connection failed: {}", e);
+                                log::error!("[WebTransport] Connection failed: {}", e);
+                                tokio::time::sleep(Duration::from_secs(reconnect_delay)).await;
+                                reconnect_delay = (reconnect_delay * 2).min(MAX_RECONNECT_DELAY_SECS);
+                                continue;
+                            }
+                        };
+                        eprintln!("[WebTransport] Connected successfully!");
+
+                        // Send registration message
+                        let register_msg = make_register_message(&mac_copy);
+                        if let Err(e) = connection.send_datagram(register_msg) {
+                            eprintln!("[WebTransport] ERROR: Failed to send registration: {}", e);
+                            tokio::time::sleep(Duration::from_secs(reconnect_delay)).await;
+                            reconnect_delay = (reconnect_delay * 2).min(MAX_RECONNECT_DELAY_SECS);
+                            continue;
+                        }
+                        eprintln!("[WebTransport] Registration sent, MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                            mac_copy[0], mac_copy[1], mac_copy[2], mac_copy[3], mac_copy[4], mac_copy[5]);
+
+                        let connection = Arc::new(connection);
+                        
+                        // Run sender/receiver/heartbeat in a combined loop using select!
+                        // This avoids issues with sharing channels across tasks
+                        let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
+                        let mut send_check_interval = tokio::time::interval(Duration::from_millis(1));
+                        
+                        'connection_loop: loop {
+                            tokio::select! {
+                                // Check for data to send to relay
+                                _ = send_check_interval.tick() => {
+                                    // Drain all pending sends
+                                    loop {
+                                        match rx_to_transport.try_recv() {
+                                            Ok(data) => {
+                                                if let Err(e) = connection.send_datagram(data) {
+                                                    log::error!("Failed to send datagram: {}", e);
+                                                    break 'connection_loop;
                                                 }
-                                                eprintln!("[WebTransport] IP Assigned: {}.{}.{}.{}", 
-                                                    ip[0], ip[1], ip[2], ip[3]);
                                             }
-                                            
-                                            eprintln!("[WebTransport] Registered with relay: {}", json_str);
+                                            Err(TryRecvError::Empty) => break,
+                                            Err(TryRecvError::Disconnected) => {
+                                                eprintln!("[WebTransport] TX channel disconnected, shutting down");
+                                                return; // Permanent shutdown
+                                            }
                                         }
                                     }
                                 }
                                 
-                                // Decode and forward Ethernet frames
-                                if let Some(ethernet_frame) = decode_message(&data) {
-                                    let _ = tx_from_transport.send(ethernet_frame);
+                                // Send periodic heartbeats
+                                _ = heartbeat_interval.tick() => {
+                                    let heartbeat = make_heartbeat_message();
+                                    if let Err(e) = connection.send_datagram(heartbeat) {
+                                        log::warn!("[WebTransport] Failed to send heartbeat: {}", e);
+                                        break 'connection_loop;
+                                    }
+                                    log::trace!("[WebTransport] Heartbeat sent");
+                                }
+                                
+                                // Receive data from relay
+                                result = connection.receive_datagram() => {
+                                    match result {
+                                        Ok(datagram) => {
+                                            let data = datagram.to_vec();
+                                            
+                                            // Check for Assigned message to confirm registration and extract IP
+                                            if !data.is_empty() && data[0] == MSG_TYPE_CONTROL {
+                                                if let Ok(json_str) = std::str::from_utf8(&data[1..]) {
+                                                    if json_str.contains("\"type\":\"Assigned\"") {
+                                                        registered_clone.store(true, Ordering::SeqCst);
+                                                        
+                                                        // Parse IP from JSON: {"type":"Assigned","ip":[10,0,2,X],...}
+                                                        if let Some(ip) = parse_ip_from_json(json_str) {
+                                                            if let Ok(mut guard) = assigned_ip_clone.lock() {
+                                                                *guard = Some(ip);
+                                                            }
+                                                            eprintln!("[WebTransport] IP Assigned: {}.{}.{}.{}", 
+                                                                ip[0], ip[1], ip[2], ip[3]);
+                                                        }
+                                                        
+                                                        eprintln!("[WebTransport] Registered with relay: {}", json_str);
+                                                    }
+                                                }
+                                            }
+                                            
+                                            // Decode and forward Ethernet frames
+                                            if let Some(ethernet_frame) = decode_message(&data) {
+                                                let _ = tx_from_transport.send(ethernet_frame);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            eprintln!("[WebTransport] Connection lost: {}", e);
+                                            log::error!("[WebTransport] Receive error: {}", e);
+                                            break 'connection_loop;
+                                        }
+                                    }
                                 }
                             }
-                            Err(e) => {
-                                log::error!("Receive error: {}", e);
-                                break;
-                            }
                         }
+                        
+                        // Connection lost, wait before reconnecting
+                        eprintln!("[WebTransport] Scheduling reconnection in {}s...", reconnect_delay);
+                        tokio::time::sleep(Duration::from_secs(reconnect_delay)).await;
+                        reconnect_delay = (reconnect_delay * 2).min(MAX_RECONNECT_DELAY_SECS);
                     }
                 });
             });
@@ -313,6 +363,7 @@ mod native {
                 mac,
                 registered,
                 assigned_ip,
+                connection_attempts,
             }
         }
 
