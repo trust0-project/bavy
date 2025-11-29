@@ -327,6 +327,10 @@ fn main() -> ! {
     // ─── STORAGE SUBSYSTEM ────────────────────────────────────────────────────
     init_storage();
     
+    // ─── SCRIPTING ENGINE ──────────────────────────────────────────────────────
+    // Preload scripts from /usr/bin/ into AST cache for faster first execution
+    scripting::preload_scripts();
+    
     // ─── NETWORK SUBSYSTEM ────────────────────────────────────────────────────
     print_section("NETWORK SUBSYSTEM");
     init_network();
@@ -1264,7 +1268,8 @@ fn cmd_node(args: &[u8]) {
             out_line("Example: node eval 2 + 2 * 3");
             return;
         }
-        match scripting::execute_script(expr, "") {
+        // Use uncached execution for one-off REPL expressions
+        match scripting::execute_script_uncached(expr, "") {
             Ok(output) => {
                 if !output.is_empty() {
                     out_str(&output);

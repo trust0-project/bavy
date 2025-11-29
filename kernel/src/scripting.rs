@@ -6,11 +6,17 @@
 //!   import * from "os:net"
 //!   import * from "os:sys"
 //!   import * from "os:mem"
+//!
+//! Performance optimizations:
+//!   - Global cached runtime (created once, reused)
+//!   - Compiled AST caching for frequently used scripts
+//!   - Optimized import preprocessor
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use alloc::collections::BTreeMap;
 use alloc::format;
-use rhai::{Engine, Scope, Dynamic, Array, Map, ImmutableString, packages::{Package, StandardPackage}};
+use rhai::{Engine, Scope, Dynamic, Array, Map, ImmutableString, AST, packages::{Package, StandardPackage}};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // MODULE TYPES - For namespace imports (import * as X from "...")
@@ -128,6 +134,148 @@ fn append_output(s: &str) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// GLOBAL RUNTIME CACHE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+static mut CACHED_RUNTIME: Option<ScriptRuntime> = None;
+
+/// Get or create the global cached runtime (much faster than creating new each time)
+fn get_runtime() -> &'static ScriptRuntime {
+    unsafe {
+        if CACHED_RUNTIME.is_none() {
+            log_debug!("Creating cached script runtime...");
+            CACHED_RUNTIME = Some(ScriptRuntime::new_internal());
+        }
+        CACHED_RUNTIME.as_ref().unwrap()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// AST CACHE - Cache compiled scripts for faster re-execution
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const AST_CACHE_MAX_SIZE: usize = 32;
+
+static mut AST_CACHE: Option<BTreeMap<u64, AST>> = None;
+
+fn get_ast_cache() -> &'static mut BTreeMap<u64, AST> {
+    unsafe {
+        if AST_CACHE.is_none() {
+            AST_CACHE = Some(BTreeMap::new());
+        }
+        AST_CACHE.as_mut().unwrap()
+    }
+}
+
+/// Simple FNV-1a hash for script content (fast, good distribution)
+#[inline]
+fn hash_script(script: &str) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    
+    let mut hash = FNV_OFFSET;
+    for byte in script.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// Try to get cached AST, or compile and cache it
+fn get_or_compile_ast(engine: &Engine, script: &str, hash: u64) -> Result<AST, String> {
+    let cache = get_ast_cache();
+    
+    // Check cache first
+    if let Some(ast) = cache.get(&hash) {
+        log_trace!("AST cache hit for hash {:016x}", hash);
+        return Ok(ast.clone());
+    }
+    
+    // Compile new AST
+    log_trace!("AST cache miss, compiling script...");
+    let ast = engine.compile(script).map_err(|e| format!("Syntax error: {}", e))?;
+    
+    // Evict oldest entries if cache is full (simple LRU approximation)
+    if cache.len() >= AST_CACHE_MAX_SIZE {
+        if let Some(&oldest_key) = cache.keys().next() {
+            cache.remove(&oldest_key);
+        }
+    }
+    
+    // Cache the compiled AST
+    cache.insert(hash, ast.clone());
+    log_trace!("Cached AST, cache size: {}", cache.len());
+    
+    Ok(ast)
+}
+
+/// Clear the AST cache (useful for debugging or freeing memory)
+pub fn clear_ast_cache() {
+    unsafe {
+        if let Some(ref mut cache) = AST_CACHE {
+            cache.clear();
+            log_debug!("AST cache cleared");
+        }
+    }
+}
+
+/// Preload all scripts from /usr/bin/ into the AST cache at boot
+/// Returns the number of scripts successfully cached
+pub fn preload_scripts() -> usize {
+    log_debug!("Preloading scripts from /usr/bin/...");
+    
+    let runtime = get_runtime();
+    let mut cached_count = 0;
+    
+    unsafe {
+        if let (Some(fs), Some(dev)) = (crate::FS_STATE.as_ref(), crate::BLK_DEV.as_mut()) {
+            // List all files in /usr/bin/
+            let files = fs.list_dir(dev, "/usr/bin");
+            
+            for file_info in files {
+                // Skip directories
+                if file_info.is_dir {
+                    continue;
+                }
+                
+                let path = format!("/usr/bin/{}", file_info.name);
+                
+                // Read the script content
+                if let Some(content) = fs.read_file(dev, &path) {
+                    if let Ok(script) = core::str::from_utf8(&content) {
+                        // Preprocess and cache
+                        let preprocess_result = preprocess_imports(script);
+                        let processed_script = preprocess_result.as_str(script);
+                        let script_hash = hash_script(processed_script);
+                        
+                        // Try to compile and cache
+                        match get_or_compile_ast(&runtime.engine, processed_script, script_hash) {
+                            Ok(_) => {
+                                log_trace!("Cached: {}", file_info.name);
+                                cached_count += 1;
+                            }
+                            Err(e) => {
+                                log_error!("Failed to cache {}: {}", file_info.name, e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    log_debug!("Preloaded {} scripts into AST cache", cached_count);
+    cached_count
+}
+
+/// Get the current AST cache size
+pub fn ast_cache_size() -> usize {
+    unsafe {
+        AST_CACHE.as_ref().map(|c| c.len()).unwrap_or(0)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // ES6 IMPORT PREPROCESSOR
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -135,95 +283,113 @@ fn append_output(s: &str) {
 /// Transforms:
 ///   import * as fs from "os:fs"     → let fs = __module_fs();
 ///   import { ls, read_file } from "os:fs"  → (stripped, functions are global)
-fn preprocess_imports(script: &str) -> String {
-    let mut output = String::with_capacity(script.len() + 256);
+/// 
+/// Optimized: returns original script unchanged if no imports found (zero-copy)
+fn preprocess_imports(script: &str) -> PreprocessResult {
+    // Fast path: check if script contains any imports at all
+    if !script.contains("import ") {
+        return PreprocessResult::Unchanged;
+    }
+    
+    let mut output = String::with_capacity(script.len() + 128);
+    let mut had_imports = false;
     
     for line in script.lines() {
         let trimmed = line.trim();
         
-        // Skip empty lines and comments
-        if trimmed.is_empty() || trimmed.starts_with("//") {
+        // Fast skip: empty lines, comments, or lines not starting with 'i'
+        if trimmed.is_empty() || trimmed.starts_with("//") || !trimmed.starts_with("import ") {
             output.push_str(line);
             output.push('\n');
             continue;
         }
         
-        // Check for import statement
-        if trimmed.starts_with("import ") && trimmed.contains(" from ") {
-            // Extract the module name from quotes
-            let module_name = extract_module_name(trimmed);
-            
-            if let Some(module) = module_name {
-                // Check for: import * as NAME from "module"
-                if trimmed.contains("* as ") {
-                    if let Some(alias) = extract_namespace_alias(trimmed) {
-                        // Transform to: let NAME = __module_X();
-                        let fn_name = match module.as_str() {
-                            "os:fs" => "__module_fs",
-                            "os:net" => "__module_net",
-                            "os:sys" => "__module_sys",
-                            "os:mem" => "__module_mem",
-                            _ => {
-                                output.push_str(&format!("// Error: Unknown module '{}'\n", module));
-                                continue;
-                            }
-                        };
-                        output.push_str(&format!("let {} = {}();\n", alias, fn_name));
-                        continue;
-                    }
-                }
-                
-                // Check for: import { fn1, fn2 } from "module" (named imports)
-                // These are stripped since functions are global
-                if trimmed.contains('{') && trimmed.contains('}') {
-                    // Validate module exists
-                    match module.as_str() {
-                        "os:fs" | "os:net" | "os:sys" | "os:mem" => {
-                            output.push_str(&format!("// imported from {}\n", module));
-                            continue;
-                        }
-                        _ => {
-                            output.push_str(&format!("// Error: Unknown module '{}'\n", module));
-                            continue;
-                        }
-                    }
-                }
-                
-                // Plain: import * from "module" (import all globals)
-                if trimmed.contains("* from") && !trimmed.contains("* as") {
-                    match module.as_str() {
-                        "os:fs" | "os:net" | "os:sys" | "os:mem" => {
-                            output.push_str(&format!("// imported {} globals\n", module));
-                            continue;
-                        }
-                        _ => {
-                            output.push_str(&format!("// Error: Unknown module '{}'\n", module));
-                            continue;
-                        }
-                    }
-                }
-            }
+        // Must be an import line - check for " from "
+        if !trimmed.contains(" from ") {
+            output.push_str(line);
+            output.push('\n');
+            continue;
         }
         
-        output.push_str(line);
-        output.push('\n');
+        had_imports = true;
+        
+        // Extract module name (between quotes)
+        let module = match extract_module_name_fast(trimmed) {
+            Some(m) => m,
+            None => {
+                output.push_str(line);
+                output.push('\n');
+                continue;
+            }
+        };
+        
+        // Map module name to function name
+        let module_fn = match module {
+            "os:fs" => "__module_fs",
+            "os:net" => "__module_net",
+            "os:sys" => "__module_sys",
+            "os:mem" => "__module_mem",
+            _ => {
+                output.push_str("// Error: Unknown module\n");
+                continue;
+            }
+        };
+        
+        // Check for: import * as NAME from "module"
+        if let Some(alias) = extract_namespace_alias_fast(trimmed) {
+            output.push_str("let ");
+            output.push_str(alias);
+            output.push_str(" = ");
+            output.push_str(module_fn);
+            output.push_str("();\n");
+            continue;
+        }
+        
+        // Named imports or plain "import * from" - just strip them
+        output.push_str("// imported\n");
     }
     
-    output
+    if had_imports {
+        PreprocessResult::Changed(output)
+    } else {
+        PreprocessResult::Unchanged
+    }
 }
 
-/// Extract module name from import statement (between quotes)
-fn extract_module_name(line: &str) -> Option<String> {
+/// Result of preprocessing - avoids allocation when no changes needed
+enum PreprocessResult {
+    Unchanged,
+    Changed(String),
+}
+
+impl PreprocessResult {
+    #[inline]
+    fn as_str<'a>(&'a self, original: &'a str) -> &'a str {
+        match self {
+            PreprocessResult::Unchanged => original,
+            PreprocessResult::Changed(s) => s.as_str(),
+        }
+    }
+}
+
+/// Extract module name from import statement (between quotes) - returns &str, no allocation
+#[inline]
+fn extract_module_name_fast(line: &str) -> Option<&str> {
+    // Find " from " first, then look for quotes after it
+    let from_pos = line.find(" from ")?;
+    let after_from = &line[from_pos + 6..];
+    
     // Find opening quote
-    let start = line.find('"').or_else(|| line.find('\''))?;
-    let rest = &line[start + 1..];
+    let start = after_from.find('"').or_else(|| after_from.find('\''))?;
+    let rest = &after_from[start + 1..];
     // Find closing quote
     let end = rest.find('"').or_else(|| rest.find('\''))?;
-    Some(rest[..end].to_string())
+    Some(&rest[..end])
 }
 
-/// Extract namespace alias from "import * as NAME from ..."
-fn extract_namespace_alias(line: &str) -> Option<String> {
+/// Extract namespace alias from "import * as NAME from ..." - returns &str, no allocation
+#[inline]
+fn extract_namespace_alias_fast(line: &str) -> Option<&str> {
     // Find "* as " pattern
     let as_pos = line.find("* as ")?;
     let after_as = &line[as_pos + 5..];
@@ -233,7 +399,7 @@ fn extract_namespace_alias(line: &str) -> Option<String> {
     if alias.is_empty() {
         None
     } else {
-        Some(alias.to_string())
+        Some(alias)
     }
 }
 
@@ -586,7 +752,8 @@ impl ScriptRuntime {
         });
     }
     
-    pub fn new() -> Self {
+    /// Create a new runtime (internal, use get_runtime() for cached access)
+    fn new_internal() -> Self {
         log_debug!("Initializing JavaScript runtime...");
         
         let mut engine = Engine::new_raw();
@@ -748,12 +915,56 @@ impl ScriptRuntime {
         Self { engine }
     }
     
+    /// Execute a script with optional arguments
+    /// Uses AST caching for faster repeated execution
     pub fn execute(&self, script: &str, args: &[&str]) -> Result<String, String> {
         log_trace!("Executing script ({} bytes, {} args)", script.len(), args.len());
         
-        // Preprocess ES6 imports
-        let processed_script = preprocess_imports(script);
-        log_trace!("Preprocessed script ({} bytes)", processed_script.len());
+        // Preprocess ES6 imports (zero-copy if no imports)
+        let preprocess_result = preprocess_imports(script);
+        let processed_script = preprocess_result.as_str(script);
+        
+        // Compute hash for AST caching
+        let script_hash = hash_script(processed_script);
+        
+        // Get or compile the AST (cached)
+        let ast = get_or_compile_ast(&self.engine, processed_script, script_hash)?;
+        
+        init_output();
+        
+        // Build scope with arguments
+        let mut scope = Scope::new();
+        let args_array: Array = args.iter()
+            .map(|&s| Dynamic::from(ImmutableString::from(s)))
+            .collect();
+        scope.push("ARGS", args_array);
+        
+        // Execute the cached AST
+        match self.engine.eval_ast_with_scope::<Dynamic>(&mut scope, &ast) {
+            Ok(result) => {
+                let output = take_output();
+                log_trace!("Script completed successfully, output: {} bytes", output.len());
+                
+                if output.is_empty() && !result.is_unit() {
+                    return Ok(format!("{}\n", result));
+                }
+                
+                Ok(String::from_utf8_lossy(&output).into_owned())
+            }
+            Err(e) => {
+                take_output();
+                log_error!("Script execution failed: {}", e);
+                Err(format!("{}", e))
+            }
+        }
+    }
+    
+    /// Execute script without caching (for one-off scripts like REPL)
+    pub fn execute_uncached(&self, script: &str, args: &[&str]) -> Result<String, String> {
+        log_trace!("Executing script uncached ({} bytes)", script.len());
+        
+        let preprocess_result = preprocess_imports(script);
+        let processed_script = preprocess_result.as_str(script);
         
         init_output();
         
@@ -763,15 +974,12 @@ impl ScriptRuntime {
             .collect();
         scope.push("ARGS", args_array);
         
-        match self.engine.eval_with_scope::<Dynamic>(&mut scope, &processed_script) {
+        match self.engine.eval_with_scope::<Dynamic>(&mut scope, processed_script) {
             Ok(result) => {
                 let output = take_output();
-                log_trace!("Script completed successfully, output: {} bytes", output.len());
-                
                 if output.is_empty() && !result.is_unit() {
                     return Ok(format!("{}\n", result));
                 }
-                
                 Ok(String::from_utf8_lossy(&output).into_owned())
             }
             Err(e) => {
@@ -795,14 +1003,26 @@ impl ScriptRuntime {
 // PUBLIC API
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// Execute a script with arguments (uses cached runtime and AST cache)
 pub fn execute_script(script_content: &str, args: &str) -> Result<String, String> {
     let args_vec: Vec<&str> = if args.is_empty() {
         Vec::new()
     } else {
         args.split_whitespace().collect()
     };
-    let runtime = ScriptRuntime::new();
+    let runtime = get_runtime();
     runtime.execute(script_content, &args_vec)
+}
+
+/// Execute a script without AST caching (for REPL/one-off expressions)
+pub fn execute_script_uncached(script_content: &str, args: &str) -> Result<String, String> {
+    let args_vec: Vec<&str> = if args.is_empty() {
+        Vec::new()
+    } else {
+        args.split_whitespace().collect()
+    };
+    let runtime = get_runtime();
+    runtime.execute_uncached(script_content, &args_vec)
 }
 
 pub fn find_script(cmd: &str) -> Option<Vec<u8>> {
