@@ -1,3 +1,13 @@
+## 0.0.20 (2025-11-29)
+
+### 🩹 Fixes
+
+- virtual machine halting and halt_code Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([777304b](https://github.com/elribonazo/riscv-vm/commit/777304b))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.0.19 (2025-11-29)
 
 ### 🩹 Fixes
