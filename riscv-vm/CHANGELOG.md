@@ -1,3 +1,13 @@
+## 0.0.14 (2025-11-29)
+
+### 🩹 Fixes
+
+- fs Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([3b3a6d4](https://github.com/elribonazo/riscv-vm/commit/3b3a6d4))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.0.13 (2025-11-29)
 
 This was a version bump only for riscv-vm to align it with other projects, there were no code changes.
