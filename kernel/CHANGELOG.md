@@ -1,3 +1,13 @@
+## 0.1.1 (2025-11-30)
+
+### 🩹 Fixes
+
+- logging and printing to uart Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([550fdcd](https://github.com/elribonazo/riscv-vm/commit/550fdcd))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.1.0 (2025-11-29)
 
 ### 🚀 Features
