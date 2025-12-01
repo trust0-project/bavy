@@ -1,3 +1,13 @@
+## 0.1.3 (2025-12-01)
+
+### 🩹 Fixes
+
+- harts beta WIP Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([b64152c](https://github.com/elribonazo/riscv-vm/commit/b64152c))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.1.2 (2025-11-30)
 
 ### 🩹 Fixes

@@ -1,6 +1,6 @@
 {
   "name": "virtual-machine",
-  "version": "0.0.28",
+  "version": "0.0.29",
   "description": "",
   "bin": "build/cli.js",
   "publishConfig": {
