@@ -1,3 +1,13 @@
+## 0.0.30 (2025-12-01)
+
+### 🩹 Fixes
+
+- vm upgrade performance Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([5ae83c9](https://github.com/elribonazo/riscv-vm/commit/5ae83c9))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.0.29 (2025-12-01)
 
 ### 🩹 Fixes
