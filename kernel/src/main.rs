@@ -25,6 +25,14 @@ mod uart;
 mod virtio_blk;
 mod virtio_net;
 
+// Process management modules
+mod task;
+mod scheduler;
+mod klog;
+mod init;
+
+pub use scheduler::SCHEDULER;
+
 extern crate alloc;
 use alloc::{format, string::String, vec::Vec};
 use core::arch::asm;
@@ -54,7 +62,7 @@ fn get_expected_harts() -> usize {
 
 /// Maximum number of harts supported.
 /// Set high enough to support modern multi-core systems.
-const MAX_HARTS: usize = 128;
+pub const MAX_HARTS: usize = 128;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // BENCHMARK STATE (for multi-hart CPU testing)
@@ -277,7 +285,7 @@ unsafe fn secondary_hart_park(hart_id: usize) -> ! {
 
 /// Get the current hart ID from mhartid CSR.
 #[inline]
-fn get_hart_id() -> usize {
+pub fn get_hart_id() -> usize {
     let id: usize;
     unsafe {
         asm!("csrr {}, mhartid", out(reg) id, options(nomem, nostack));
@@ -313,33 +321,62 @@ fn secondary_hart_entry(hart_id: usize) -> ! {
 
 /// Secondary hart idle loop.
 /// 
-/// Secondary harts wait for work (IPI wakeup), then check for benchmark tasks.
+/// Secondary harts wait for work (IPI wakeup), then check for:
+/// 1. Benchmark tasks (high priority, checked first)
+/// 2. Scheduler tasks
 fn secondary_hart_idle(hart_id: usize) -> ! {
     loop {
-        // Wait for work (IPI or timer)
+        // Wait for work via IPI - this is the primary coordination mechanism
         unsafe {
             core::arch::asm!("wfi", options(nomem, nostack));
         }
         
-        // Check if we were woken for a reason
-        if is_my_msip_pending() {
-            clear_my_msip();
-            
-            // Check if there's a benchmark to run
-            if BENCHMARK.is_active() {
-                let mode = BENCHMARK.mode.load(Ordering::Acquire);
-                if mode == BenchmarkMode::PrimeCount as usize {
-                    // Get our work range
-                    let (start, end) = BENCHMARK.get_work_range(hart_id);
-                    if start < end {
-                        // Count primes in our range
-                        let count = count_primes_in_range(start, end);
-                        // Report result
-                        BENCHMARK.report_result(hart_id, count);
-                    } else {
-                        // No work for this hart
-                        BENCHMARK.report_result(hart_id, 0);
-                    }
+        // Check if we were woken by an IPI
+        if !is_my_msip_pending() {
+            // Spurious wakeup - go back to sleep
+            continue;
+        }
+        
+        // Clear the IPI
+        clear_my_msip();
+        
+        // Check for benchmark work first (high priority)
+        if BENCHMARK.is_active() {
+            let mode = BENCHMARK.mode.load(Ordering::Acquire);
+            if mode == BenchmarkMode::PrimeCount as usize {
+                // Get our work range
+                let (start, end) = BENCHMARK.get_work_range(hart_id);
+                if start < end {
+                    // Count primes in our range
+                    let count = count_primes_in_range(start, end);
+                    // Report result
+                    BENCHMARK.report_result(hart_id, count);
+                } else {
+                    // No work for this hart
+                    BENCHMARK.report_result(hart_id, 0);
+                }
+                continue;
+            }
+        }
+        
+        // Check for scheduler tasks
+        if SCHEDULER.is_running() {
+            if let Some(task) = SCHEDULER.pick_next(hart_id) {
+                // Mark task as running on this hart
+                task.mark_running(hart_id);
+                
+                let start_time = get_time_ms() as u64;
+                
+                // Execute the task's entry point
+                (task.entry)();
+                
+                // Update CPU time
+                let elapsed = (get_time_ms() as u64).saturating_sub(start_time);
+                task.add_cpu_time(elapsed);
+                
+                // Mark task as finished (unless it's a daemon that should restart)
+                if !task.is_daemon {
+                    SCHEDULER.finish_task(task.pid, 0);
                 }
             }
         }
@@ -709,7 +746,7 @@ enum RedirectMode {
 }
 
 /// Read current time in milliseconds from CLINT mtime register
-fn get_time_ms() -> i64 {
+pub fn get_time_ms() -> i64 {
     let mtime = unsafe { core::ptr::read_volatile(CLINT_MTIME as *const u64) };
     (mtime / 10_000) as i64
 }
@@ -834,6 +871,26 @@ fn main() -> ! {
     uart::write_str("/");
     uart::write_u64(expected_harts as u64);
     uart::write_line("");
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // PROCESS MANAGER INITIALIZATION
+    // ═══════════════════════════════════════════════════════════════════
+    
+    print_section("PROCESS MANAGER");
+    
+    // Initialize scheduler with number of online harts
+    SCHEDULER.init(online);
+    print_boot_status("Scheduler initialized", true);
+    print_boot_info("Run queues", &format!("{} (one per hart)", online));
+    
+    // Run init directly on primary hart (spawns daemons to secondary harts)
+    // Note: We don't spawn init as a task - it runs synchronously during boot
+    print_boot_info("Init process", "running");
+    init::init_main();
+    
+    // Report services started
+    let services = init::service_count();
+    print_boot_status(&format!("System services started ({})", services), services > 0);
     
     // ─── BOOT COMPLETE ────────────────────────────────────────────────────────
     print_section(&format!("\x1b[1;97mBAVY OS BOOT COMPLETE!\x1b[0m"));

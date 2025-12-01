@@ -87,8 +87,26 @@ fn main() -> std::io::Result<()> {
             dir_idx = import_directory(&mut file, &mut bitmap, &home_dir, dir_idx, "/home/")?;
         }
     }
+    
+    // 6. Import files from var/log/ subdirectory (with /var/log/ prefix)
+    if let Some(ref src_dir) = args.dir {
+        let var_log_dir = src_dir.join("var").join("log");
+        if var_log_dir.exists() {
+            println!("\n📋 Importing files from var/log/...");
+            dir_idx = import_directory(&mut file, &mut bitmap, &var_log_dir, dir_idx, "/var/log/")?;
+        }
+    }
+    
+    // 7. Import files from etc/init.d/ subdirectory (with /etc/init.d/ prefix)
+    if let Some(ref src_dir) = args.dir {
+        let etc_init_dir = src_dir.join("etc").join("init.d");
+        if etc_init_dir.exists() {
+            println!("\n⚙️  Importing files from etc/init.d/...");
+            dir_idx = import_directory(&mut file, &mut bitmap, &etc_init_dir, dir_idx, "/etc/init.d/")?;
+        }
+    }
 
-    // 6. Write Bitmap back to disk
+    // 8. Write Bitmap back to disk
     file.seek(SeekFrom::Start(SEC_MAP_START * SECTOR_SIZE))?;
     file.write_all(&bitmap)?;
 

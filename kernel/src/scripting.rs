@@ -584,6 +584,72 @@ impl ScriptRuntime {
         engine.register_fn("arch", || -> ImmutableString {
             "RISC-V 64-bit (RV64GC)".into()
         });
+        
+        // harts_online() -> i64
+        engine.register_fn("harts_online", || -> i64 {
+            crate::HARTS_ONLINE.load(core::sync::atomic::Ordering::Relaxed) as i64
+        });
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════
+    // os:proc MODULE - Process management functions
+    // ═══════════════════════════════════════════════════════════════════════
+    
+    fn register_proc_module(engine: &mut Engine) {
+        // get_tasks() -> Array of {pid, name, state, priority, hart, cpu_time, uptime}
+        engine.register_fn("get_tasks", || -> Array {
+            let mut list = Array::new();
+            let tasks = crate::scheduler::SCHEDULER.list_tasks();
+            for task in tasks {
+                let mut map = Map::new();
+                map.insert("pid".into(), Dynamic::from(task.pid as i64));
+                map.insert("name".into(), Dynamic::from(task.name));
+                map.insert("state".into(), Dynamic::from(task.state.as_str()));
+                map.insert("priority".into(), Dynamic::from(task.priority.as_str()));
+                map.insert("hart".into(), Dynamic::from(task.hart.map(|h| h as i64).unwrap_or(-1)));
+                map.insert("cpu_time".into(), Dynamic::from(task.cpu_time as i64));
+                map.insert("uptime".into(), Dynamic::from(task.uptime as i64));
+                list.push(Dynamic::from(map));
+            }
+            list
+        });
+        
+        // task_count() -> i64
+        engine.register_fn("task_count", || -> i64 {
+            crate::scheduler::SCHEDULER.task_count() as i64
+        });
+        
+        // kill_task(pid) -> bool
+        engine.register_fn("kill_task", |pid: i64| -> bool {
+            if pid <= 0 {
+                return false;
+            }
+            crate::scheduler::SCHEDULER.kill(pid as u32)
+        });
+        
+        // get_klog(count) -> Array of formatted log strings
+        engine.register_fn("get_klog", |count: i64| -> Array {
+            let count = count.max(1).min(100) as usize;
+            let entries = crate::klog::KLOG.recent(count);
+            entries.iter()
+                .rev() // Most recent first
+                .map(|e| Dynamic::from(e.format_colored()))
+                .collect()
+        });
+        
+        // services() -> Array of {name, pid, started_at}
+        engine.register_fn("services", || -> Array {
+            let mut list = Array::new();
+            let services = crate::init::list_services();
+            for svc in services {
+                let mut map = Map::new();
+                map.insert("name".into(), Dynamic::from(svc.name));
+                map.insert("pid".into(), Dynamic::from(svc.pid as i64));
+                map.insert("started_at".into(), Dynamic::from(svc.started_at as i64));
+                list.push(Dynamic::from(map));
+            }
+            list
+        });
     }
     
     // ═══════════════════════════════════════════════════════════════════════
@@ -1186,6 +1252,7 @@ impl ScriptRuntime {
         Self::register_sys_module(&mut engine);
         Self::register_mem_module(&mut engine);
         Self::register_http_module(&mut engine);
+        Self::register_proc_module(&mut engine);
         
         // Register module object constructors for namespace imports
         Self::register_module_objects(&mut engine);

@@ -1,0 +1,30 @@
+// BAVY OS Startup Script
+// This script runs during init
+
+print("=== BAVY OS Startup ===");
+
+// Log startup time
+let start_time = time_ms();
+print("Boot time: " + start_time + "ms");
+
+// Check filesystem
+if fs_available() {
+    print("[OK] Filesystem available");
+} else {
+    print("[WARN] Filesystem not available");
+}
+
+// Check network
+if net_available() {
+    print("[OK] Network available");
+    print("  IP: " + get_ip());
+} else {
+    print("[INFO] Network not configured");
+}
+
+// Write startup marker to log
+let log_msg = "[" + start_time + "] System startup complete\n";
+write_file("/var/log/kernel.log", log_msg);
+
+print("Startup script complete");
+
