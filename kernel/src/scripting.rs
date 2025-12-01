@@ -17,6 +17,7 @@ use alloc::vec::Vec;
 use alloc::collections::BTreeMap;
 use alloc::format;
 use rhai::{Engine, Scope, Dynamic, Array, Map, ImmutableString, AST, packages::{Package, StandardPackage}};
+use crate::Spinlock;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // MODULE TYPES - For namespace imports (import * as X from "...")
@@ -70,18 +71,19 @@ impl LogLevel {
     }
 }
 
-static mut SCRIPT_LOG_LEVEL: LogLevel = LogLevel::Info;
+/// Script log level, protected by spinlock.
+static SCRIPT_LOG_LEVEL: Spinlock<LogLevel> = Spinlock::new(LogLevel::Info);
 
 pub fn set_log_level(level: LogLevel) {
-    unsafe { SCRIPT_LOG_LEVEL = level; }
+    *SCRIPT_LOG_LEVEL.lock() = level;
 }
 
 pub fn get_log_level() -> LogLevel {
-    unsafe { SCRIPT_LOG_LEVEL }
+    *SCRIPT_LOG_LEVEL.lock()
 }
 
 fn log(level: LogLevel, msg: &str) {
-    let current_level = unsafe { SCRIPT_LOG_LEVEL };
+    let current_level = *SCRIPT_LOG_LEVEL.lock();
     if (level as u8) <= (current_level as u8) {
         let color = match level {
             LogLevel::Error => "\x1b[1;31m",
@@ -115,25 +117,21 @@ macro_rules! log_trace {
 // OUTPUT BUFFER
 // ═══════════════════════════════════════════════════════════════════════════════
 
-static mut SCRIPT_OUTPUT: Option<Vec<u8>> = None;
+/// Script output buffer, protected by spinlock.
+static SCRIPT_OUTPUT: Spinlock<Option<Vec<u8>>> = Spinlock::new(None);
 
 fn init_output() {
-    unsafe {
-        SCRIPT_OUTPUT = Some(Vec::with_capacity(8192));
-    }
+    *SCRIPT_OUTPUT.lock() = Some(Vec::with_capacity(8192));
 }
 
 fn take_output() -> Vec<u8> {
-    unsafe {
-        SCRIPT_OUTPUT.take().unwrap_or_default()
-    }
+    SCRIPT_OUTPUT.lock().take().unwrap_or_default()
 }
 
 fn append_output(s: &str) {
-    unsafe {
-        if let Some(ref mut buf) = SCRIPT_OUTPUT {
-            buf.extend_from_slice(s.as_bytes());
-        }
+    let mut guard = SCRIPT_OUTPUT.lock();
+    if let Some(ref mut buf) = *guard {
+        buf.extend_from_slice(s.as_bytes());
     }
 }
 
@@ -141,6 +139,9 @@ fn append_output(s: &str) {
 // GLOBAL RUNTIME CACHE
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// Note: ScriptRuntime contains Rhai Engine which uses Rc internally and is not Send.
+// This is acceptable because scripts only run on the primary hart (shell).
+// Access is serialized by the shell command loop.
 static mut CACHED_RUNTIME: Option<ScriptRuntime> = None;
 
 /// Get or create the global cached runtime (much faster than creating new each time)
@@ -160,6 +161,8 @@ fn get_runtime() -> &'static ScriptRuntime {
 
 const AST_CACHE_MAX_SIZE: usize = 32;
 
+// Note: AST contains Rhai types that use Rc internally and are not Send.
+// This is acceptable because scripts only run on the primary hart (shell).
 static mut AST_CACHE: Option<BTreeMap<u64, AST>> = None;
 
 fn get_ast_cache() -> &'static mut BTreeMap<u64, AST> {
@@ -231,8 +234,13 @@ pub fn preload_scripts() -> usize {
     let runtime = get_runtime();
     let mut cached_count = 0;
     
-    unsafe {
-        if let (Some(fs), Some(dev)) = (crate::FS_STATE.as_ref(), crate::BLK_DEV.as_mut()) {
+    // Collect scripts with FS lock, then release before compiling
+    let scripts_to_cache: Vec<(String, Vec<u8>)> = {
+        let fs_guard = crate::FS_STATE.lock();
+        let mut blk_guard = crate::BLK_DEV.lock();
+        
+        let mut scripts = Vec::new();
+        if let (Some(fs), Some(dev)) = (fs_guard.as_ref(), blk_guard.as_mut()) {
             // List all files in /usr/bin/
             let files = fs.list_dir(dev, "/usr/bin");
             
@@ -246,23 +254,29 @@ pub fn preload_scripts() -> usize {
                 
                 // Read the script content
                 if let Some(content) = fs.read_file(dev, &path) {
-                    if let Ok(script) = core::str::from_utf8(&content) {
-                        // Preprocess and cache
-                        let preprocess_result = preprocess_imports(script);
-                        let processed_script = preprocess_result.as_str(script);
-                        let script_hash = hash_script(processed_script);
-                        
-                        // Try to compile and cache
-                        match get_or_compile_ast(&runtime.engine, processed_script, script_hash) {
-                            Ok(_) => {
-                                log_trace!("Cached: {}", file_info.name);
-                                cached_count += 1;
-                            }
-                            Err(e) => {
-                                log_error!("Failed to cache {}: {}", file_info.name, e);
-                            }
-                        }
-                    }
+                    scripts.push((file_info.name.clone(), content));
+                }
+            }
+        }
+        scripts
+    };
+    
+    // Now compile and cache scripts (FS lock released)
+    for (name, content) in scripts_to_cache {
+        if let Ok(script) = core::str::from_utf8(&content) {
+            // Preprocess and cache
+            let preprocess_result = preprocess_imports(script);
+            let processed_script = preprocess_result.as_str(script);
+            let script_hash = hash_script(processed_script);
+            
+            // Try to compile and cache
+            match get_or_compile_ast(&runtime.engine, processed_script, script_hash) {
+                Ok(_) => {
+                    log_trace!("Cached: {}", name);
+                    cached_count += 1;
+                }
+                Err(e) => {
+                    log_error!("Failed to cache {}: {}", name, e);
                 }
             }
         }
@@ -425,16 +439,16 @@ impl ScriptRuntime {
         // ls() -> Array of {name, size, is_dir}
         engine.register_fn("ls", || -> Array {
             let mut list = Array::new();
-            unsafe {
-                if let (Some(fs), Some(dev)) = (crate::FS_STATE.as_ref(), crate::BLK_DEV.as_mut()) {
-                    let files = fs.list_dir(dev, "/");
-                    for f in files {
-                        let mut map = Map::new();
-                        map.insert("name".into(), Dynamic::from(f.name));
-                        map.insert("size".into(), Dynamic::from(f.size as i64));
-                        map.insert("is_dir".into(), Dynamic::from(f.is_dir));
-                        list.push(Dynamic::from(map));
-                    }
+            let fs_guard = crate::FS_STATE.lock();
+            let mut blk_guard = crate::BLK_DEV.lock();
+            if let (Some(fs), Some(dev)) = (fs_guard.as_ref(), blk_guard.as_mut()) {
+                let files = fs.list_dir(dev, "/");
+                for f in files {
+                    let mut map = Map::new();
+                    map.insert("name".into(), Dynamic::from(f.name));
+                    map.insert("size".into(), Dynamic::from(f.size as i64));
+                    map.insert("is_dir".into(), Dynamic::from(f.is_dir));
+                    list.push(Dynamic::from(map));
                 }
             }
             list
@@ -442,11 +456,11 @@ impl ScriptRuntime {
         
         // read_file(path) -> String
         engine.register_fn("read_file", |path: ImmutableString| -> ImmutableString {
-            unsafe {
-                if let (Some(fs), Some(dev)) = (crate::FS_STATE.as_ref(), crate::BLK_DEV.as_mut()) {
-                    if let Some(data) = fs.read_file(dev, path.as_str()) {
-                        return String::from_utf8_lossy(&data).into_owned().into();
-                    }
+            let fs_guard = crate::FS_STATE.lock();
+            let mut blk_guard = crate::BLK_DEV.lock();
+            if let (Some(fs), Some(dev)) = (fs_guard.as_ref(), blk_guard.as_mut()) {
+                if let Some(data) = fs.read_file(dev, path.as_str()) {
+                    return String::from_utf8_lossy(&data).into_owned().into();
                 }
             }
             "".into()
@@ -454,27 +468,27 @@ impl ScriptRuntime {
         
         // write_file(path, content) -> bool
         engine.register_fn("write_file", |path: ImmutableString, content: ImmutableString| -> bool {
-            unsafe {
-                if let (Some(fs), Some(dev)) = (crate::FS_STATE.as_mut(), crate::BLK_DEV.as_mut()) {
-                    return fs.write_file(dev, path.as_str(), content.as_bytes()).is_ok();
-                }
+            let mut fs_guard = crate::FS_STATE.lock();
+            let mut blk_guard = crate::BLK_DEV.lock();
+            if let (Some(fs), Some(dev)) = (fs_guard.as_mut(), blk_guard.as_mut()) {
+                return fs.write_file(dev, path.as_str(), content.as_bytes()).is_ok();
             }
             false
         });
         
         // file_exists(path) -> bool
         engine.register_fn("file_exists", |path: ImmutableString| -> bool {
-            unsafe {
-                if let (Some(fs), Some(dev)) = (crate::FS_STATE.as_ref(), crate::BLK_DEV.as_mut()) {
-                    return fs.read_file(dev, path.as_str()).is_some();
-                }
+            let fs_guard = crate::FS_STATE.lock();
+            let mut blk_guard = crate::BLK_DEV.lock();
+            if let (Some(fs), Some(dev)) = (fs_guard.as_ref(), blk_guard.as_mut()) {
+                return fs.read_file(dev, path.as_str()).is_some();
             }
             false
         });
         
         // fs_available() -> bool
         engine.register_fn("fs_available", || -> bool {
-            unsafe { crate::FS_STATE.is_some() }
+            crate::FS_STATE.lock().is_some()
         });
     }
     
@@ -493,10 +507,9 @@ impl ScriptRuntime {
         
         // get_mac() -> String
         engine.register_fn("get_mac", || -> ImmutableString {
-            unsafe {
-                if let Some(ref state) = crate::NET_STATE {
-                    return String::from_utf8_lossy(&state.mac_str()).into_owned().into();
-                }
+            let net_guard = crate::NET_STATE.lock();
+            if let Some(ref state) = *net_guard {
+                return String::from_utf8_lossy(&state.mac_str()).into_owned().into();
             }
             "00:00:00:00:00:00".into()
         });
@@ -522,7 +535,7 @@ impl ScriptRuntime {
         
         // net_available() -> bool
         engine.register_fn("net_available", || -> bool {
-            unsafe { crate::NET_STATE.is_some() }
+            crate::NET_STATE.lock().is_some()
         });
     }
     
@@ -547,8 +560,9 @@ impl ScriptRuntime {
                 let now = unsafe { core::ptr::read_volatile(CLINT_MTIME as *const u64) };
                 if now.wrapping_sub(start) >= ticks { break; }
                 core::hint::spin_loop();
-                unsafe {
-                    if let Some(ref mut net) = crate::NET_STATE {
+                {
+                    let mut net_guard = crate::NET_STATE.lock();
+                    if let Some(ref mut net) = *net_guard {
                         net.poll((now / 10_000) as i64);
                     }
                 }
@@ -688,8 +702,9 @@ impl ScriptRuntime {
             }
             
             // Perform the request
-            unsafe {
-                if let Some(ref mut net) = crate::NET_STATE {
+            {
+                let mut net_guard = crate::NET_STATE.lock();
+                if let Some(ref mut net) = *net_guard {
                     let http_result = if follow_redirects {
                         crate::http::http_request_follow_redirects(net, &request, timeout, get_time_ms)
                     } else {
@@ -733,34 +748,33 @@ impl ScriptRuntime {
         engine.register_fn("http_get", |url: ImmutableString| -> Map {
             let mut result = Map::new();
             
-            unsafe {
-                if let Some(ref mut net) = crate::NET_STATE {
-                    match crate::http::get_follow_redirects(net, url.as_str(), 10000, get_time_ms) {
-                        Ok(response) => {
-                            let body_text = response.text();
-                            let status_code = response.status_code;
-                            let status_text = response.status_text;
-                            
-                            result.insert("ok".into(), Dynamic::from(true));
-                            result.insert("status".into(), Dynamic::from(status_code as i64));
-                            result.insert("statusText".into(), Dynamic::from(status_text));
-                            
-                            let mut headers_map = Map::new();
-                            for (key, value) in response.headers {
-                                headers_map.insert(key.into(), Dynamic::from(value));
-                            }
-                            result.insert("headers".into(), Dynamic::from(headers_map));
-                            result.insert("body".into(), Dynamic::from(body_text));
+            let mut net_guard = crate::NET_STATE.lock();
+            if let Some(ref mut net) = *net_guard {
+                match crate::http::get_follow_redirects(net, url.as_str(), 10000, get_time_ms) {
+                    Ok(response) => {
+                        let body_text = response.text();
+                        let status_code = response.status_code;
+                        let status_text = response.status_text;
+                        
+                        result.insert("ok".into(), Dynamic::from(true));
+                        result.insert("status".into(), Dynamic::from(status_code as i64));
+                        result.insert("statusText".into(), Dynamic::from(status_text));
+                        
+                        let mut headers_map = Map::new();
+                        for (key, value) in response.headers {
+                            headers_map.insert(key.into(), Dynamic::from(value));
                         }
-                        Err(e) => {
-                            result.insert("ok".into(), Dynamic::from(false));
-                            result.insert("error".into(), Dynamic::from(e));
-                        }
+                        result.insert("headers".into(), Dynamic::from(headers_map));
+                        result.insert("body".into(), Dynamic::from(body_text));
                     }
-                } else {
-                    result.insert("ok".into(), Dynamic::from(false));
-                    result.insert("error".into(), Dynamic::from("Network not available"));
+                    Err(e) => {
+                        result.insert("ok".into(), Dynamic::from(false));
+                        result.insert("error".into(), Dynamic::from(e));
+                    }
                 }
+            } else {
+                result.insert("ok".into(), Dynamic::from(false));
+                result.insert("error".into(), Dynamic::from("Network not available"));
             }
             
             result
@@ -770,34 +784,33 @@ impl ScriptRuntime {
         engine.register_fn("http_post", |url: ImmutableString, body: ImmutableString, content_type: ImmutableString| -> Map {
             let mut result = Map::new();
             
-            unsafe {
-                if let Some(ref mut net) = crate::NET_STATE {
-                    match crate::http::post(net, url.as_str(), body.as_str(), content_type.as_str(), 10000, get_time_ms) {
-                        Ok(response) => {
-                            let body_text = response.text();
-                            let status_code = response.status_code;
-                            let status_text = response.status_text;
-                            
-                            result.insert("ok".into(), Dynamic::from(true));
-                            result.insert("status".into(), Dynamic::from(status_code as i64));
-                            result.insert("statusText".into(), Dynamic::from(status_text));
-                            
-                            let mut headers_map = Map::new();
-                            for (key, value) in response.headers {
-                                headers_map.insert(key.into(), Dynamic::from(value));
-                            }
-                            result.insert("headers".into(), Dynamic::from(headers_map));
-                            result.insert("body".into(), Dynamic::from(body_text));
+            let mut net_guard = crate::NET_STATE.lock();
+            if let Some(ref mut net) = *net_guard {
+                match crate::http::post(net, url.as_str(), body.as_str(), content_type.as_str(), 10000, get_time_ms) {
+                    Ok(response) => {
+                        let body_text = response.text();
+                        let status_code = response.status_code;
+                        let status_text = response.status_text;
+                        
+                        result.insert("ok".into(), Dynamic::from(true));
+                        result.insert("status".into(), Dynamic::from(status_code as i64));
+                        result.insert("statusText".into(), Dynamic::from(status_text));
+                        
+                        let mut headers_map = Map::new();
+                        for (key, value) in response.headers {
+                            headers_map.insert(key.into(), Dynamic::from(value));
                         }
-                        Err(e) => {
-                            result.insert("ok".into(), Dynamic::from(false));
-                            result.insert("error".into(), Dynamic::from(e));
-                        }
+                        result.insert("headers".into(), Dynamic::from(headers_map));
+                        result.insert("body".into(), Dynamic::from(body_text));
                     }
-                } else {
-                    result.insert("ok".into(), Dynamic::from(false));
-                    result.insert("error".into(), Dynamic::from("Network not available"));
+                    Err(e) => {
+                        result.insert("ok".into(), Dynamic::from(false));
+                        result.insert("error".into(), Dynamic::from(e));
+                    }
                 }
+            } else {
+                result.insert("ok".into(), Dynamic::from(false));
+                result.insert("error".into(), Dynamic::from("Network not available"));
             }
             
             result
@@ -822,48 +835,48 @@ impl ScriptRuntime {
         // FsModule methods
         engine.register_fn("ls", |_: &mut FsModule| -> Array {
             let mut list = Array::new();
-            unsafe {
-                if let (Some(fs), Some(dev)) = (crate::FS_STATE.as_ref(), crate::BLK_DEV.as_mut()) {
-                    let files = fs.list_dir(dev, "/");
-                    for f in files {
-                        let mut map = Map::new();
-                        map.insert("name".into(), Dynamic::from(f.name));
-                        map.insert("size".into(), Dynamic::from(f.size as i64));
-                        map.insert("is_dir".into(), Dynamic::from(f.is_dir));
-                        list.push(Dynamic::from(map));
-                    }
+            let fs_guard = crate::FS_STATE.lock();
+            let mut blk_guard = crate::BLK_DEV.lock();
+            if let (Some(fs), Some(dev)) = (fs_guard.as_ref(), blk_guard.as_mut()) {
+                let files = fs.list_dir(dev, "/");
+                for f in files {
+                    let mut map = Map::new();
+                    map.insert("name".into(), Dynamic::from(f.name));
+                    map.insert("size".into(), Dynamic::from(f.size as i64));
+                    map.insert("is_dir".into(), Dynamic::from(f.is_dir));
+                    list.push(Dynamic::from(map));
                 }
             }
             list
         });
         engine.register_fn("read", |_: &mut FsModule, path: ImmutableString| -> ImmutableString {
-            unsafe {
-                if let (Some(fs), Some(dev)) = (crate::FS_STATE.as_ref(), crate::BLK_DEV.as_mut()) {
-                    if let Some(data) = fs.read_file(dev, path.as_str()) {
-                        return String::from_utf8_lossy(&data).into_owned().into();
-                    }
+            let fs_guard = crate::FS_STATE.lock();
+            let mut blk_guard = crate::BLK_DEV.lock();
+            if let (Some(fs), Some(dev)) = (fs_guard.as_ref(), blk_guard.as_mut()) {
+                if let Some(data) = fs.read_file(dev, path.as_str()) {
+                    return String::from_utf8_lossy(&data).into_owned().into();
                 }
             }
             "".into()
         });
         engine.register_fn("write", |_: &mut FsModule, path: ImmutableString, content: ImmutableString| -> bool {
-            unsafe {
-                if let (Some(fs), Some(dev)) = (crate::FS_STATE.as_mut(), crate::BLK_DEV.as_mut()) {
-                    return fs.write_file(dev, path.as_str(), content.as_bytes()).is_ok();
-                }
+            let mut fs_guard = crate::FS_STATE.lock();
+            let mut blk_guard = crate::BLK_DEV.lock();
+            if let (Some(fs), Some(dev)) = (fs_guard.as_mut(), blk_guard.as_mut()) {
+                return fs.write_file(dev, path.as_str(), content.as_bytes()).is_ok();
             }
             false
         });
         engine.register_fn("exists", |_: &mut FsModule, path: ImmutableString| -> bool {
-            unsafe {
-                if let (Some(fs), Some(dev)) = (crate::FS_STATE.as_ref(), crate::BLK_DEV.as_mut()) {
-                    return fs.read_file(dev, path.as_str()).is_some();
-                }
+            let fs_guard = crate::FS_STATE.lock();
+            let mut blk_guard = crate::BLK_DEV.lock();
+            if let (Some(fs), Some(dev)) = (fs_guard.as_ref(), blk_guard.as_mut()) {
+                return fs.read_file(dev, path.as_str()).is_some();
             }
             false
         });
         engine.register_fn("available", |_: &mut FsModule| -> bool {
-            unsafe { crate::FS_STATE.is_some() }
+            crate::FS_STATE.lock().is_some()
         });
         
         // __module_net() -> NetModule
@@ -877,10 +890,9 @@ impl ScriptRuntime {
             String::from_utf8_lossy(&buf[..len]).into_owned().into()
         });
         engine.register_fn("mac", |_: &mut NetModule| -> ImmutableString {
-            unsafe {
-                if let Some(ref state) = crate::NET_STATE {
-                    return String::from_utf8_lossy(&state.mac_str()).into_owned().into();
-                }
+            let net_guard = crate::NET_STATE.lock();
+            if let Some(ref state) = *net_guard {
+                return String::from_utf8_lossy(&state.mac_str()).into_owned().into();
             }
             "00:00:00:00:00:00".into()
         });
@@ -898,7 +910,7 @@ impl ScriptRuntime {
             crate::net::PREFIX_LEN as i64
         });
         engine.register_fn("available", |_: &mut NetModule| -> bool {
-            unsafe { crate::NET_STATE.is_some() }
+            crate::NET_STATE.lock().is_some()
         });
         
         // __module_sys() -> SysModule
@@ -918,8 +930,9 @@ impl ScriptRuntime {
                 let now = unsafe { core::ptr::read_volatile(CLINT_MTIME as *const u64) };
                 if now.wrapping_sub(start) >= ticks { break; }
                 core::hint::spin_loop();
-                unsafe {
-                    if let Some(ref mut net) = crate::NET_STATE {
+                {
+                    let mut net_guard = crate::NET_STATE.lock();
+                    if let Some(ref mut net) = *net_guard {
                         net.poll((now / 10_000) as i64);
                     }
                 }
@@ -975,34 +988,33 @@ impl ScriptRuntime {
         engine.register_fn("get", |_: &mut HttpModule, url: ImmutableString| -> Map {
             let mut result = Map::new();
             
-            unsafe {
-                if let Some(ref mut net) = crate::NET_STATE {
-                    match crate::http::get_follow_redirects(net, url.as_str(), 10000, get_time_ms_mod) {
-                        Ok(response) => {
-                            let body_text = response.text();
-                            let status_code = response.status_code;
-                            let status_text = response.status_text;
-                            
-                            result.insert("ok".into(), Dynamic::from(true));
-                            result.insert("status".into(), Dynamic::from(status_code as i64));
-                            result.insert("statusText".into(), Dynamic::from(status_text));
-                            
-                            let mut headers_map = Map::new();
-                            for (key, value) in response.headers {
-                                headers_map.insert(key.into(), Dynamic::from(value));
-                            }
-                            result.insert("headers".into(), Dynamic::from(headers_map));
-                            result.insert("body".into(), Dynamic::from(body_text));
+            let mut net_guard = crate::NET_STATE.lock();
+            if let Some(ref mut net) = *net_guard {
+                match crate::http::get_follow_redirects(net, url.as_str(), 10000, get_time_ms_mod) {
+                    Ok(response) => {
+                        let body_text = response.text();
+                        let status_code = response.status_code;
+                        let status_text = response.status_text;
+                        
+                        result.insert("ok".into(), Dynamic::from(true));
+                        result.insert("status".into(), Dynamic::from(status_code as i64));
+                        result.insert("statusText".into(), Dynamic::from(status_text));
+                        
+                        let mut headers_map = Map::new();
+                        for (key, value) in response.headers {
+                            headers_map.insert(key.into(), Dynamic::from(value));
                         }
-                        Err(e) => {
-                            result.insert("ok".into(), Dynamic::from(false));
-                            result.insert("error".into(), Dynamic::from(e));
-                        }
+                        result.insert("headers".into(), Dynamic::from(headers_map));
+                        result.insert("body".into(), Dynamic::from(body_text));
                     }
-                } else {
-                    result.insert("ok".into(), Dynamic::from(false));
-                    result.insert("error".into(), Dynamic::from("Network not available"));
+                    Err(e) => {
+                        result.insert("ok".into(), Dynamic::from(false));
+                        result.insert("error".into(), Dynamic::from(e));
+                    }
                 }
+            } else {
+                result.insert("ok".into(), Dynamic::from(false));
+                result.insert("error".into(), Dynamic::from("Network not available"));
             }
             
             result
@@ -1012,34 +1024,33 @@ impl ScriptRuntime {
         engine.register_fn("post", |_: &mut HttpModule, url: ImmutableString, body: ImmutableString, content_type: ImmutableString| -> Map {
             let mut result = Map::new();
             
-            unsafe {
-                if let Some(ref mut net) = crate::NET_STATE {
-                    match crate::http::post(net, url.as_str(), body.as_str(), content_type.as_str(), 10000, get_time_ms_mod) {
-                        Ok(response) => {
-                            let body_text = response.text();
-                            let status_code = response.status_code;
-                            let status_text = response.status_text;
-                            
-                            result.insert("ok".into(), Dynamic::from(true));
-                            result.insert("status".into(), Dynamic::from(status_code as i64));
-                            result.insert("statusText".into(), Dynamic::from(status_text));
-                            
-                            let mut headers_map = Map::new();
-                            for (key, value) in response.headers {
-                                headers_map.insert(key.into(), Dynamic::from(value));
-                            }
-                            result.insert("headers".into(), Dynamic::from(headers_map));
-                            result.insert("body".into(), Dynamic::from(body_text));
+            let mut net_guard = crate::NET_STATE.lock();
+            if let Some(ref mut net) = *net_guard {
+                match crate::http::post(net, url.as_str(), body.as_str(), content_type.as_str(), 10000, get_time_ms_mod) {
+                    Ok(response) => {
+                        let body_text = response.text();
+                        let status_code = response.status_code;
+                        let status_text = response.status_text;
+                        
+                        result.insert("ok".into(), Dynamic::from(true));
+                        result.insert("status".into(), Dynamic::from(status_code as i64));
+                        result.insert("statusText".into(), Dynamic::from(status_text));
+                        
+                        let mut headers_map = Map::new();
+                        for (key, value) in response.headers {
+                            headers_map.insert(key.into(), Dynamic::from(value));
                         }
-                        Err(e) => {
-                            result.insert("ok".into(), Dynamic::from(false));
-                            result.insert("error".into(), Dynamic::from(e));
-                        }
+                        result.insert("headers".into(), Dynamic::from(headers_map));
+                        result.insert("body".into(), Dynamic::from(body_text));
                     }
-                } else {
-                    result.insert("ok".into(), Dynamic::from(false));
-                    result.insert("error".into(), Dynamic::from("Network not available"));
+                    Err(e) => {
+                        result.insert("ok".into(), Dynamic::from(false));
+                        result.insert("error".into(), Dynamic::from(e));
+                    }
                 }
+            } else {
+                result.insert("ok".into(), Dynamic::from(false));
+                result.insert("error".into(), Dynamic::from("Network not available"));
             }
             
             result
@@ -1111,8 +1122,9 @@ impl ScriptRuntime {
             }
             
             // Perform the request
-            unsafe {
-                if let Some(ref mut net) = crate::NET_STATE {
+            {
+                let mut net_guard = crate::NET_STATE.lock();
+                if let Some(ref mut net) = *net_guard {
                     match crate::http::http_request(net, &request, timeout, get_time_ms_mod) {
                         Ok(response) => {
                             let body_text = response.text();
@@ -1146,7 +1158,7 @@ impl ScriptRuntime {
         
         // http.available() -> bool
         engine.register_fn("available", |_: &mut HttpModule| -> bool {
-            unsafe { crate::NET_STATE.is_some() }
+            crate::NET_STATE.lock().is_some()
         });
     }
     
@@ -1427,35 +1439,36 @@ pub fn execute_script_uncached(script_content: &str, args: &str) -> Result<Strin
 pub fn find_script(cmd: &str) -> Option<Vec<u8>> {
     log_trace!("Looking for script: {}", cmd);
     
-    unsafe {
-        if let (Some(fs), Some(dev)) = (crate::FS_STATE.as_ref(), crate::BLK_DEV.as_mut()) {
-            if cmd.contains('/') {
-                let full_path = if cmd.starts_with('/') {
-                    alloc::string::String::from(cmd)
-                } else {
-                    crate::resolve_path(cmd)
-                };
-                
-                log_trace!("Resolved path: {} -> {}", cmd, full_path);
-                
-                if let Some(content) = fs.read_file(dev, &full_path) {
-                    log_debug!("Found script at path: {} ({} bytes)", full_path, content.len());
-                    return Some(content);
-                }
-                log_trace!("Script not found at path: {}", full_path);
-                return None;
-            }
+    let fs_guard = crate::FS_STATE.lock();
+    let mut blk_guard = crate::BLK_DEV.lock();
+    
+    if let (Some(fs), Some(dev)) = (fs_guard.as_ref(), blk_guard.as_mut()) {
+        if cmd.contains('/') {
+            let full_path = if cmd.starts_with('/') {
+                alloc::string::String::from(cmd)
+            } else {
+                crate::resolve_path(cmd)
+            };
             
-            let usr_bin_path = format!("/usr/bin/{}", cmd);
-            if let Some(content) = fs.read_file(dev, &usr_bin_path) {
-                log_debug!("Found script in /usr/bin/: {} ({} bytes)", usr_bin_path, content.len());
+            log_trace!("Resolved path: {} -> {}", cmd, full_path);
+            
+            if let Some(content) = fs.read_file(dev, &full_path) {
+                log_debug!("Found script at path: {} ({} bytes)", full_path, content.len());
                 return Some(content);
             }
-            
-            if let Some(content) = fs.read_file(dev, cmd) {
-                log_debug!("Found script in root: {} ({} bytes)", cmd, content.len());
-                return Some(content);
-            }
+            log_trace!("Script not found at path: {}", full_path);
+            return None;
+        }
+        
+        let usr_bin_path = format!("/usr/bin/{}", cmd);
+        if let Some(content) = fs.read_file(dev, &usr_bin_path) {
+            log_debug!("Found script in /usr/bin/: {} ({} bytes)", usr_bin_path, content.len());
+            return Some(content);
+        }
+        
+        if let Some(content) = fs.read_file(dev, cmd) {
+            log_debug!("Found script in root: {} ({} bytes)", cmd, content.len());
+            return Some(content);
         }
     }
     

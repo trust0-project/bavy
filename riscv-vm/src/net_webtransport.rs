@@ -133,7 +133,7 @@ mod native {
 
     impl WebTransportBackend {
         pub fn new(url: &str, cert_hash: Option<String>) -> Self {
-            eprintln!("[WebTransport] Creating backend for URL: {}", url);
+            log::warn!("[WebTransport] Creating backend for URL: {}", url);
             
             // Generate a random MAC address (locally administered, unicast)
             // Use system time + process id for randomness
@@ -177,11 +177,11 @@ mod native {
                 rt.block_on(async move {
                     // Parse cert hash once outside the reconnection loop
                     let cert_digest = if let Some(hash_str) = &cert_hash {
-                        eprintln!("[WebTransport] Using certificate hash: {}", hash_str);
+                        log::warn!("[WebTransport] Using certificate hash: {}", hash_str);
                         let bytes = match hex::decode(hash_str.replace(":", "")) {
                             Ok(b) => b,
                             Err(e) => {
-                                eprintln!("[WebTransport] ERROR: Invalid hex hash: {}", e);
+                                log::warn!("[WebTransport] ERROR: Invalid hex hash: {}", e);
                                 return;
                             }
                         };
@@ -189,17 +189,17 @@ mod native {
                         let array: [u8; 32] = match bytes.try_into() {
                             Ok(a) => a,
                             Err(_) => {
-                                eprintln!("[WebTransport] ERROR: Hash must be 32 bytes, got {} bytes", bytes_len);
+                                log::warn!("[WebTransport] ERROR: Hash must be 32 bytes, got {} bytes", bytes_len);
                                 return;
                             }
                         };
                         Some(Sha256Digest::from(array))
                     } else {
-                        eprintln!("[WebTransport] WARNING: No certificate hash provided, disabling cert validation");
+                        log::warn!("[WebTransport] WARNING: No certificate hash provided, disabling cert validation");
                         None
                     };
                     
-                    eprintln!("[WebTransport] QUIC keep-alive interval: {}s", QUIC_KEEP_ALIVE_SECS);
+                    log::warn!("[WebTransport] QUIC keep-alive interval: {}s", QUIC_KEEP_ALIVE_SECS);
 
                     // Reconnection loop - keeps trying to connect/reconnect forever
                     let mut reconnect_delay = INITIAL_RECONNECT_DELAY_SECS;
@@ -208,9 +208,9 @@ mod native {
                         let attempt = connection_attempts_clone.fetch_add(1, Ordering::SeqCst) + 1;
                         
                         if attempt > 1 {
-                            eprintln!("[WebTransport] Reconnection attempt {} (delay was {}s)...", attempt, reconnect_delay);
+                            log::warn!("[WebTransport] Reconnection attempt {} (delay was {}s)...", attempt, reconnect_delay);
                         } else {
-                            eprintln!("[WebTransport] Starting connection to {}...", url);
+                            log::warn!("[WebTransport] Starting connection to {}...", url);
                         }
                         
                         // Reset registered state on reconnection
@@ -234,14 +234,14 @@ mod native {
                         let endpoint = match Endpoint::client(config) {
                             Ok(ep) => ep,
                             Err(e) => {
-                                eprintln!("[WebTransport] ERROR: Failed to provision endpoint: {}", e);
+                                log::warn!("[WebTransport] ERROR: Failed to provision endpoint: {}", e);
                                 tokio::time::sleep(Duration::from_secs(reconnect_delay)).await;
                                 reconnect_delay = (reconnect_delay * 2).min(MAX_RECONNECT_DELAY_SECS);
                                 continue;
                             }
                         };
 
-                        eprintln!("[WebTransport] Connecting to {}...", url);
+                        log::warn!("[WebTransport] Connecting to {}...", url);
                         let connection = match endpoint.connect(&url).await {
                             Ok(conn) => {
                                 // Reset delay on successful connection
@@ -249,24 +249,24 @@ mod native {
                                 conn
                             }
                             Err(e) => {
-                                eprintln!("[WebTransport] ERROR: Connection failed: {}", e);
+                                log::warn!("[WebTransport] ERROR: Connection failed: {}", e);
                                 log::error!("[WebTransport] Connection failed: {}", e);
                                 tokio::time::sleep(Duration::from_secs(reconnect_delay)).await;
                                 reconnect_delay = (reconnect_delay * 2).min(MAX_RECONNECT_DELAY_SECS);
                                 continue;
                             }
                         };
-                        eprintln!("[WebTransport] Connected successfully!");
+                        log::warn!("[WebTransport] Connected successfully!");
 
                         // Send registration message
                         let register_msg = make_register_message(&mac_copy);
                         if let Err(e) = connection.send_datagram(register_msg) {
-                            eprintln!("[WebTransport] ERROR: Failed to send registration: {}", e);
+                            log::warn!("[WebTransport] ERROR: Failed to send registration: {}", e);
                             tokio::time::sleep(Duration::from_secs(reconnect_delay)).await;
                             reconnect_delay = (reconnect_delay * 2).min(MAX_RECONNECT_DELAY_SECS);
                             continue;
                         }
-                        eprintln!("[WebTransport] Registration sent, MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                        log::warn!("[WebTransport] Registration sent, MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
                             mac_copy[0], mac_copy[1], mac_copy[2], mac_copy[3], mac_copy[4], mac_copy[5]);
 
                         let connection = Arc::new(connection);
@@ -291,7 +291,7 @@ mod native {
                                             }
                                             Err(TryRecvError::Empty) => break,
                                             Err(TryRecvError::Disconnected) => {
-                                                eprintln!("[WebTransport] TX channel disconnected, shutting down");
+                                                log::warn!("[WebTransport] TX channel disconnected, shutting down");
                                                 return; // Permanent shutdown
                                             }
                                         }
@@ -325,11 +325,11 @@ mod native {
                                                             if let Ok(mut guard) = assigned_ip_clone.lock() {
                                                                 *guard = Some(ip);
                                                             }
-                                                            eprintln!("[WebTransport] IP Assigned: {}.{}.{}.{}", 
+                                                            log::warn!("[WebTransport] IP Assigned: {}.{}.{}.{}", 
                                                                 ip[0], ip[1], ip[2], ip[3]);
                                                         }
                                                         
-                                                        eprintln!("[WebTransport] Registered with relay: {}", json_str);
+                                                        log::warn!("[WebTransport] Registered with relay: {}", json_str);
                                                     }
                                                 }
                                             }
@@ -340,7 +340,7 @@ mod native {
                                             }
                                         }
                                         Err(e) => {
-                                            eprintln!("[WebTransport] Connection lost: {}", e);
+                                            log::warn!("[WebTransport] Connection lost: {}", e);
                                             log::error!("[WebTransport] Receive error: {}", e);
                                             break 'connection_loop;
                                         }
@@ -350,7 +350,7 @@ mod native {
                         }
                         
                         // Connection lost, wait before reconnecting
-                        eprintln!("[WebTransport] Scheduling reconnection in {}s...", reconnect_delay);
+                        log::warn!("[WebTransport] Scheduling reconnection in {}s...", reconnect_delay);
                         tokio::time::sleep(Duration::from_secs(reconnect_delay)).await;
                         reconnect_delay = (reconnect_delay * 2).min(MAX_RECONNECT_DELAY_SECS);
                     }

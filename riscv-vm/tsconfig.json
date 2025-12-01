@@ -12,8 +12,8 @@
     "forceConsistentCasingInFileNames": true,
     "moduleDetection": "force",
     "strict": true,
-    "lib": ["ES2022", "DOM"],
+    "lib": ["ES2022", "DOM", ],
   },
-  "include": ["pkg", "index.ts"],
+  "include": ["pkg", "index.ts", "worker.ts", "cli.ts"],
   "exclude": ["node_modules", "build"]
 }

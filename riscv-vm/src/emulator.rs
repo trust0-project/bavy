@@ -3,12 +3,90 @@ use crate::cpu::Cpu;
 use crate::Trap;
 use goblin::elf::{program_header::PT_LOAD, Elf};
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+
+#[cfg(not(target_arch = "wasm32"))]
+use crate::console::Console;
+
+/// Shared state between main thread and worker threads.
+///
+/// This struct is wrapped in Arc and shared across all threads.
+/// All fields use atomics for lock-free synchronization.
+pub struct SharedState {
+    /// Request all threads to stop.
+    halt_requested: AtomicBool,
+    /// A thread has encountered a fatal error or shutdown.
+    halted: AtomicBool,
+    /// Halt code (e.g., from TEST_FINISHER).
+    halt_code: AtomicU64,
+}
+
+impl SharedState {
+    /// Create new shared state.
+    pub fn new() -> Self {
+        Self {
+            halt_requested: AtomicBool::new(false),
+            halted: AtomicBool::new(false),
+            halt_code: AtomicU64::new(0),
+        }
+    }
+
+    /// Request all threads to halt.
+    pub fn request_halt(&self) {
+        // Use Release ordering - ensures all prior writes are visible
+        // before the halt flag becomes visible
+        self.halt_requested.store(true, Ordering::Release);
+    }
+
+    /// Check if halt has been requested.
+    pub fn is_halt_requested(&self) -> bool {
+        // Use Relaxed - we just need to eventually see the flag
+        self.halt_requested.load(Ordering::Relaxed)
+    }
+
+    /// Signal that a thread has halted (e.g., due to trap).
+    pub fn signal_halted(&self, code: u64) {
+        self.halt_code.store(code, Ordering::Relaxed);
+        // Use Release for the halted flag to ensure halt_code is visible
+        self.halted.store(true, Ordering::Release);
+    }
+
+    /// Check if any thread has halted.
+    pub fn is_halted(&self) -> bool {
+        self.halted.load(Ordering::Relaxed)
+    }
+
+    /// Get the halt code.
+    pub fn halt_code(&self) -> u64 {
+        // Use Acquire to ensure we see the halt_code written before halted was set
+        self.halt_code.load(Ordering::Acquire)
+    }
+
+    /// Check if we should stop (either requested or already halted).
+    /// 
+    /// Performance note: This is called on every instruction, so we use
+    /// Relaxed ordering. The flags will eventually become visible.
+    #[inline(always)]
+    pub fn should_stop(&self) -> bool {
+        // Use Relaxed - we're polling frequently enough that eventual consistency is fine
+        self.halt_requested.load(Ordering::Relaxed) || self.halted.load(Ordering::Relaxed)
+    }
+}
+
+impl Default for SharedState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Default DRAM size used when constructing an [`Emulator`] via [`Emulator::new`].
 ///
@@ -65,7 +143,7 @@ impl Emulator {
     pub fn with_memory(dram_size_bytes: usize) -> Self {
         let dram_base = DRAM_BASE;
         let bus = SystemBus::new(dram_base, dram_size_bytes);
-        let cpu = Cpu::new(dram_base);
+        let cpu = Cpu::new(dram_base, 0);  // hart_id = 0
 
         Self {
             cpu,
@@ -127,7 +205,7 @@ impl Emulator {
     /// On success, returns `Ok(())`. On architectural traps, this records the
     /// trap in [`last_trap`] and sets [`trapped`] before returning `Err(trap)`.
     pub fn step(&mut self) -> Result<(), Trap> {
-        match self.cpu.step(&mut self.bus) {
+        match self.cpu.step(&self.bus) {
             Ok(()) => {
                 // Deliver UART bytes to host callback if registered.
                 if let Some(cb) = self.uart_callback.as_mut() {
@@ -215,7 +293,8 @@ impl Emulator {
         }
 
         // SAFETY: bounds checked above.
-        Ok(self.bus.dram.data[offset..end].to_vec())
+        self.bus.dram.read_range(offset, self.signature_size as usize)
+            .map_err(|e| format!("failed to read signature: {}", e))
     }
 }
 
@@ -233,9 +312,9 @@ pub struct CpuSnapshot {
 /// Serializable CLINT state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClintSnapshot {
-    pub msip: [u32; crate::clint::MAX_HARTS],
+    pub msip: Vec<u32>,
     pub mtime: u64,
-    pub mtimecmp: [u64; crate::clint::MAX_HARTS],
+    pub mtimecmp: Vec<u64>,
 }
 
 /// Serializable PLIC state.
@@ -302,43 +381,45 @@ impl Emulator {
         };
 
         let clint = ClintSnapshot {
-            msip: self.bus.clint.msip,
-            mtime: self.bus.clint.mtime,
-            mtimecmp: self.bus.clint.mtimecmp,
+            msip: self.bus.clint.get_msip_array().to_vec(),
+            mtime: self.bus.clint.mtime(),
+            mtimecmp: self.bus.clint.get_mtimecmp_array().to_vec(),
         };
 
         let plic = PlicSnapshot {
-            priority: self.bus.plic.priority.to_vec(),
-            pending: self.bus.plic.pending,
-            enable: self.bus.plic.enable.to_vec(),
-            threshold: self.bus.plic.threshold.to_vec(),
-            active: self.bus.plic.active.to_vec(),
+            priority: self.bus.plic.get_priority(),
+            pending: self.bus.plic.get_pending(),
+            enable: self.bus.plic.get_enable(),
+            threshold: self.bus.plic.get_threshold(),
+            active: self.bus.plic.get_active(),
         };
 
+        let (ier, iir, fcr, lcr, mcr, lsr, msr, scr, dll, dlm) = self.bus.uart.get_registers();
         let uart = UartSnapshot {
-            rx_fifo: self.bus.uart.input.iter().copied().collect(),
-            tx_fifo: self.bus.uart.output.iter().copied().collect(),
-            ier: self.bus.uart.ier,
-            iir: self.bus.uart.iir,
-            fcr: self.bus.uart.fcr,
-            lcr: self.bus.uart.lcr,
-            mcr: self.bus.uart.mcr,
-            lsr: self.bus.uart.lsr,
-            msr: self.bus.uart.msr,
-            scr: self.bus.uart.scr,
-            dll: self.bus.uart.dll,
-            dlm: self.bus.uart.dlm,
+            rx_fifo: self.bus.uart.get_input(),
+            tx_fifo: self.bus.uart.get_output(),
+            ier,
+            iir,
+            fcr,
+            lcr,
+            mcr,
+            lsr,
+            msr,
+            scr,
+            dll,
+            dlm,
         };
 
+        let dram_data = self.bus.dram.get_data();
         let mut hasher = Sha256::new();
-        hasher.update(&self.bus.dram.data);
+        hasher.update(&dram_data);
         let hash = hex::encode(hasher.finalize());
 
         let region = MemRegionSnapshot {
             base: self.bus.dram.base,
-            size: self.bus.dram.data.len() as u64,
+            size: self.bus.dram.size() as u64,
             hash,
-            data: Some(self.bus.dram.data.clone()),
+            data: Some(dram_data),
         };
 
         Snapshot {
@@ -367,49 +448,32 @@ impl Emulator {
         self.last_trap = None;
 
         // Restore CLINT.
-        self.bus.clint.msip = snapshot.devices.clint.msip;
+        self.bus.clint.set_msip_array(&snapshot.devices.clint.msip);
         self.bus.clint.set_mtime(snapshot.devices.clint.mtime);
-        self.bus.clint.mtimecmp = snapshot.devices.clint.mtimecmp;
+        self.bus.clint.set_mtimecmp_array(&snapshot.devices.clint.mtimecmp);
 
-        // Restore PLIC (truncate if snapshot has more sources/contexts).
-        for (i, &val) in snapshot.devices.plic.priority.iter().enumerate() {
-            if i < self.bus.plic.priority.len() {
-                self.bus.plic.priority[i] = val;
-            }
-        }
-        self.bus.plic.pending = snapshot.devices.plic.pending;
-        for (i, &val) in snapshot.devices.plic.enable.iter().enumerate() {
-            if i < self.bus.plic.enable.len() {
-                self.bus.plic.enable[i] = val;
-            }
-        }
-        for (i, &val) in snapshot.devices.plic.threshold.iter().enumerate() {
-            if i < self.bus.plic.threshold.len() {
-                self.bus.plic.threshold[i] = val;
-            }
-        }
-        for (i, &val) in snapshot.devices.plic.active.iter().enumerate() {
-            if i < self.bus.plic.active.len() {
-                self.bus.plic.active[i] = val;
-            }
-        }
+        // Restore PLIC.
+        self.bus.plic.set_priority(&snapshot.devices.plic.priority);
+        self.bus.plic.set_pending(snapshot.devices.plic.pending);
+        self.bus.plic.set_enable(&snapshot.devices.plic.enable);
+        self.bus.plic.set_threshold(&snapshot.devices.plic.threshold);
+        self.bus.plic.set_active(&snapshot.devices.plic.active);
 
         // Restore UART.
-        self.bus.uart.input.clear();
-        self.bus.uart.input.extend(snapshot.devices.uart.rx_fifo.iter().copied());
-        self.bus.uart.output.clear();
-        self.bus.uart.output.extend(snapshot.devices.uart.tx_fifo.iter().copied());
-        self.bus.uart.ier = snapshot.devices.uart.ier;
-        self.bus.uart.iir = snapshot.devices.uart.iir;
-        self.bus.uart.fcr = snapshot.devices.uart.fcr;
-        self.bus.uart.lcr = snapshot.devices.uart.lcr;
-        self.bus.uart.mcr = snapshot.devices.uart.mcr;
-        self.bus.uart.lsr = snapshot.devices.uart.lsr;
-        self.bus.uart.msr = snapshot.devices.uart.msr;
-        self.bus.uart.scr = snapshot.devices.uart.scr;
-        self.bus.uart.dll = snapshot.devices.uart.dll;
-        self.bus.uart.dlm = snapshot.devices.uart.dlm;
-        self.bus.uart.update_interrupts();
+        self.bus.uart.set_input(&snapshot.devices.uart.rx_fifo);
+        self.bus.uart.set_output(&snapshot.devices.uart.tx_fifo);
+        self.bus.uart.set_registers(
+            snapshot.devices.uart.ier,
+            snapshot.devices.uart.iir,
+            snapshot.devices.uart.fcr,
+            snapshot.devices.uart.lcr,
+            snapshot.devices.uart.mcr,
+            snapshot.devices.uart.lsr,
+            snapshot.devices.uart.msr,
+            snapshot.devices.uart.scr,
+            snapshot.devices.uart.dll,
+            snapshot.devices.uart.dlm,
+        );
 
         // Restore DRAM.
         let region = snapshot
@@ -428,10 +492,10 @@ impl Emulator {
                 self.bus.dram.base, region.base
             ));
         }
-        if self.bus.dram.data.len() != data.len() {
+        if self.bus.dram.size() != data.len() {
             return Err(format!(
                 "snapshot DRAM size mismatch: emulator={} bytes, snapshot={} bytes",
-                self.bus.dram.data.len(),
+                self.bus.dram.size(),
                 data.len()
             ));
         }
@@ -446,7 +510,8 @@ impl Emulator {
             ));
         }
 
-        self.bus.dram.data.clone_from_slice(data);
+        self.bus.dram.set_data(data)
+            .map_err(|e| format!("failed to restore DRAM: {}", e))?;
 
         Ok(())
     }
@@ -507,8 +572,12 @@ mod tests {
         // Touch DRAM and devices.
         let addr = emu.bus.dram_base() + 0x80;
         emu.bus.write64(addr, 0x0123_4567_89ab_cdef).unwrap();
-        emu.bus.clint.mtime = 1234;
-        emu.bus.clint.mtimecmp[0] = 5678;
+        emu.bus.clint.set_mtime(1234);
+        {
+            let mut mtimecmp = emu.bus.clint.get_mtimecmp_array();
+            mtimecmp[0] = 5678;
+            emu.bus.clint.set_mtimecmp_array(mtimecmp);
+        }
         emu.bus.uart.push_input(b'A');
 
         let snap = emu.snapshot();
@@ -522,10 +591,10 @@ mod tests {
             emu.cpu.read_reg(crate::decoder::Register::X5),
             emu2.cpu.read_reg(crate::decoder::Register::X5)
         );
-        assert_eq!(emu.bus.dram.data, emu2.bus.dram.data);
-        assert_eq!(emu.bus.clint.mtime, emu2.bus.clint.mtime);
-        assert_eq!(emu.bus.clint.mtimecmp, emu2.bus.clint.mtimecmp);
-        assert_eq!(emu.bus.uart.input, emu2.bus.uart.input);
+        assert_eq!(emu.bus.dram.get_data(), emu2.bus.dram.get_data());
+        assert_eq!(emu.bus.clint.mtime(), emu2.bus.clint.mtime());
+        assert_eq!(emu.bus.clint.get_mtimecmp_array(), emu2.bus.clint.get_mtimecmp_array());
+        assert_eq!(emu.bus.uart.get_input(), emu2.bus.uart.get_input());
     }
 }
 
@@ -600,4 +669,490 @@ fn load_elf_into_dram(
     Ok(elf.entry)
 }
 
+// ============================================================================
+// NativeVm - Multi-threaded VM for native execution
+// ============================================================================
+
+#[cfg(not(target_arch = "wasm32"))]
+/// Native multi-threaded VM.
+///
+/// Manages one thread per hart, with hart 0 running on the main thread
+/// for I/O coordination.
+pub struct NativeVm {
+    /// Shared bus (thread-safe after Phase 2).
+    bus: Arc<SystemBus>,
+    /// Thread handles for worker threads (harts 1+).
+    handles: Vec<JoinHandle<()>>,
+    /// Primary hart CPU (runs on main thread for I/O).
+    primary_cpu: Option<Cpu>,
+    /// Shared state for coordination.
+    pub shared: Arc<SharedState>,
+    /// Number of harts.
+    num_harts: usize,
+    /// Kernel entry point.
+    entry_pc: u64,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl NativeVm {
+    /// Create a new VM with the given kernel.
+    ///
+    /// # Arguments
+    /// * `kernel` - Kernel binary (ELF or raw)
+    /// * `num_harts` - Number of harts (CPUs) to create
+    pub fn new(kernel: &[u8], num_harts: usize) -> Result<Self, String> {
+        const DRAM_SIZE: usize = 512 * 1024 * 1024;
+        let bus = SystemBus::new(DRAM_BASE, DRAM_SIZE);
+        
+        // Set hart count in CLINT so kernel can read it
+        bus.set_num_harts(num_harts);
+
+        // Load kernel (ELF or raw)
+        let entry_pc = if kernel.starts_with(b"\x7FELF") {
+            load_elf_native(kernel, &bus)?
+        } else {
+            bus.dram
+                .load(kernel, 0)
+                .map_err(|e| format!("Failed to load kernel: {:?}", e))?;
+            DRAM_BASE
+        };
+
+        let bus = Arc::new(bus);
+        let shared = Arc::new(SharedState::new());
+
+        // Create primary CPU (hart 0)
+        let primary_cpu = Some(Cpu::new(entry_pc, 0));
+
+        println!("[VM] Created with {} harts, entry=0x{:x}", num_harts, entry_pc);
+
+        Ok(Self {
+            bus,
+            handles: Vec::new(),
+            primary_cpu,
+            shared,
+            num_harts,
+            entry_pc,
+        })
+    }
+
+    /// Create a VM with auto-detected hart count.
+    /// Uses half the available CPU cores on the host.
+    pub fn new_auto(kernel: &[u8]) -> Result<Self, String> {
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2);
+        let num_harts = (cpus / 2).max(1); // Use half the CPUs, ensure at least 1
+        Self::new(kernel, num_harts)
+    }
+
+    /// Load a disk image and attach as VirtIO block device.
+    pub fn load_disk(&mut self, disk: Vec<u8>) {
+        use crate::virtio::VirtioBlock;
+
+        // Need to get mutable access to bus - this requires unsafe or RefCell
+        // For now, load disk before creating workers
+        if let Some(bus) = Arc::get_mut(&mut self.bus) {
+            let vblk = VirtioBlock::new(disk);
+            bus.virtio_devices.push(Box::new(vblk));
+            println!("[VM] Loaded disk image");
+        } else {
+            eprintln!("[VM] Cannot load disk: workers already running");
+        }
+    }
+
+    /// Connect to a WebTransport relay for networking.
+    ///
+    /// Must be called before `run()` / `start_workers()`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn connect_webtransport(&mut self, url: &str, cert_hash: Option<String>) {
+        use crate::net_webtransport::WebTransportBackend;
+        use crate::virtio::VirtioNet;
+
+        if let Some(bus) = Arc::get_mut(&mut self.bus) {
+            let backend = WebTransportBackend::new(url, cert_hash);
+            let vnet = VirtioNet::new(Box::new(backend));
+            bus.virtio_devices.push(Box::new(vnet));
+            println!("[VM] WebTransport network configured: {}", url);
+        } else {
+            eprintln!("[VM] Cannot configure network: workers already running");
+        }
+    }
+
+    /// Get the number of harts.
+    pub fn num_harts(&self) -> usize {
+        self.num_harts
+    }
+
+    /// Get the kernel entry point.
+    pub fn entry_pc(&self) -> u64 {
+        self.entry_pc
+    }
+
+    /// Get a reference to the shared bus.
+    pub fn bus(&self) -> &Arc<SystemBus> {
+        &self.bus
+    }
+
+    /// Start worker threads for secondary harts.
+    ///
+    /// This spawns threads for harts 1, 2, ..., N-1.
+    /// Hart 0 runs on the main thread (in `run()`).
+    pub fn start_workers(&mut self) {
+        for hart_id in 1..self.num_harts {
+            let bus = Arc::clone(&self.bus);
+            let shared = Arc::clone(&self.shared);
+            let entry_pc = self.entry_pc;
+
+            let handle = thread::Builder::new()
+                .name(format!("hart-{}", hart_id))
+                .spawn(move || {
+                    hart_thread(hart_id, entry_pc, bus, shared);
+                })
+                .expect("Failed to spawn hart thread");
+
+            self.handles.push(handle);
+            println!("[VM] Started thread for hart {}", hart_id);
+        }
+    }
+
+    /// Check if workers have been started.
+    pub fn workers_started(&self) -> bool {
+        !self.handles.is_empty() || self.num_harts == 1
+    }
+
+    /// Run the VM until halted.
+    ///
+    /// This runs hart 0 on the main thread while secondary harts
+    /// run on worker threads.
+    pub fn run(&mut self) {
+        // Start worker threads if not already started
+        if !self.workers_started() {
+            self.start_workers();
+        }
+
+        let mut cpu = self.primary_cpu.take().expect("CPU already taken");
+        let mut step_count: u64 = 0;
+        let start_time = Instant::now();
+
+        // Initialize console for non-blocking input
+        let console = Console::new();
+        let mut escaped = false;
+
+        // Performance metrics
+        let mut last_report_time = Instant::now();
+        let mut last_report_steps: u64 = 0;
+        let report_interval = Duration::from_secs(5);
+
+        println!("[VM] Running hart 0 on main thread...");
+
+        // Batch size for halt checking - reduces atomic load frequency
+        // Check less frequently since should_stop() is now cheap (Relaxed ordering)
+        // Higher values = better performance, lower responsiveness to halt
+        const HALT_CHECK_INTERVAL: u64 = 16384;
+        // I/O polling interval - balance between responsiveness and throughput
+        // Console/VirtIO polling is relatively expensive, so do it less often
+        const IO_POLL_INTERVAL: u64 = 32768;
+
+        loop {
+            // Batch halt checking - only check every N instructions
+            if step_count % HALT_CHECK_INTERVAL == 0 && self.shared.should_stop() {
+                break;
+            }
+
+            // Poll I/O periodically
+            if step_count % IO_POLL_INTERVAL == 0 {
+                self.bus.poll_virtio();
+                self.pump_console(&console, &mut escaped);
+                
+                // Periodic performance report (debug mode)
+                if log::log_enabled!(log::Level::Debug) {
+                    let now = Instant::now();
+                    if now.duration_since(last_report_time) >= report_interval {
+                        let delta_steps = step_count - last_report_steps;
+                        let delta_time = now.duration_since(last_report_time).as_secs_f64();
+                        let current_ips = if delta_time > 0.0 {
+                            delta_steps as f64 / delta_time
+                        } else {
+                            0.0
+                        };
+                        log::debug!(
+                            "[Hart 0] {} steps, {:.2}M IPS (current), PC=0x{:x}",
+                            step_count,
+                            current_ips / 1_000_000.0,
+                            cpu.pc
+                        );
+                        last_report_time = now;
+                        last_report_steps = step_count;
+                    }
+                }
+            }
+
+            // Execute primary hart
+            match cpu.step(&*self.bus) {
+                Ok(()) => {
+                    step_count += 1;
+                }
+                Err(Trap::RequestedTrap(code)) => {
+                    println!("[VM] Shutdown requested (code: {:#x})", code);
+                    self.shared.signal_halted(code);
+                    break;
+                }
+                Err(Trap::Fatal(msg)) => {
+                    eprintln!("[VM] Fatal error: {} at PC=0x{:x}", msg, cpu.pc);
+                    self.shared.signal_halted(0xDEAD);
+                    break;
+                }
+                Err(_trap) => {
+                    // Architectural traps handled by CPU
+                    step_count += 1;
+                }
+            }
+        }
+
+        // Clean up
+        self.shutdown();
+
+        // Report statistics
+        let elapsed = start_time.elapsed().as_secs_f64();
+        let ips = if elapsed > 0.0 {
+            step_count as f64 / elapsed
+        } else {
+            0.0
+        };
+        println!(
+            "[VM] Hart 0 halted after {} steps ({:.2}M IPS)",
+            step_count,
+            ips / 1_000_000.0
+        );
+    }
+
+    /// Pump console I/O.
+    /// 
+    /// Handles UART output to stdout and console input to UART.
+    /// Supports Ctrl-A escape sequences:
+    /// - Ctrl-A x: terminate VM
+    /// - Ctrl-A Ctrl-A: send literal Ctrl-A
+    fn pump_console(&self, console: &Console, escaped: &mut bool) {
+        // Output to stdout - drain all at once to reduce lock contention
+        let output = self.bus.uart.drain_output();
+        if !output.is_empty() {
+            for byte in output {
+                // In raw terminal mode, \n alone doesn't return cursor to column 0.
+                // We need to emit \r\n for proper line breaks.
+                if byte == b'\n' {
+                    print!("\r\n");
+                } else {
+                    print!("{}", byte as char);
+                }
+            }
+            io::stdout().flush().ok();
+        }
+
+        // Input from console (non-blocking)
+        for byte in console.read_available() {
+            if *escaped {
+                if byte == b'x' {
+                    // Ctrl-A x: terminate
+                    println!("\r\n[VM] Terminated by user (Ctrl-A x)");
+                    self.shared.request_halt();
+                    return;
+                } else if byte == 1 {
+                    // Ctrl-A Ctrl-A: send literal Ctrl-A
+                    self.bus.uart.push_input(1);
+                } else {
+                    // Ctrl-A then something else: send that something
+                    self.bus.uart.push_input(byte);
+                }
+                *escaped = false;
+            } else {
+                if byte == 1 {
+                    // Ctrl-A: start escape sequence
+                    *escaped = true;
+                } else {
+                    self.bus.uart.push_input(byte);
+                }
+            }
+        }
+    }
+
+    /// Request shutdown and wait for workers.
+    fn shutdown(&mut self) {
+        println!("[VM] Shutting down...");
+
+        // Signal halt to all workers
+        self.shared.request_halt();
+
+        // Wait for all workers to exit
+        for handle in self.handles.drain(..) {
+            if let Err(e) = handle.join() {
+                eprintln!("[VM] Worker thread panicked: {:?}", e);
+            }
+        }
+
+        println!("[VM] All threads stopped");
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for NativeVm {
+    fn drop(&mut self) {
+        // Ensure threads are cleaned up
+        self.shared.request_halt();
+        for handle in self.handles.drain(..) {
+            handle.join().ok();
+        }
+    }
+}
+
+/// Load ELF kernel into DRAM (for NativeVm).
+///
+/// Takes a shared reference to the bus since SystemBus uses interior
+/// mutability for DRAM access.
+#[cfg(not(target_arch = "wasm32"))]
+fn load_elf_native(buffer: &[u8], bus: &SystemBus) -> Result<u64, String> {
+    let elf = Elf::parse(buffer).map_err(|e| format!("ELF parse error: {}", e))?;
+    let base = bus.dram.base;
+    let dram_size = bus.dram.size();
+    let dram_end = base + dram_size as u64;
+
+    for ph in &elf.program_headers {
+        if ph.p_type != PT_LOAD || ph.p_memsz == 0 {
+            continue;
+        }
+
+        let file_size = ph.p_filesz as usize;
+        let mem_size = ph.p_memsz as usize;
+        let file_offset = ph.p_offset as usize;
+
+        if file_offset + file_size > buffer.len() {
+            return Err("Segment exceeds file bounds".to_string());
+        }
+
+        let target_addr = if ph.p_paddr != 0 {
+            ph.p_paddr
+        } else {
+            ph.p_vaddr
+        };
+
+        if target_addr < base || target_addr + mem_size as u64 > dram_end {
+            return Err(format!("Segment 0x{:x} out of DRAM range", target_addr));
+        }
+
+        let dram_offset = target_addr - base;
+
+        if file_size > 0 {
+            bus.dram
+                .load(&buffer[file_offset..file_offset + file_size], dram_offset)
+                .map_err(|e| format!("Failed to load segment: {:?}", e))?;
+        }
+
+        if mem_size > file_size {
+            bus.dram
+                .zero_range((dram_offset as usize) + file_size, mem_size - file_size)
+                .map_err(|e| format!("Failed to zero BSS: {:?}", e))?;
+        }
+    }
+
+    Ok(elf.entry)
+}
+
+/// Hart thread entry point.
+///
+/// This function runs on a dedicated thread for each secondary hart.
+/// It executes CPU instructions until halted.
+#[cfg(not(target_arch = "wasm32"))]
+fn hart_thread(hart_id: usize, entry_pc: u64, bus: Arc<SystemBus>, shared: Arc<SharedState>) {
+    let mut cpu = Cpu::new(entry_pc, hart_id as u64);
+    let mut step_count: u64 = 0;
+    let start_time = Instant::now();
+
+    // Performance metrics
+    let mut last_report_time = Instant::now();
+    let mut last_report_steps: u64 = 0;
+    let report_interval = Duration::from_secs(5);
+
+    println!("[Hart {}] Started at PC=0x{:x}", hart_id, entry_pc);
+
+    // Batch size for halt checking - reduces atomic load frequency
+    // Check less frequently since should_stop() is now cheap (Relaxed ordering)
+    // Higher values = better performance but slower halt response
+    const HALT_CHECK_INTERVAL: u64 = 16384;
+    // Yield interval - allow other threads to run
+    // Higher value = better throughput but potentially less fair scheduling
+    // Modern OSes handle this well, so we can be aggressive
+    const YIELD_INTERVAL: u64 = 4_000_000;
+
+    loop {
+        // Batch halt checking - only check every N instructions
+        if step_count % HALT_CHECK_INTERVAL == 0 && shared.should_stop() {
+            break;
+        }
+
+        // Execute one instruction
+        match cpu.step(&*bus) {
+            Ok(()) => {
+                step_count += 1;
+            }
+            Err(Trap::RequestedTrap(code)) => {
+                println!(
+                    "[Hart {}] Shutdown requested (code: {:#x})",
+                    hart_id, code
+                );
+                shared.signal_halted(code);
+                break;
+            }
+            Err(Trap::Fatal(msg)) => {
+                eprintln!("[Hart {}] Fatal: {} at PC=0x{:x}", hart_id, msg, cpu.pc);
+                shared.signal_halted(0xDEAD);
+                break;
+            }
+            Err(_trap) => {
+                // Architectural traps handled by CPU
+                step_count += 1;
+            }
+        }
+
+        // Yield occasionally to prevent CPU hogging and reduce contention
+        if step_count % YIELD_INTERVAL == 0 {
+            thread::yield_now();
+            
+            // Periodic performance report (debug mode)
+            if log::log_enabled!(log::Level::Debug) {
+                let now = Instant::now();
+                if now.duration_since(last_report_time) >= report_interval {
+                    let delta_steps = step_count - last_report_steps;
+                    let delta_time = now.duration_since(last_report_time).as_secs_f64();
+                    let current_ips = if delta_time > 0.0 {
+                        delta_steps as f64 / delta_time
+                    } else {
+                        0.0
+                    };
+                    log::debug!(
+                        "[Hart {}] {} steps, {:.2}M IPS (current), PC=0x{:x}",
+                        hart_id,
+                        step_count,
+                        current_ips / 1_000_000.0,
+                        cpu.pc
+                    );
+                    last_report_time = now;
+                    last_report_steps = step_count;
+                }
+            }
+        }
+    }
+
+    // Report statistics
+    let elapsed = start_time.elapsed().as_secs_f64();
+    let ips = if elapsed > 0.0 {
+        step_count as f64 / elapsed
+    } else {
+        0.0
+    };
+    println!(
+        "[Hart {}] Exited after {} steps ({:.2}M IPS)",
+        hart_id,
+        step_count,
+        ips / 1_000_000.0
+    );
+}
 

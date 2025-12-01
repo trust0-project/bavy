@@ -1,8 +1,9 @@
 PROVIDE(_stext = ORIGIN(REGION_TEXT));
 PROVIDE(_stack_start = ORIGIN(REGION_STACK) + LENGTH(REGION_STACK));
-PROVIDE(_max_hart_id = 0);
-PROVIDE(_hart_stack_size = 128K);
-PROVIDE(_heap_size = 64M);
+/* Use direct assignment to override riscv-rt's default PROVIDE */
+_max_hart_id = 7;              /* Support 8 harts (0-7), value is max ID */
+_hart_stack_size = 128K;
+_heap_size = 64M;
 
 PROVIDE(UserSoft = DefaultHandler);
 PROVIDE(SupervisorSoft = DefaultHandler);

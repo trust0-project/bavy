@@ -2,6 +2,23 @@
 members = ["riscv-vm", "kernel", "relay", "mkfs"]
 resolver = "2"
 
+# Workspace-wide release optimizations
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+overflow-checks = false
+debug = false
+
+# Optimize all dependencies in release mode
+[profile.release.package."*"]
+opt-level = 3
+
+# Keep some debug info for profiling (uncomment if needed)
+# [profile.release]
+# debug = 1
+
 
 
 

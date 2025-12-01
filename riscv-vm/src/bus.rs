@@ -1,9 +1,12 @@
 use crate::clint::{Clint, CLINT_BASE, CLINT_SIZE};
-use crate::plic::{Plic, PLIC_BASE, PLIC_SIZE};
+use crate::plic::{Plic, PLIC_BASE, PLIC_SIZE, UART_IRQ, VIRTIO0_IRQ};
 use crate::uart::{Uart, UART_BASE, UART_SIZE};
 use crate::virtio::VirtioDevice;
 use crate::Trap;
 use crate::dram::Dram;
+
+#[cfg(target_arch = "wasm32")]
+use js_sys::SharedArrayBuffer;
 
 /// Default DRAM base for the virt platform.
 pub const DRAM_BASE: u64 = 0x8000_0000;
@@ -17,19 +20,26 @@ pub const VIRTIO_BASE: u64 = 0x1000_1000;
 /// Size of each VirtIO MMIO region.
 pub const VIRTIO_STRIDE: u64 = 0x1000;
 
-pub trait Bus {
-    fn read8(&mut self, addr: u64) -> Result<u8, Trap>;
-    fn read16(&mut self, addr: u64) -> Result<u16, Trap>;
-    fn read32(&mut self, addr: u64) -> Result<u32, Trap>;
-    fn read64(&mut self, addr: u64) -> Result<u64, Trap>;
+/// System bus trait for memory and MMIO access.
+///
+/// All methods take `&self` to allow concurrent access from multiple harts.
+/// Implementations must use interior mutability (Mutex, RwLock, atomics)
+/// for any mutable state.
+///
+/// The `Send + Sync` bounds ensure implementations are thread-safe.
+pub trait Bus: Send + Sync {
+    fn read8(&self, addr: u64) -> Result<u8, Trap>;
+    fn read16(&self, addr: u64) -> Result<u16, Trap>;
+    fn read32(&self, addr: u64) -> Result<u32, Trap>;
+    fn read64(&self, addr: u64) -> Result<u64, Trap>;
 
-    fn write8(&mut self, addr: u64, val: u8) -> Result<(), Trap>;
-    fn write16(&mut self, addr: u64, val: u16) -> Result<(), Trap>;
-    fn write32(&mut self, addr: u64, val: u32) -> Result<(), Trap>;
-    fn write64(&mut self, addr: u64, val: u64) -> Result<(), Trap>;
+    fn write8(&self, addr: u64, val: u8) -> Result<(), Trap>;
+    fn write16(&self, addr: u64, val: u16) -> Result<(), Trap>;
+    fn write32(&self, addr: u64, val: u32) -> Result<(), Trap>;
+    fn write64(&self, addr: u64, val: u64) -> Result<(), Trap>;
 
     /// Generic load helper used by the MMU for page-table walks.
-    fn load(&mut self, addr: u64, size: u64) -> Result<u64, Trap> {
+    fn load(&self, addr: u64, size: u64) -> Result<u64, Trap> {
         match size {
             1 => self.read8(addr).map(|v| v as u64),
             2 => self.read16(addr).map(|v| v as u64),
@@ -40,7 +50,7 @@ pub trait Bus {
     }
 
     /// Generic store helper used by the MMU for page-table A/D updates.
-    fn store(&mut self, addr: u64, size: u64, value: u64) -> Result<(), Trap> {
+    fn store(&self, addr: u64, size: u64, value: u64) -> Result<(), Trap> {
         match size {
             1 => self.write8(addr, value as u8),
             2 => self.write16(addr, value as u16),
@@ -50,7 +60,7 @@ pub trait Bus {
         }
     }
 
-    fn fetch_u32(&mut self, addr: u64) -> Result<u32, Trap> {
+    fn fetch_u32(&self, addr: u64) -> Result<u32, Trap> {
         if addr % 4 != 0 {
             return Err(Trap::InstructionAddressMisaligned(addr));
         }
@@ -62,7 +72,14 @@ pub trait Bus {
         })
     }
 
-    fn poll_interrupts(&mut self) -> u64 {
+    fn poll_interrupts(&self) -> u64 {
+        0
+    }
+
+    /// Poll hardware interrupt sources for a specific hart.
+    /// Returns MIP bits for that hart.
+    /// Default implementation returns 0 (no interrupts).
+    fn poll_interrupts_for_hart(&self, _hart_id: usize) -> u64 {
         0
     }
 }
@@ -87,64 +104,101 @@ impl SystemBus {
         }
     }
 
+    /// Create a SystemBus from an existing SharedArrayBuffer.
+    ///
+    /// Used by Web Workers to attach to shared memory created by main thread.
+    /// Workers get a view of the shared DRAM but have their own CLINT/PLIC/UART
+    /// instances (these are per-worker and not shared).
+    #[cfg(target_arch = "wasm32")]
+    pub fn from_shared_buffer(buffer: SharedArrayBuffer) -> Self {
+        Self {
+            dram: Dram::from_shared(DRAM_BASE, buffer),
+            clint: Clint::new(),
+            plic: Plic::new(),
+            uart: Uart::new(),
+            virtio_devices: Vec::new(),
+        }
+    }
+
     pub fn dram_base(&self) -> u64 {
         self.dram.base
     }
 
     pub fn dram_size(&self) -> usize {
-        self.dram.data.len()
+        self.dram.size()
+    }
+    
+    /// Set the number of harts (called by emulator at init).
+    /// This writes the hart count to a CLINT register so the kernel can read it.
+    pub fn set_num_harts(&self, num_harts: usize) {
+        self.clint.set_num_harts(num_harts);
     }
 
-    pub fn check_interrupts(&mut self) -> u64 {
-        // 0. Advance CLINT timer each step
-        self.clint.tick();
-        
-        // 1. Update PLIC with UART status
-        let uart_irq = self.uart.interrupting;
-        self.plic.set_source_level(crate::plic::UART_IRQ, uart_irq);
+    /// Check interrupts for hart 0 (backward compatibility).
+    pub fn check_interrupts(&self) -> u64 {
+        self.check_interrupts_for_hart(0)
+    }
 
-        // 1b. Update PLIC with VirtIO interrupts
-        // We map VirtIO devices to IRQs starting at VIRTIO0_IRQ (1).
-        // Device 0 -> IRQ 1
+    /// Check interrupts for a specific hart.
+    /// 
+    /// Each hart has its own:
+    /// - MSIP (software interrupt from CLINT)
+    /// - MTIP (timer interrupt from CLINT)
+    /// - SEIP/MEIP (external interrupt from PLIC)
+    /// 
+    /// Thread-safe: each device has internal locking.
+    /// Optimized to minimize lock acquisitions.
+    pub fn check_interrupts_for_hart(&self, hart_id: usize) -> u64 {
+        // Advance CLINT timer - only from hart 0 to avoid Nx speedup with N harts
+        if hart_id == 0 {
+            self.clint.tick();
+        }
+
+        // Update PLIC with UART interrupt status
+        let uart_irq = self.uart.is_interrupting();
+        self.plic.set_source_level(UART_IRQ, uart_irq);
+
+        // Update PLIC with VirtIO interrupts
+        // Device 0 -> IRQ 1 (VIRTIO0_IRQ)
         // Device 1 -> IRQ 2
-        // ...
-        // Device 7 -> IRQ 8
-        // Note: xv6 expects VIRTIO0 at IRQ 1.
+        // etc.
         for (i, dev) in self.virtio_devices.iter().enumerate() {
-            let irq = crate::plic::VIRTIO0_IRQ + i as u32;
-            if irq < 32 { // PLIC limit
-                let intr = dev.is_interrupting();
-                self.plic.set_source_level(irq, intr);
+            let irq = VIRTIO0_IRQ + i as u32;
+            if irq < 32 {
+                self.plic.set_source_level(irq, dev.is_interrupting());
             }
         }
 
-        // 2. Calculate MIP bits
-        let mut mip = 0;
+        // Calculate MIP bits for this hart
+        let mut mip: u64 = 0;
 
+        // Get CLINT interrupts in a single lock acquisition
+        let (msip, timer) = self.clint.check_interrupts_for_hart(hart_id);
+        
         // MSIP (Machine Software Interrupt) - Bit 3
-        if self.clint.msip[0] & 1 != 0 {
+        if msip {
             mip |= 1 << 3;
         }
 
         // MTIP (Machine Timer Interrupt) - Bit 7
-        if self.clint.mtime >= self.clint.mtimecmp[0] {
+        if timer {
             mip |= 1 << 7;
         }
 
         // SEIP (Supervisor External Interrupt) - Bit 9
-        if self.plic.is_interrupt_pending_for(1) {
+        if self.plic.is_interrupt_pending_for(Plic::s_context(hart_id)) {
             mip |= 1 << 9;
         }
 
         // MEIP (Machine External Interrupt) - Bit 11
-        if self.plic.is_interrupt_pending_for(0) {
+        if self.plic.is_interrupt_pending_for(Plic::m_context(hart_id)) {
             mip |= 1 << 11;
         }
 
         mip
     }
 
-    fn get_virtio_device(&mut self, addr: u64) -> Option<(usize, u64)> {
+    fn get_virtio_device(&self, addr: u64) -> Option<(usize, u64)> {
         if addr >= VIRTIO_BASE {
             let offset = addr - VIRTIO_BASE;
             let idx = (offset / VIRTIO_STRIDE) as usize;
@@ -167,9 +221,9 @@ impl SystemBus {
     
     /// Poll all VirtIO devices for pending work (e.g., incoming network packets).
     /// Should be called periodically from the main emulation loop.
-    pub fn poll_virtio(&mut self) {
-        for device in &mut self.virtio_devices {
-            if let Err(e) = device.poll(&mut self.dram) {
+    pub fn poll_virtio(&self) {
+        for device in &self.virtio_devices {
+            if let Err(e) = device.poll(&self.dram) {
                 log::warn!("[Bus] VirtIO poll error: {:?}", e);
             }
         }
@@ -178,7 +232,7 @@ impl SystemBus {
     // Slow path methods for MMIO device access (moved out of hot path)
     
     #[cold]
-    fn read8_slow(&mut self, addr: u64) -> Result<u8, Trap> {
+    fn read8_slow(&self, addr: u64) -> Result<u8, Trap> {
         // Test finisher region: reads are harmless and return zero.
         if addr >= TEST_FINISHER_BASE && addr < TEST_FINISHER_BASE + TEST_FINISHER_SIZE {
             return Ok(0);
@@ -219,7 +273,7 @@ impl SystemBus {
     }
     
     #[cold]
-    fn read16_slow(&mut self, addr: u64) -> Result<u16, Trap> {
+    fn read16_slow(&self, addr: u64) -> Result<u16, Trap> {
         if addr >= TEST_FINISHER_BASE && addr < TEST_FINISHER_BASE + TEST_FINISHER_SIZE {
             return Ok(0);
         }
@@ -258,7 +312,7 @@ impl SystemBus {
     }
     
     #[cold]
-    fn read32_slow(&mut self, addr: u64) -> Result<u32, Trap> {
+    fn read32_slow(&self, addr: u64) -> Result<u32, Trap> {
         if addr >= TEST_FINISHER_BASE && addr < TEST_FINISHER_BASE + TEST_FINISHER_SIZE {
             return Ok(0);
         }
@@ -295,7 +349,7 @@ impl SystemBus {
     }
     
     #[cold]
-    fn read64_slow(&mut self, addr: u64) -> Result<u64, Trap> {
+    fn read64_slow(&self, addr: u64) -> Result<u64, Trap> {
         if addr >= TEST_FINISHER_BASE && addr < TEST_FINISHER_BASE + TEST_FINISHER_SIZE {
             return Ok(0);
         }
@@ -333,7 +387,7 @@ impl SystemBus {
     }
     
     #[cold]
-    fn write8_slow(&mut self, addr: u64, val: u8) -> Result<(), Trap> {
+    fn write8_slow(&self, addr: u64, val: u8) -> Result<(), Trap> {
         // Any write in the test finisher region signals a requested trap to the host.
         if addr >= TEST_FINISHER_BASE && addr < TEST_FINISHER_BASE + TEST_FINISHER_SIZE {
             return Err(Trap::RequestedTrap(val as u64));
@@ -367,7 +421,7 @@ impl SystemBus {
     }
     
     #[cold]
-    fn write16_slow(&mut self, addr: u64, val: u16) -> Result<(), Trap> {
+    fn write16_slow(&self, addr: u64, val: u16) -> Result<(), Trap> {
         if addr >= TEST_FINISHER_BASE && addr < TEST_FINISHER_BASE + TEST_FINISHER_SIZE {
             return Err(Trap::RequestedTrap(val as u64));
         }
@@ -398,7 +452,7 @@ impl SystemBus {
     }
     
     #[cold]
-    fn write32_slow(&mut self, addr: u64, val: u32) -> Result<(), Trap> {
+    fn write32_slow(&self, addr: u64, val: u32) -> Result<(), Trap> {
         if addr >= TEST_FINISHER_BASE && addr < TEST_FINISHER_BASE + TEST_FINISHER_SIZE {
             return Err(Trap::RequestedTrap(val as u64));
         }
@@ -422,7 +476,7 @@ impl SystemBus {
         }
 
         if let Some((idx, offset)) = self.get_virtio_device(addr) {
-            self.virtio_devices[idx].write(offset, val as u64, &mut self.dram)
+            self.virtio_devices[idx].write(offset, val as u64, &self.dram)
                 .map_err(|_| Trap::StoreAccessFault(addr))?;
             return Ok(());
         }
@@ -436,7 +490,7 @@ impl SystemBus {
     }
     
     #[cold]
-    fn write64_slow(&mut self, addr: u64, val: u64) -> Result<(), Trap> {
+    fn write64_slow(&self, addr: u64, val: u64) -> Result<(), Trap> {
         if addr >= TEST_FINISHER_BASE && addr < TEST_FINISHER_BASE + TEST_FINISHER_SIZE {
             return Err(Trap::RequestedTrap(val));
         }
@@ -476,131 +530,108 @@ impl SystemBus {
 
 impl Bus for SystemBus {
     #[inline]
-    fn poll_interrupts(&mut self) -> u64 {
+    fn poll_interrupts(&self) -> u64 {
         self.check_interrupts()
     }
 
+    #[inline]
+    fn poll_interrupts_for_hart(&self, hart_id: usize) -> u64 {
+        self.check_interrupts_for_hart(hart_id)
+    }
+
     #[inline(always)]
-    fn read8(&mut self, addr: u64) -> Result<u8, Trap> {
+    fn read8(&self, addr: u64) -> Result<u8, Trap> {
         // Fast path: DRAM access (most common case)
         if let Some(off) = self.dram.offset(addr) {
-            return Ok(self.dram.data[off]);
+            return self.dram.load_8(off as u64).map_err(|_| Trap::LoadAccessFault(addr));
         }
         // Slow path: MMIO devices
         self.read8_slow(addr)
     }
 
     #[inline(always)]
-    fn read16(&mut self, addr: u64) -> Result<u16, Trap> {
+    fn read16(&self, addr: u64) -> Result<u16, Trap> {
         if addr % 2 != 0 {
             return Err(Trap::LoadAddressMisaligned(addr));
         }
         // Fast path: DRAM access (most common case)
         if let Some(off) = self.dram.offset(addr) {
-            if off + 2 > self.dram.data.len() {
-                return Err(Trap::LoadAccessFault(addr));
-            }
-            let bytes = &self.dram.data[off..off + 2];
-            return Ok(u16::from_le_bytes(bytes.try_into().unwrap()));
+            return self.dram.load_16(off as u64).map_err(|_| Trap::LoadAccessFault(addr));
         }
         // Slow path: MMIO devices
         self.read16_slow(addr)
     }
 
     #[inline(always)]
-    fn read32(&mut self, addr: u64) -> Result<u32, Trap> {
+    fn read32(&self, addr: u64) -> Result<u32, Trap> {
         if addr % 4 != 0 {
             return Err(Trap::LoadAddressMisaligned(addr));
         }
         // Fast path: DRAM access (most common case)
         if let Some(off) = self.dram.offset(addr) {
-            if off + 4 > self.dram.data.len() {
-                return Err(Trap::LoadAccessFault(addr));
-            }
-            let bytes = &self.dram.data[off..off + 4];
-            return Ok(u32::from_le_bytes(bytes.try_into().unwrap()));
+            return self.dram.load_32(off as u64).map_err(|_| Trap::LoadAccessFault(addr));
         }
         // Slow path: MMIO devices
         self.read32_slow(addr)
     }
 
     #[inline(always)]
-    fn read64(&mut self, addr: u64) -> Result<u64, Trap> {
+    fn read64(&self, addr: u64) -> Result<u64, Trap> {
         if addr % 8 != 0 {
             return Err(Trap::LoadAddressMisaligned(addr));
         }
         // Fast path: DRAM access (most common case)
         if let Some(off) = self.dram.offset(addr) {
-            if off + 8 > self.dram.data.len() {
-                return Err(Trap::LoadAccessFault(addr));
-            }
-            let bytes = &self.dram.data[off..off + 8];
-            return Ok(u64::from_le_bytes(bytes.try_into().unwrap()));
+            return self.dram.load_64(off as u64).map_err(|_| Trap::LoadAccessFault(addr));
         }
         // Slow path: MMIO devices
         self.read64_slow(addr)
     }
 
     #[inline(always)]
-    fn write8(&mut self, addr: u64, val: u8) -> Result<(), Trap> {
+    fn write8(&self, addr: u64, val: u8) -> Result<(), Trap> {
         // Fast path: DRAM access (most common case)
         if let Some(off) = self.dram.offset(addr) {
-            self.dram.data[off] = val;
-            return Ok(());
+            return self.dram.store_8(off as u64, val as u64).map_err(|_| Trap::StoreAccessFault(addr));
         }
         // Slow path: MMIO devices
         self.write8_slow(addr, val)
     }
 
     #[inline(always)]
-    fn write16(&mut self, addr: u64, val: u16) -> Result<(), Trap> {
+    fn write16(&self, addr: u64, val: u16) -> Result<(), Trap> {
         if addr % 2 != 0 {
             return Err(Trap::StoreAddressMisaligned(addr));
         }
         // Fast path: DRAM access (most common case)
         if let Some(off) = self.dram.offset(addr) {
-            if off + 2 > self.dram.data.len() {
-                return Err(Trap::StoreAccessFault(addr));
-            }
-            let bytes = val.to_le_bytes();
-            self.dram.data[off..off + 2].copy_from_slice(&bytes);
-            return Ok(());
+            return self.dram.store_16(off as u64, val as u64).map_err(|_| Trap::StoreAccessFault(addr));
         }
         // Slow path: MMIO devices
         self.write16_slow(addr, val)
     }
 
     #[inline(always)]
-    fn write32(&mut self, addr: u64, val: u32) -> Result<(), Trap> {
+    fn write32(&self, addr: u64, val: u32) -> Result<(), Trap> {
         if addr % 4 != 0 {
             return Err(Trap::StoreAddressMisaligned(addr));
         }
         // Fast path: DRAM access (most common case)
         if let Some(off) = self.dram.offset(addr) {
-            if off + 4 > self.dram.data.len() {
-                return Err(Trap::StoreAccessFault(addr));
-            }
-            let bytes = val.to_le_bytes();
-            self.dram.data[off..off + 4].copy_from_slice(&bytes);
-            return Ok(());
+            return self.dram.store_32(off as u64, val as u64).map_err(|_| Trap::StoreAccessFault(addr));
         }
         // Slow path: MMIO devices
         self.write32_slow(addr, val)
     }
 
     #[inline(always)]
-    fn write64(&mut self, addr: u64, val: u64) -> Result<(), Trap> {
+    fn write64(&self, addr: u64, val: u64) -> Result<(), Trap> {
         if addr % 8 != 0 {
             return Err(Trap::StoreAddressMisaligned(addr));
         }
         // Fast path: DRAM access (most common case)
         if let Some(off) = self.dram.offset(addr) {
-            if off + 8 > self.dram.data.len() {
-                return Err(Trap::StoreAccessFault(addr));
-            }
-            let bytes = val.to_le_bytes();
-            self.dram.data[off..off + 8].copy_from_slice(&bytes);
-            return Ok(());
+            return self.dram.store_64(off as u64, val).map_err(|_| Trap::StoreAccessFault(addr));
         }
         // Slow path: MMIO devices
         self.write64_slow(addr, val)

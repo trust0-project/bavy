@@ -44,7 +44,12 @@ web-sys = { version = "0.3", features = [
     "WritableStream",
     "ReadableStreamDefaultReader",
     "WritableStreamDefaultWriter",
-    "console"
+    "console",
+    "Window",
+    "Navigator",
+    "Worker"
 ] }
 js-sys = "0.3"
 wasm-bindgen-futures = "0.4"
+
+# Note: Release profile is defined at workspace root (Cargo.toml)

@@ -1,8 +1,20 @@
 #![no_std]
 #![no_main]
 
+// Override riscv-rt's _max_hart_id to allow multiple harts to boot
+// This MUST be defined before riscv-rt's startup code runs
+// Set to 127 to support up to 128 harts (matching MAX_HARTS)
+core::arch::global_asm!(
+    ".global _max_hart_id",
+    "_max_hart_id = 127"
+);
+
 mod allocator;
 mod dns;
+mod lock;
+
+// Re-export Spinlock for convenience
+pub use lock::Spinlock;
 mod fs;
 mod http;
 mod net;
@@ -15,13 +27,422 @@ mod virtio_net;
 
 extern crate alloc;
 use alloc::{format, string::String, vec::Vec};
+use core::arch::asm;
+use core::sync::atomic::{fence, AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use panic_halt as _;
 use riscv_rt::entry;
 
+/// Flag indicating primary boot is complete.
+/// Secondary harts spin on this before proceeding.
+static BOOT_READY: AtomicBool = AtomicBool::new(false);
+
+/// Counter of harts that have completed initialization.
+static HARTS_ONLINE: AtomicUsize = AtomicUsize::new(0);
+
+/// CLINT MSIP register base address.
+const CLINT_MSIP_BASE: usize = 0x0200_0000;
+
+/// CLINT hart count register (set by emulator, read by kernel)
+const CLINT_HART_COUNT: usize = 0x0200_0F00;
+
+/// Read the hart count from the CLINT register (set by emulator)
+fn get_expected_harts() -> usize {
+    let count = unsafe { core::ptr::read_volatile(CLINT_HART_COUNT as *const u32) } as usize;
+    // Clamp to valid range [1, MAX_HARTS]
+    if count == 0 { 1 } else { count.min(MAX_HARTS) }
+}
+
+/// Maximum number of harts supported.
+/// Set high enough to support modern multi-core systems.
+const MAX_HARTS: usize = 128;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BENCHMARK STATE (for multi-hart CPU testing)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Benchmark mode for parallel computation
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum BenchmarkMode {
+    Idle = 0,
+    PrimeCount = 1,
+}
+
+/// Shared benchmark state for coordinating work across harts
+struct BenchmarkState {
+    /// Current benchmark mode (0 = idle, 1 = prime counting)
+    mode: AtomicUsize,
+    /// Start of range for prime counting
+    range_start: AtomicU64,
+    /// End of range for prime counting  
+    range_end: AtomicU64,
+    /// Number of harts that should participate
+    num_harts: AtomicUsize,
+    /// Counter for harts that have completed their work
+    completed: AtomicUsize,
+    /// Results from each hart (prime counts)
+    results: [AtomicU64; MAX_HARTS],
+}
+
+impl BenchmarkState {
+    const fn new() -> Self {
+        const ZERO: AtomicU64 = AtomicU64::new(0);
+        Self {
+            mode: AtomicUsize::new(0),
+            range_start: AtomicU64::new(0),
+            range_end: AtomicU64::new(0),
+            num_harts: AtomicUsize::new(0),
+            completed: AtomicUsize::new(0),
+            results: [ZERO; MAX_HARTS],
+        }
+    }
+    
+    /// Start a new benchmark
+    fn start(&self, mode: BenchmarkMode, start: u64, end: u64, num_harts: usize) {
+        // Reset results
+        for i in 0..MAX_HARTS {
+            self.results[i].store(0, Ordering::Relaxed);
+        }
+        self.completed.store(0, Ordering::Relaxed);
+        self.range_start.store(start, Ordering::Relaxed);
+        self.range_end.store(end, Ordering::Relaxed);
+        self.num_harts.store(num_harts, Ordering::Relaxed);
+        fence(Ordering::SeqCst);
+        // Set mode last to signal start
+        self.mode.store(mode as usize, Ordering::Release);
+    }
+    
+    /// Clear benchmark (return to idle)
+    fn clear(&self) {
+        self.mode.store(BenchmarkMode::Idle as usize, Ordering::Release);
+    }
+    
+    /// Check if benchmark is active
+    fn is_active(&self) -> bool {
+        self.mode.load(Ordering::Acquire) != BenchmarkMode::Idle as usize
+    }
+    
+    /// Get work range for a specific hart
+    fn get_work_range(&self, hart_id: usize) -> (u64, u64) {
+        let start = self.range_start.load(Ordering::Relaxed);
+        let end = self.range_end.load(Ordering::Relaxed);
+        let num_harts = self.num_harts.load(Ordering::Relaxed);
+        
+        if num_harts == 0 || hart_id >= num_harts {
+            return (0, 0);
+        }
+        
+        let total_range = end - start;
+        let chunk_size = total_range / num_harts as u64;
+        
+        let my_start = start + (hart_id as u64 * chunk_size);
+        let my_end = if hart_id == num_harts - 1 {
+            end // Last hart takes remainder
+        } else {
+            my_start + chunk_size
+        };
+        
+        (my_start, my_end)
+    }
+    
+    /// Report result from a hart
+    fn report_result(&self, hart_id: usize, count: u64) {
+        if hart_id < MAX_HARTS {
+            self.results[hart_id].store(count, Ordering::Relaxed);
+        }
+        fence(Ordering::SeqCst);
+        self.completed.fetch_add(1, Ordering::SeqCst);
+    }
+    
+    /// Get total result from all harts
+    fn total_result(&self) -> u64 {
+        let mut total = 0u64;
+        let num_harts = self.num_harts.load(Ordering::Relaxed);
+        for i in 0..num_harts {
+            total += self.results[i].load(Ordering::Relaxed);
+        }
+        total
+    }
+    
+    /// Check if all harts have completed
+    fn all_completed(&self) -> bool {
+        let num_harts = self.num_harts.load(Ordering::Relaxed);
+        self.completed.load(Ordering::Acquire) >= num_harts
+    }
+}
+
+/// Global benchmark state
+static BENCHMARK: BenchmarkState = BenchmarkState::new();
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PRIME NUMBER FUNCTIONS (for CPU benchmarking)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Check if a number is prime using trial division
+/// Optimized with early exits and only checking up to sqrt(n)
+#[inline(never)] // Prevent inlining to ensure fair timing
+fn is_prime(n: u64) -> bool {
+    if n < 2 {
+        return false;
+    }
+    if n == 2 {
+        return true;
+    }
+    if n % 2 == 0 {
+        return false;
+    }
+    if n == 3 {
+        return true;
+    }
+    if n % 3 == 0 {
+        return false;
+    }
+    
+    // Check divisors of form 6k±1 up to sqrt(n)
+    let mut i = 5u64;
+    while i * i <= n {
+        if n % i == 0 || n % (i + 2) == 0 {
+            return false;
+        }
+        i += 6;
+    }
+    true
+}
+
+/// Count primes in a range [start, end)
+#[inline(never)]
+fn count_primes_in_range(start: u64, end: u64) -> u64 {
+    let mut count = 0u64;
+    for n in start..end {
+        if is_prime(n) {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Multi-processing hook called by riscv-rt before main().
+///
+/// - Hart 0: Returns true to continue to main()
+/// - Other harts: Enter parking loop, call secondary_hart_entry when woken
+/// 
+/// # Safety
+/// This is called very early in boot, before Rust runtime is fully initialized.
+/// Only use assembly and no allocations.
+#[export_name = "_mp_hook"]
+#[inline(never)]
+pub unsafe extern "C" fn mp_hook() -> bool {
+    let hart_id: usize;
+    asm!(
+        "csrr {}, mhartid",
+        out(reg) hart_id,
+        options(nomem, nostack, preserves_flags)
+    );
+
+    if hart_id == 0 {
+        // Primary hart: continue to main()
+        true
+    } else {
+        // Secondary harts: park and wait for IPI
+        secondary_hart_park(hart_id);
+        // Never returns, but we need to satisfy the return type
+        // This is unreachable
+    }
+}
+
+/// Secondary hart parking loop.
+///
+/// Waits for IPI, then transfers to secondary_hart_entry.
+/// 
+/// # Safety
+/// Called very early in boot, before Rust runtime is fully initialized.
+#[inline(never)]
+unsafe fn secondary_hart_park(hart_id: usize) -> ! {
+    // Wait for IPI to wake us
+    loop {
+        asm!("wfi", options(nomem, nostack));
+        
+        // Check if this was our wake-up call
+        if is_msip_pending(hart_id) {
+            // Clear the interrupt
+            clear_msip(hart_id);
+            break;
+        }
+        // Spurious wakeup - go back to sleep
+    }
+    
+    // Transfer to secondary entry point
+    secondary_hart_entry(hart_id);
+}
+
+/// Get the current hart ID from mhartid CSR.
+#[inline]
+fn get_hart_id() -> usize {
+    let id: usize;
+    unsafe {
+        asm!("csrr {}, mhartid", out(reg) id, options(nomem, nostack));
+    }
+    id
+}
+
+/// Entry point for secondary harts (called after waking from WFI).
+/// 
+/// This function is called after the secondary hart has:
+/// 1. Been woken by an IPI from the primary hart
+/// 2. Checked that BOOT_READY is true
+/// 
+/// # Arguments
+/// * `hart_id` - This hart's ID (1, 2, 3, ...)
+fn secondary_hart_entry(hart_id: usize) -> ! {
+    // Wait for primary boot to complete (double-check after WFI wake)
+    while !BOOT_READY.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    
+    // Memory fence ensures we see all init writes from primary hart
+    fence(Ordering::SeqCst);
+    
+    // Register this hart as online
+    HARTS_ONLINE.fetch_add(1, Ordering::SeqCst);
+    
+   
+    
+    // Enter the secondary hart idle loop
+    secondary_hart_idle(hart_id);
+}
+
+/// Secondary hart idle loop.
+/// 
+/// Secondary harts wait for work (IPI wakeup), then check for benchmark tasks.
+fn secondary_hart_idle(hart_id: usize) -> ! {
+    loop {
+        // Wait for work (IPI or timer)
+        unsafe {
+            core::arch::asm!("wfi", options(nomem, nostack));
+        }
+        
+        // Check if we were woken for a reason
+        if is_my_msip_pending() {
+            clear_my_msip();
+            
+            // Check if there's a benchmark to run
+            if BENCHMARK.is_active() {
+                let mode = BENCHMARK.mode.load(Ordering::Acquire);
+                if mode == BenchmarkMode::PrimeCount as usize {
+                    // Get our work range
+                    let (start, end) = BENCHMARK.get_work_range(hart_id);
+                    if start < end {
+                        // Count primes in our range
+                        let count = count_primes_in_range(start, end);
+                        // Report result
+                        BENCHMARK.report_result(hart_id, count);
+                    } else {
+                        // No work for this hart
+                        BENCHMARK.report_result(hart_id, 0);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Send an Inter-Processor Interrupt to the specified hart.
+///
+/// This triggers a `MachineSoftwareInterrupt` on the target hart,
+/// waking it from WFI if sleeping.
+///
+/// # Arguments
+/// * `hart_id` - The target hart ID (0-7)
+///
+/// # Safety
+/// This function writes to MMIO registers but is safe to call
+/// from any context.
+#[inline]
+pub fn send_ipi(hart_id: usize) {
+    if hart_id >= MAX_HARTS {
+        return; // Invalid hart ID, silently ignore
+    }
+
+    let msip_addr = CLINT_MSIP_BASE + (hart_id * 4);
+
+    // Write 1 to MSIP[hart_id] to trigger software interrupt
+    unsafe {
+        core::ptr::write_volatile(msip_addr as *mut u32, 1);
+    }
+
+    // Memory fence to ensure write is visible
+    fence(Ordering::SeqCst);
+}
+
+/// Send IPI to all harts except the caller.
+///
+/// Useful for broadcast notifications.
+#[allow(dead_code)]
+pub fn send_ipi_all_others() {
+    let my_hart = get_hart_id();
+    let expected_harts = get_expected_harts();
+    for hart in 0..expected_harts {
+        if hart != my_hart {
+            send_ipi(hart);
+        }
+    }
+}
+
+/// Clear the software interrupt for a hart.
+///
+/// Must be called by the target hart to acknowledge the IPI.
+/// Typically called in the software interrupt handler.
+#[inline]
+pub fn clear_msip(hart_id: usize) {
+    if hart_id >= MAX_HARTS {
+        return;
+    }
+    let msip_addr = CLINT_MSIP_BASE + (hart_id * 4);
+    unsafe {
+        core::ptr::write_volatile(msip_addr as *mut u32, 0);
+    }
+}
+
+/// Clear the software interrupt for the current hart.
+#[inline]
+#[allow(dead_code)]
+pub fn clear_my_msip() {
+    clear_msip(get_hart_id());
+}
+
+/// Check if software interrupt is pending for a hart.
+#[inline]
+#[allow(dead_code)]
+pub fn is_msip_pending(hart_id: usize) -> bool {
+    if hart_id >= MAX_HARTS {
+        return false;
+    }
+    let msip_addr = CLINT_MSIP_BASE + (hart_id * 4);
+    unsafe { core::ptr::read_volatile(msip_addr as *const u32) & 1 != 0 }
+}
+
+/// Check if software interrupt is pending for current hart.
+#[inline]
+#[allow(dead_code)]
+pub fn is_my_msip_pending() -> bool {
+    is_msip_pending(get_hart_id())
+}
+
 const CLINT_MTIME: usize = 0x0200_BFF8;
 const TEST_FINISHER: usize = 0x0010_0000;
-static mut NET_STATE: Option<net::NetState> = None;
-static mut FS_STATE: Option<fs::FileSystem> = None;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SPINLOCK-PROTECTED GLOBAL STATE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Network state, protected by spinlock.
+static NET_STATE: Spinlock<Option<net::NetState>> = Spinlock::new(None);
+
+/// Filesystem state, protected by spinlock.
+static FS_STATE: Spinlock<Option<fs::FileSystem>> = Spinlock::new(None);
+
+/// Block device, protected by spinlock.
+static BLK_DEV: Spinlock<Option<virtio_blk::VirtioBlock>> = Spinlock::new(None);
 
 /// State for continuous ping (like Linux ping command)
 struct PingState {
@@ -84,75 +505,107 @@ impl PingState {
     }
 }
 
-static mut BLK_DEV: Option<virtio_blk::VirtioBlock> = None;
-static mut PING_STATE: Option<PingState> = None;
-static mut COMMAND_RUNNING: bool = false;
+/// Ping state, protected by spinlock.
+static PING_STATE: Spinlock<Option<PingState>> = Spinlock::new(None);
+
+/// Command running flag, protected by spinlock.
+static COMMAND_RUNNING: Spinlock<bool> = Spinlock::new(false);
 
 // ─── CURRENT WORKING DIRECTORY ────────────────────────────────────────────────
 const CWD_MAX_LEN: usize = 128;
-static mut CWD: [u8; CWD_MAX_LEN] = [0u8; CWD_MAX_LEN];
-static mut CWD_LEN: usize = 1; // Start with "/" (root)
 
-/// Initialize CWD to root
-fn cwd_init() {
-    unsafe {
-        CWD[0] = b'/';
-        CWD_LEN = 1;
+/// Current working directory state
+struct CwdState {
+    path: [u8; CWD_MAX_LEN],
+    len: usize,
+}
+
+impl CwdState {
+    const fn new() -> Self {
+        let mut path = [0u8; CWD_MAX_LEN];
+        path[0] = b'/';
+        Self { path, len: 1 }
     }
 }
 
-/// Get current working directory as str
-fn cwd_get() -> &'static str {
-    unsafe {
-        core::str::from_utf8(&CWD[..CWD_LEN]).unwrap_or("/")
-    }
+/// Current working directory, protected by spinlock.
+static CWD_STATE: Spinlock<CwdState> = Spinlock::new(CwdState::new());
+
+/// Initialize CWD to root
+fn cwd_init() {
+    let mut cwd = CWD_STATE.lock();
+    cwd.path[0] = b'/';
+    cwd.len = 1;
+}
+
+/// Get current working directory as String
+pub fn cwd_get() -> alloc::string::String {
+    let cwd = CWD_STATE.lock();
+    core::str::from_utf8(&cwd.path[..cwd.len])
+        .unwrap_or("/")
+        .into()
 }
 
 /// Set current working directory
 fn cwd_set(path: &str) {
-    unsafe {
-        let bytes = path.as_bytes();
-        let len = core::cmp::min(bytes.len(), CWD_MAX_LEN);
-        CWD[..len].copy_from_slice(&bytes[..len]);
-        CWD_LEN = len;
-    }
+    let mut cwd = CWD_STATE.lock();
+    let bytes = path.as_bytes();
+    let len = core::cmp::min(bytes.len(), CWD_MAX_LEN);
+    cwd.path[..len].copy_from_slice(&bytes[..len]);
+    cwd.len = len;
 }
 
 // ─── OUTPUT CAPTURE FOR REDIRECTION ────────────────────────────────────────────
 const OUTPUT_BUFFER_SIZE: usize = 4096;
-static mut OUTPUT_BUFFER: [u8; OUTPUT_BUFFER_SIZE] = [0u8; OUTPUT_BUFFER_SIZE];
-static mut OUTPUT_LEN: usize = 0;
-static mut CAPTURE_MODE: bool = false;
 
-/// Start capturing output to the buffer
-fn output_capture_start() {
-    unsafe {
-        CAPTURE_MODE = true;
-        OUTPUT_LEN = 0;
+/// Output capture state for redirection
+struct OutputCapture {
+    buffer: [u8; OUTPUT_BUFFER_SIZE],
+    len: usize,
+    capturing: bool,
+}
+
+impl OutputCapture {
+    const fn new() -> Self {
+        Self {
+            buffer: [0u8; OUTPUT_BUFFER_SIZE],
+            len: 0,
+            capturing: false,
+        }
     }
 }
 
-/// Stop capturing and return the captured bytes
-fn output_capture_stop() -> &'static [u8] {
-    unsafe {
-        CAPTURE_MODE = false;
-        &OUTPUT_BUFFER[..OUTPUT_LEN]
-    }
+/// Output capture state, protected by spinlock.
+static OUTPUT_CAPTURE: Spinlock<OutputCapture> = Spinlock::new(OutputCapture::new());
+
+/// Start capturing output to the buffer
+fn output_capture_start() {
+    let mut cap = OUTPUT_CAPTURE.lock();
+    cap.capturing = true;
+    cap.len = 0;
+}
+
+/// Stop capturing and return the captured bytes as a Vec
+fn output_capture_stop() -> Vec<u8> {
+    let mut cap = OUTPUT_CAPTURE.lock();
+    cap.capturing = false;
+    Vec::from(&cap.buffer[..cap.len])
 }
 
 /// Write a string - respects capture mode
 fn out_str(s: &str) {
-    unsafe {
-        if CAPTURE_MODE {
-            for &b in s.as_bytes() {
-                if OUTPUT_LEN < OUTPUT_BUFFER_SIZE {
-                    OUTPUT_BUFFER[OUTPUT_LEN] = b;
-                    OUTPUT_LEN += 1;
-                }
+    let mut cap = OUTPUT_CAPTURE.lock();
+    if cap.capturing {
+        for &b in s.as_bytes() {
+            let idx = cap.len;
+            if idx < OUTPUT_BUFFER_SIZE {
+                cap.buffer[idx] = b;
+                cap.len += 1;
             }
-        } else {
-            uart::write_str(s);
         }
+    } else {
+        drop(cap); // Release lock before UART
+        uart::write_str(s);
     }
 }
 
@@ -164,82 +617,87 @@ fn out_line(s: &str) {
 
 /// Write bytes - respects capture mode
 fn out_bytes(bytes: &[u8]) {
-    unsafe {
-        if CAPTURE_MODE {
-            for &b in bytes {
-                if OUTPUT_LEN < OUTPUT_BUFFER_SIZE {
-                    OUTPUT_BUFFER[OUTPUT_LEN] = b;
-                    OUTPUT_LEN += 1;
-                }
+    let mut cap = OUTPUT_CAPTURE.lock();
+    if cap.capturing {
+        for &b in bytes {
+            let idx = cap.len;
+            if idx < OUTPUT_BUFFER_SIZE {
+                cap.buffer[idx] = b;
+                cap.len += 1;
             }
-        } else {
-            uart::write_bytes(bytes);
         }
+    } else {
+        drop(cap); // Release lock before UART
+        uart::write_bytes(bytes);
     }
 }
 
 /// Write u64 - respects capture mode
 fn out_u64(n: u64) {
-    unsafe {
-        if CAPTURE_MODE {
-            if n == 0 {
-                if OUTPUT_LEN < OUTPUT_BUFFER_SIZE {
-                    OUTPUT_BUFFER[OUTPUT_LEN] = b'0';
-                    OUTPUT_LEN += 1;
-                }
-                return;
+    let mut cap = OUTPUT_CAPTURE.lock();
+    if cap.capturing {
+        if n == 0 {
+            let idx = cap.len;
+            if idx < OUTPUT_BUFFER_SIZE {
+                cap.buffer[idx] = b'0';
+                cap.len += 1;
             }
-            let mut buf = [0u8; 20];
-            let mut i = 0;
-            let mut val = n;
-            while val > 0 && i < buf.len() {
-                buf[i] = b'0' + (val % 10) as u8;
-                val /= 10;
-                i += 1;
-            }
-            while i > 0 {
-                i -= 1;
-                if OUTPUT_LEN < OUTPUT_BUFFER_SIZE {
-                    OUTPUT_BUFFER[OUTPUT_LEN] = buf[i];
-                    OUTPUT_LEN += 1;
-                }
-            }
-        } else {
-            uart::write_u64(n);
+            return;
         }
+        let mut buf = [0u8; 20];
+        let mut i = 0;
+        let mut val = n;
+        while val > 0 && i < buf.len() {
+            buf[i] = b'0' + (val % 10) as u8;
+            val /= 10;
+            i += 1;
+        }
+        while i > 0 {
+            i -= 1;
+            let idx = cap.len;
+            if idx < OUTPUT_BUFFER_SIZE {
+                cap.buffer[idx] = buf[i];
+                cap.len += 1;
+            }
+        }
+    } else {
+        drop(cap); // Release lock before UART
+        uart::write_u64(n);
     }
 }
 
 /// Write hex - respects capture mode  
 fn out_hex(n: u64) {
-    unsafe {
-        if CAPTURE_MODE {
-            let hex_digits = b"0123456789abcdef";
-            if n == 0 {
-                if OUTPUT_LEN < OUTPUT_BUFFER_SIZE {
-                    OUTPUT_BUFFER[OUTPUT_LEN] = b'0';
-                    OUTPUT_LEN += 1;
-                }
-                return;
+    let mut cap = OUTPUT_CAPTURE.lock();
+    if cap.capturing {
+        let hex_digits = b"0123456789abcdef";
+        if n == 0 {
+            let idx = cap.len;
+            if idx < OUTPUT_BUFFER_SIZE {
+                cap.buffer[idx] = b'0';
+                cap.len += 1;
             }
-            let mut buf = [0u8; 16];
-            let mut i = 0;
-            let mut val = n;
-            while val > 0 && i < buf.len() {
-                buf[i] = hex_digits[(val & 0xf) as usize];
-                val >>= 4;
-                i += 1;
-            }
-            while i > 0 {
-                i -= 1;
-                if OUTPUT_LEN < OUTPUT_BUFFER_SIZE {
-                    OUTPUT_BUFFER[OUTPUT_LEN] = buf[i];
-                    OUTPUT_LEN += 1;
-                }
-            }
-        } else {
-            uart::write_hex(n);
+            return;
         }
+        let mut buf = [0u8; 16];
+        let mut i = 0;
+        let mut val = n;
+        while val > 0 && i < buf.len() {
+            buf[i] = hex_digits[(val & 0xf) as usize];
+            val >>= 4;
+            i += 1;
+        }
+        while i > 0 {
+            i -= 1;
+            let idx = cap.len;
+            if idx < OUTPUT_BUFFER_SIZE {
+                cap.buffer[idx] = buf[i];
+                cap.len += 1;
+            }
+        }
+    } else {
+        drop(cap); // Release lock before UART
+        uart::write_hex(n);
     }
 }
 
@@ -287,8 +745,19 @@ fn print_boot_info(key: &str, value: &str) {
 
 #[entry]
 fn main() -> ! {
+    // ═══════════════════════════════════════════════════════════════════
+    // VERIFY WE'RE THE PRIMARY HART
+    // ═══════════════════════════════════════════════════════════════════
+    
+    let hart_id = get_hart_id();
+    if hart_id != 0 {
+        // Should never happen if _mp_hook works correctly
+        loop { unsafe { asm!("wfi"); } }
+    }
+
     // ─── CPU & ARCHITECTURE INFO ──────────────────────────────────────────────
     print_section("CPU & ARCHITECTURE");
+    print_boot_info("Primary Hart", "0");
     print_boot_info("Architecture", "RISC-V 64-bit (RV64GC)");
     print_boot_info("Mode", "Machine Mode (M-Mode)");
     print_boot_info("Timer Source", "CLINT @ 0x02000000");
@@ -316,6 +785,55 @@ fn main() -> ! {
     // ─── NETWORK SUBSYSTEM ────────────────────────────────────────────────────
     print_section("NETWORK SUBSYSTEM");
     init_network();
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // SMP INITIALIZATION
+    // ═══════════════════════════════════════════════════════════════════
+    
+    print_section("SMP INITIALIZATION");
+    
+    // Read expected hart count from emulator (CLINT register)
+    let expected_harts = get_expected_harts();
+    print_boot_info("Expected harts", &format!("{}", expected_harts));
+    
+    // Memory fence ensures all init writes are visible to other harts
+    fence(Ordering::SeqCst);
+    
+    // Signal that boot is complete
+    BOOT_READY.store(true, Ordering::Release);
+    
+    // Register primary hart as online
+    HARTS_ONLINE.fetch_add(1, Ordering::SeqCst);
+    print_boot_info("Primary hart", "online");
+    
+    // Wake secondary harts via IPI
+    for hart in 1..expected_harts {
+        uart::write_str("    Sending IPI to hart ");
+        uart::write_u64(hart as u64);
+        uart::write_line("");
+        send_ipi(hart);
+    }
+    
+    // Wait for all harts to come online (with timeout)
+    let timeout = get_time_ms() + 1000; // 1 second timeout
+    while HARTS_ONLINE.load(Ordering::Acquire) < expected_harts {
+        if get_time_ms() > timeout {
+            uart::write_str("    \x1b[1;33m[!]\x1b[0m Warning: Only ");
+            uart::write_u64(HARTS_ONLINE.load(Ordering::Relaxed) as u64);
+            uart::write_str("/");
+            uart::write_u64(expected_harts as u64);
+            uart::write_line(" harts online after timeout");
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    
+    let online = HARTS_ONLINE.load(Ordering::Relaxed);
+    uart::write_str("    \x1b[1;32m[✓]\x1b[0m Harts online: ");
+    uart::write_u64(online as u64);
+    uart::write_str("/");
+    uart::write_u64(expected_harts as u64);
+    uart::write_line("");
     
     // ─── BOOT COMPLETE ────────────────────────────────────────────────────────
     print_section(&format!("\x1b[1;97mBAVY OS BOOT COMPLETE!\x1b[0m"));
@@ -550,8 +1068,10 @@ fn handle_tab_completion(buffer: &mut [u8], len: usize) -> usize {
         }
         
         // Also check /usr/bin/ for scripts
-        unsafe {
-            if let (Some(fs), Some(dev)) = (FS_STATE.as_ref(), BLK_DEV.as_mut()) {
+        {
+            let fs_guard = FS_STATE.lock();
+            let mut blk_guard = BLK_DEV.lock();
+            if let (Some(fs), Some(dev)) = (fs_guard.as_ref(), blk_guard.as_mut()) {
                 let files = fs.list_dir(dev, "/");
                 for f in files {
                     if f.name.starts_with("/usr/bin/") {
@@ -585,8 +1105,10 @@ fn handle_tab_completion(buffer: &mut [u8], len: usize) -> usize {
             ("/", path_to_complete.as_str())
         };
         
-        unsafe {
-            if let (Some(fs), Some(dev)) = (FS_STATE.as_ref(), BLK_DEV.as_mut()) {
+        {
+            let fs_guard = FS_STATE.lock();
+            let mut blk_guard = BLK_DEV.lock();
+            if let (Some(fs), Some(dev)) = (fs_guard.as_ref(), blk_guard.as_mut()) {
                 let files = fs.list_dir(dev, "/");
                 let mut seen_dirs: Vec<String> = Vec::new();
                 
@@ -763,15 +1285,17 @@ fn init_storage() {
         uart::write_str("    \x1b[0;90m├─\x1b[0m Block Device: \x1b[1;97m");
         uart::write_u64(blk.capacity() * 512 / 1024 / 1024);
         uart::write_line(" MiB\x1b[0m");
-        unsafe { BLK_DEV = Some(blk); }
+        *BLK_DEV.lock() = Some(blk);
         print_boot_status("VirtIO-Block driver loaded", true);
     } else {
         print_boot_status("No storage device found", false);
     }
-    if let Some(ref mut blk) = unsafe { BLK_DEV.as_mut() } {
+    
+    let mut blk_guard = BLK_DEV.lock();
+    if let Some(ref mut blk) = *blk_guard {
         if let Some(fs) = fs::FileSystem::init(blk) {
             uart::write_line("    \x1b[1;32m[✓]\x1b[0m SFS Mounted (R/W)");
-            unsafe { FS_STATE = Some(fs); }
+            *FS_STATE.lock() = Some(fs);
         }
     }
 }
@@ -779,13 +1303,13 @@ fn init_storage() {
 fn init_fs() {
     if let Some(blk) = virtio_blk::VirtioBlock::probe() {
         uart::write_line("    \x1b[1;32m[✓]\x1b[0m VirtIO Block found");
-        unsafe { 
-            BLK_DEV = Some(blk);
-            if let Some(ref mut dev) = BLK_DEV {
-                if let Some(fs) = fs::FileSystem::init(dev) {
-                    FS_STATE = Some(fs);
-                    uart::write_line("    \x1b[1;32m[✓]\x1b[0m FileSystem Mounted");
-                }
+        *BLK_DEV.lock() = Some(blk);
+        
+        let mut blk_guard = BLK_DEV.lock();
+        if let Some(ref mut dev) = *blk_guard {
+            if let Some(fs) = fs::FileSystem::init(dev) {
+                *FS_STATE.lock() = Some(fs);
+                uart::write_line("    \x1b[1;32m[✓]\x1b[0m FileSystem Mounted");
             }
         }
     }
@@ -805,9 +1329,10 @@ fn init_network() {
             match net::NetState::new(device) {
                 Ok(state) => {
                     // Store in static FIRST, then finalize
-                    unsafe { 
-                        NET_STATE = Some(state);
-                        if let Some(ref mut s) = NET_STATE {
+                    {
+                        let mut net_guard = NET_STATE.lock();
+                        *net_guard = Some(state);
+                        if let Some(ref mut s) = *net_guard {
                             s.finalize();
                             
                             // Print network configuration
@@ -856,59 +1381,64 @@ fn init_network() {
 
 /// Cancel any running command (called when Ctrl+C is pressed)
 fn cancel_running_command() -> bool {
-    unsafe {
-        if !COMMAND_RUNNING {
-            return false;
-        }
-        
-        // Check if ping is running
-        if let Some(ref ping) = PING_STATE {
-            if ping.continuous {
-                uart::write_line("^C");
-                print_ping_statistics();
-                PING_STATE = None;
-                COMMAND_RUNNING = false;
-                return true;
-            }
-        }
-        
-        // Generic command cancellation
-        COMMAND_RUNNING = false;
-        uart::write_line("^C");
-        true
+    let running = *COMMAND_RUNNING.lock();
+    if !running {
+        return false;
     }
+    
+    // Check if ping is running
+    let should_print_stats = {
+        let ping_guard = PING_STATE.lock();
+        if let Some(ref ping) = *ping_guard {
+            ping.continuous
+        } else {
+            false
+        }
+    };
+    
+    if should_print_stats {
+        uart::write_line("^C");
+        print_ping_statistics();
+        *PING_STATE.lock() = None;
+        *COMMAND_RUNNING.lock() = false;
+        return true;
+    }
+    
+    // Generic command cancellation
+    *COMMAND_RUNNING.lock() = false;
+    uart::write_line("^C");
+    true
 }
 
 /// Print ping statistics summary (like Linux ping)
 fn print_ping_statistics() {
-    unsafe {
-        if let Some(ref ping) = PING_STATE {
-            let mut ip_buf = [0u8; 16];
-            let ip_len = net::format_ipv4(ping.target, &mut ip_buf);
-            
-            uart::write_line("");
-            uart::write_str("--- ");
-            uart::write_bytes(&ip_buf[..ip_len]);
-            uart::write_line(" ping statistics ---");
-            
-            uart::write_u64(ping.packets_sent as u64);
-            uart::write_str(" packets transmitted, ");
-            uart::write_u64(ping.packets_received as u64);
-            uart::write_str(" received, ");
-            uart::write_u64(ping.packet_loss_percent() as u64);
-            uart::write_line("% packet loss");
-            
-            if ping.packets_received > 0 {
-                uart::write_str("rtt min/avg/max = ");
-                uart::write_u64(ping.min_rtt as u64);
-                uart::write_str("/");
-                uart::write_u64(ping.avg_rtt() as u64);
-                uart::write_str("/");
-                uart::write_u64(ping.max_rtt as u64);
-                uart::write_line(" ms");
-            }
-            uart::write_line("");
+    let ping_guard = PING_STATE.lock();
+    if let Some(ref ping) = *ping_guard {
+        let mut ip_buf = [0u8; 16];
+        let ip_len = net::format_ipv4(ping.target, &mut ip_buf);
+        
+        uart::write_line("");
+        uart::write_str("--- ");
+        uart::write_bytes(&ip_buf[..ip_len]);
+        uart::write_line(" ping statistics ---");
+        
+        uart::write_u64(ping.packets_sent as u64);
+        uart::write_str(" packets transmitted, ");
+        uart::write_u64(ping.packets_received as u64);
+        uart::write_str(" received, ");
+        uart::write_u64(ping.packet_loss_percent() as u64);
+        uart::write_line("% packet loss");
+        
+        if ping.packets_received > 0 {
+            uart::write_str("rtt min/avg/max = ");
+            uart::write_u64(ping.min_rtt as u64);
+            uart::write_str("/");
+            uart::write_u64(ping.avg_rtt() as u64);
+            uart::write_str("/");
+            uart::write_u64(ping.max_rtt as u64);
+            uart::write_line(" ms");
         }
+        uart::write_line("");
     }
 }
 
@@ -916,57 +1446,78 @@ fn print_ping_statistics() {
 fn poll_network() {
     let timestamp = get_time_ms();
     
-    unsafe {
-        if let Some(ref mut state) = NET_STATE {
+    // First, poll the network state
+    {
+        let mut net_guard = NET_STATE.lock();
+        if let Some(ref mut state) = *net_guard {
             state.poll(timestamp);
-            
-            // Handle continuous ping
-            if let Some(ref mut ping) = PING_STATE {
-                // Check for ping reply
-                if ping.waiting {
-                    if let Some((from, _ident, seq)) = state.check_ping_reply() {
-                        if seq == ping.seq {
-                            let rtt = timestamp - ping.sent_time;
-                            ping.record_reply(rtt);
-                            
-                            let mut ip_buf = [0u8; 16];
-                            let ip_len = net::format_ipv4(from, &mut ip_buf);
-                            uart::write_str("64 bytes from ");
-                            uart::write_bytes(&ip_buf[..ip_len]);
-                            uart::write_str(": icmp_seq=");
-                            uart::write_u64(seq as u64);
-                            uart::write_str(" time=");
-                            uart::write_u64(rtt as u64);
-                            uart::write_line(" ms");
-                            ping.waiting = false;
-                        }
-                    }
-                    
-                    // Timeout after 5 seconds for current ping
-                    if timestamp - ping.sent_time > 5000 {
-                        uart::write_str("Request timeout for icmp_seq ");
-                        uart::write_u64(ping.seq as u64);
-                        uart::write_line("");
-                        ping.waiting = false;
-                    }
+        }
+    }
+    
+    // Then handle ping state separately to avoid holding both locks
+    let mut ping_guard = PING_STATE.lock();
+    if let Some(ref mut ping) = *ping_guard {
+        // Check for ping reply
+        if ping.waiting {
+            let reply = {
+                let mut net_guard = NET_STATE.lock();
+                if let Some(ref mut state) = *net_guard {
+                    state.check_ping_reply()
+                } else {
+                    None
                 }
+            };
+            
+            if let Some((from, _ident, seq)) = reply {
+                if seq == ping.seq {
+                    let rtt = timestamp - ping.sent_time;
+                    ping.record_reply(rtt);
+                    
+                    let mut ip_buf = [0u8; 16];
+                    let ip_len = net::format_ipv4(from, &mut ip_buf);
+                    uart::write_str("64 bytes from ");
+                    uart::write_bytes(&ip_buf[..ip_len]);
+                    uart::write_str(": icmp_seq=");
+                    uart::write_u64(seq as u64);
+                    uart::write_str(" time=");
+                    uart::write_u64(rtt as u64);
+                    uart::write_line(" ms");
+                    ping.waiting = false;
+                }
+            }
+            
+            // Timeout after 5 seconds for current ping
+            if timestamp - ping.sent_time > 5000 {
+                uart::write_str("Request timeout for icmp_seq ");
+                uart::write_u64(ping.seq as u64);
+                uart::write_line("");
+                ping.waiting = false;
+            }
+        }
+        
+        // In continuous mode, send next ping after 1 second interval
+        if ping.continuous && !ping.waiting {
+            if timestamp - ping.last_send_time >= 1000 {
+                ping.seq = ping.seq.wrapping_add(1);
+                ping.sent_time = timestamp;
+                ping.last_send_time = timestamp;
+                ping.packets_sent += 1;
                 
-                // In continuous mode, send next ping after 1 second interval
-                if ping.continuous && !ping.waiting {
-                    if timestamp - ping.last_send_time >= 1000 {
-                        ping.seq = ping.seq.wrapping_add(1);
-                        ping.sent_time = timestamp;
-                        ping.last_send_time = timestamp;
-                        ping.packets_sent += 1;
-                        
-                        match state.send_ping(ping.target, ping.seq, timestamp) {
-                            Ok(()) => {
-                                ping.waiting = true;
-                            }
-                            Err(_e) => {
-                                // Failed to send, will retry next interval
-                            }
-                        }
+                let send_result = {
+                    let mut net_guard = NET_STATE.lock();
+                    if let Some(ref mut state) = *net_guard {
+                        state.send_ping(ping.target, ping.seq, timestamp)
+                    } else {
+                        Err("Network not available")
+                    }
+                };
+                
+                match send_result {
+                    Ok(()) => {
+                        ping.waiting = true;
+                    }
+                    Err(_e) => {
+                        // Failed to send, will retry next interval
                     }
                 }
             }
@@ -1083,37 +1634,37 @@ fn handle_line(buffer: &[u8], len: usize, _count: &mut usize) {
             // Resolve path relative to CWD
             let resolved_path = resolve_path(filename);
             
-            unsafe {
-                if let (Some(fs), Some(dev)) = (FS_STATE.as_mut(), BLK_DEV.as_mut()) {
-                    let final_data = if redirect_mode == RedirectMode::Append {
-                        // Read existing file content and append
-                        let mut combined = match fs.read_file(dev, &resolved_path) {
-                            Some(existing) => existing,
-                            None => Vec::new(),
-                        };
-                        combined.extend_from_slice(output);
-                        combined
-                    } else {
-                        // Overwrite mode - just use new output
-                        Vec::from(output)
+            let mut fs_guard = FS_STATE.lock();
+            let mut blk_guard = BLK_DEV.lock();
+            if let (Some(fs), Some(dev)) = (fs_guard.as_mut(), blk_guard.as_mut()) {
+                let final_data = if redirect_mode == RedirectMode::Append {
+                    // Read existing file content and append
+                    let mut combined = match fs.read_file(dev, &resolved_path) {
+                        Some(existing) => existing,
+                        None => Vec::new(),
                     };
-                    
-                    match fs.write_file(dev, &resolved_path, &final_data) {
-                        Ok(()) => {
-                            uart::write_line("");
-                            uart::write_str("\x1b[1;32m✓\x1b[0m Output written to ");
-                            uart::write_line(&resolved_path);
-                        }
-                        Err(e) => {
-                            uart::write_line("");
-                            uart::write_str("\x1b[1;31mError:\x1b[0m Failed to write to file: ");
-                            uart::write_line(e);
-                        }
-                    }
+                    combined.extend_from_slice(&output);
+                    combined
                 } else {
-                    uart::write_line("");
-                    uart::write_line("\x1b[1;31mError:\x1b[0m Filesystem not available");
+                    // Overwrite mode - just use new output
+                    output
+                };
+                
+                match fs.write_file(dev, &resolved_path, &final_data) {
+                    Ok(()) => {
+                        uart::write_line("");
+                        uart::write_str("\x1b[1;32m✓\x1b[0m Output written to ");
+                        uart::write_line(&resolved_path);
+                    }
+                    Err(e) => {
+                        uart::write_line("");
+                        uart::write_str("\x1b[1;31mError:\x1b[0m Failed to write to file: ");
+                        uart::write_line(e);
+                    }
                 }
+            } else {
+                uart::write_line("");
+                uart::write_line("\x1b[1;31mError:\x1b[0m Filesystem not available");
             }
         } else {
             uart::write_line("");
@@ -1143,7 +1694,7 @@ fn execute_command(cmd: &[u8], args: &[u8]) {
         
         // Directory navigation - requires shell state
         "cd" => { cmd_cd(args_str); return; }
-        "pwd" => { out_line(cwd_get()); return; }
+        "pwd" => { out_line(&cwd_get()); return; }
         
         // Scripting engine control
         "node" => { cmd_node(args); return; }
@@ -1156,6 +1707,9 @@ fn execute_command(cmd: &[u8], args: &[u8]) {
         "readsec" => { cmd_readsec(args); return; }
         "alloc" => { cmd_alloc(args); return; }
         "memtest" => { cmd_memtest(args); return; }
+        
+        // CPU benchmark
+        "cpuTest" | "cputest" => { cmd_cputest(args); return; }
         
         // Help - try script first, fall back to built-in
         "help" => {
@@ -1269,33 +1823,39 @@ fn cmd_node(args: &[u8]) {
             resolve_path(script_name)
         };
         
-        unsafe {
-            if let (Some(fs), Some(dev)) = (crate::FS_STATE.as_ref(), crate::BLK_DEV.as_mut()) {
-                match fs.read_file(dev, &resolved_path) {
-                    Some(script_bytes) => {
-                        if let Ok(script) = core::str::from_utf8(&script_bytes) {
-                            match scripting::execute_script(script, script_args) {
-                                Ok(output) => {
-                                    if !output.is_empty() {
-                                        out_str(&output);
-                                    }
-                                }
-                                Err(e) => {
-                                    out_str("\x1b[1;31mScript error:\x1b[0m ");
-                                    out_line(&e);
-                                }
-                            }
-                        } else {
-                            out_line("\x1b[1;31mError:\x1b[0m Invalid UTF-8 in script file");
-                        }
-                    }
-                    None => {
-                        out_str("\x1b[1;31mError:\x1b[0m Script not found: ");
-                        out_line(&resolved_path);
-                    }
-                }
+        // Read script content with lock held, then execute without lock
+        let script_result = {
+            let fs_guard = FS_STATE.lock();
+            let mut blk_guard = BLK_DEV.lock();
+            if let (Some(fs), Some(dev)) = (fs_guard.as_ref(), blk_guard.as_mut()) {
+                fs.read_file(dev, &resolved_path)
             } else {
                 out_line("\x1b[1;31mError:\x1b[0m Filesystem not available");
+                return;
+            }
+        };
+        
+        match script_result {
+            Some(script_bytes) => {
+                if let Ok(script) = core::str::from_utf8(&script_bytes) {
+                    match scripting::execute_script(script, script_args) {
+                        Ok(output) => {
+                            if !output.is_empty() {
+                                out_str(&output);
+                            }
+                        }
+                        Err(e) => {
+                            out_str("\x1b[1;31mScript error:\x1b[0m ");
+                            out_line(&e);
+                        }
+                    }
+                } else {
+                    out_line("\x1b[1;31mError:\x1b[0m Invalid UTF-8 in script file");
+                }
+            }
+            None => {
+                out_str("\x1b[1;31mError:\x1b[0m Script not found: ");
+                out_line(&resolved_path);
             }
         }
     }
@@ -1352,22 +1912,21 @@ fn cmd_alloc(args: &[u8]) {
 
 fn cmd_readsec(args: &[u8]) {
     let sector = parse_usize(args) as u64;
-    unsafe {
-        if let Some(ref mut blk) = BLK_DEV {
-            let mut buf = [0u8; 512];
-            if blk.read_sector(sector, &mut buf).is_ok() {
-                uart::write_line("Sector contents (first 64 bytes):");
-                for i in 0..64 {
-                   uart::write_hex_byte(buf[i]);
-                   if (i+1) % 16 == 0 { uart::write_line(""); }
-                   else { uart::write_str(" "); }
-                }
-            } else {
-                uart::write_line("Read failed.");
+    let mut blk_guard = BLK_DEV.lock();
+    if let Some(ref mut blk) = *blk_guard {
+        let mut buf = [0u8; 512];
+        if blk.read_sector(sector, &mut buf).is_ok() {
+            uart::write_line("Sector contents (first 64 bytes):");
+            for i in 0..64 {
+               uart::write_hex_byte(buf[i]);
+               if (i+1) % 16 == 0 { uart::write_line(""); }
+               else { uart::write_str(" "); }
             }
         } else {
-            uart::write_line("No block device.");
+            uart::write_line("Read failed.");
         }
+    } else {
+        uart::write_line("No block device.");
     }
 }
 
@@ -1443,6 +2002,191 @@ fn cmd_memtest(args: &[u8]) {
     }
 }
 
+/// CPU benchmark command - compares serial vs parallel prime counting
+fn cmd_cputest(args: &[u8]) {
+    // Parse the upper limit from args, default to 100000
+    let limit = {
+        let n = parse_usize(args);
+        if n == 0 { 100_000 } else { n }
+    };
+    
+    let num_harts = HARTS_ONLINE.load(Ordering::Relaxed);
+    
+    uart::write_line("");
+    uart::write_line("\x1b[1;36m╔═══════════════════════════════════════════════════════════════════════╗\x1b[0m");
+    uart::write_line("\x1b[1;36m║\x1b[0m                      \x1b[1;97mCPU BENCHMARK - Prime Counting\x1b[0m                  \x1b[1;36m║\x1b[0m");
+    uart::write_line("\x1b[1;36m╚═══════════════════════════════════════════════════════════════════════╝\x1b[0m");
+    uart::write_line("");
+    
+    uart::write_str("  \x1b[1;33mConfiguration:\x1b[0m");
+    uart::write_line("");
+    uart::write_str("    Range: 2 to ");
+    uart::write_u64(limit as u64);
+    uart::write_line("");
+    uart::write_str("    Harts online: ");
+    uart::write_u64(num_harts as u64);
+    uart::write_line("");
+    uart::write_line("");
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // SERIAL BENCHMARK (single hart)
+    // ═══════════════════════════════════════════════════════════════════
+    
+    uart::write_line("  \x1b[1;33m[1/2] Serial Execution\x1b[0m (single hart)");
+    uart::write_str("        Computing primes...");
+    
+    let serial_start = get_time_ms();
+    let serial_count = count_primes_in_range(2, limit as u64);
+    let serial_end = get_time_ms();
+    let serial_time = serial_end - serial_start;
+    
+    uart::write_line(" done!");
+    uart::write_str("        Result: \x1b[1;97m");
+    uart::write_u64(serial_count);
+    uart::write_str("\x1b[0m primes found in \x1b[1;97m");
+    uart::write_u64(serial_time as u64);
+    uart::write_line("\x1b[0m ms");
+    uart::write_line("");
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // PARALLEL BENCHMARK (multiple harts)
+    // ═══════════════════════════════════════════════════════════════════
+    
+    if num_harts > 1 {
+        uart::write_str("  \x1b[1;33m[2/2] Parallel Execution\x1b[0m (");
+        uart::write_u64(num_harts as u64);
+        uart::write_line(" harts)");
+        uart::write_str("        Computing primes...");
+        
+        let parallel_start = get_time_ms();
+        
+        // Start benchmark on secondary harts
+        BENCHMARK.start(BenchmarkMode::PrimeCount, 2, limit as u64, num_harts);
+        
+        // Wake up secondary harts via IPI
+        for hart in 1..num_harts {
+            send_ipi(hart);
+        }
+        
+        // Primary hart (0) does its share of work
+        let (my_start, my_end) = BENCHMARK.get_work_range(0);
+        let my_count = count_primes_in_range(my_start, my_end);
+        BENCHMARK.report_result(0, my_count);
+        
+        // Wait for all harts to complete (with timeout)
+        let timeout = get_time_ms() + 60000; // 60 second timeout
+        while !BENCHMARK.all_completed() {
+            if get_time_ms() > timeout {
+                uart::write_line(" TIMEOUT!");
+                uart::write_line("        \x1b[1;31mError:\x1b[0m Some harts did not complete in time");
+                BENCHMARK.clear();
+                return;
+            }
+            core::hint::spin_loop();
+        }
+        
+        let parallel_end = get_time_ms();
+        let parallel_time = parallel_end - parallel_start;
+        let parallel_count = BENCHMARK.total_result();
+        
+        // Clear benchmark state
+        BENCHMARK.clear();
+        
+        uart::write_line(" done!");
+        uart::write_str("        Result: \x1b[1;97m");
+        uart::write_u64(parallel_count);
+        uart::write_str("\x1b[0m primes found in \x1b[1;97m");
+        uart::write_u64(parallel_time as u64);
+        uart::write_line("\x1b[0m ms");
+        
+        // Show work distribution
+        uart::write_line("");
+        uart::write_line("        \x1b[0;90mWork distribution:\x1b[0m");
+        let chunk = (limit as u64 - 2) / num_harts as u64;
+        for hart in 0..num_harts {
+            let h_start = 2 + hart as u64 * chunk;
+            let h_end = if hart == num_harts - 1 { limit as u64 } else { h_start + chunk };
+            uart::write_str("          Hart ");
+            uart::write_u64(hart as u64);
+            uart::write_str(": [");
+            uart::write_u64(h_start);
+            uart::write_str(", ");
+            uart::write_u64(h_end);
+            uart::write_line(")");
+        }
+        uart::write_line("");
+        
+        // ═══════════════════════════════════════════════════════════════
+        // RESULTS COMPARISON
+        // ═══════════════════════════════════════════════════════════════
+        
+        uart::write_line("\x1b[1;36m────────────────────────────────────────────────────────────────────────\x1b[0m");
+        uart::write_line("  \x1b[1;33mResults Summary:\x1b[0m");
+        uart::write_line("");
+        
+        // Verify results match
+        if serial_count == parallel_count {
+            uart::write_line("    \x1b[1;32m✓\x1b[0m Results match (verified correctness)");
+        } else {
+            uart::write_line("    \x1b[1;31m✗\x1b[0m Results MISMATCH (bug detected!)");
+            uart::write_str("      Serial: ");
+            uart::write_u64(serial_count);
+            uart::write_str(", Parallel: ");
+            uart::write_u64(parallel_count);
+            uart::write_line("");
+        }
+        uart::write_line("");
+        
+        // Calculate speedup
+        if parallel_time > 0 {
+            let speedup_x10 = (serial_time * 10) / parallel_time;
+            let speedup_whole = speedup_x10 / 10;
+            let speedup_frac = speedup_x10 % 10;
+            
+            uart::write_str("    Serial time:   \x1b[1;97m");
+            uart::write_u64(serial_time as u64);
+            uart::write_line(" ms\x1b[0m");
+            uart::write_str("    Parallel time: \x1b[1;97m");
+            uart::write_u64(parallel_time as u64);
+            uart::write_line(" ms\x1b[0m");
+            uart::write_str("    Speedup:       \x1b[1;32m");
+            uart::write_u64(speedup_whole as u64);
+            uart::write_str(".");
+            uart::write_u64(speedup_frac as u64);
+            uart::write_str("x\x1b[0m (with ");
+            uart::write_u64(num_harts as u64);
+            uart::write_line(" harts)");
+            
+            // Efficiency
+            let efficiency = (speedup_x10 * 100) / (num_harts as i64 * 10);
+            uart::write_str("    Efficiency:    \x1b[1;97m");
+            uart::write_u64(efficiency as u64);
+            uart::write_line("%\x1b[0m (speedup / num_harts × 100)");
+        }
+        uart::write_line("");
+        
+    } else {
+        uart::write_line("  \x1b[1;33m[2/2] Parallel Execution\x1b[0m");
+        uart::write_line("        \x1b[0;90mSkipped - only 1 hart online\x1b[0m");
+        uart::write_line("");
+        uart::write_line("\x1b[1;36m────────────────────────────────────────────────────────────────────────\x1b[0m");
+        uart::write_line("  \x1b[1;33mResults Summary:\x1b[0m");
+        uart::write_line("");
+        uart::write_str("    Serial time: \x1b[1;97m");
+        uart::write_u64(serial_time as u64);
+        uart::write_line(" ms\x1b[0m");
+        uart::write_str("    Primes found: \x1b[1;97m");
+        uart::write_u64(serial_count);
+        uart::write_line("\x1b[0m");
+        uart::write_line("");
+        uart::write_line("    \x1b[0;90mNote: Enable more harts to see parallel comparison\x1b[0m");
+        uart::write_line("");
+    }
+    
+    uart::write_line("\x1b[1;36m════════════════════════════════════════════════════════════════════════\x1b[0m");
+    uart::write_line("");
+}
+
 // Legacy cmd_memstats and cmd_ip removed - now implemented as user-space scripts
 // See mkfs/root/usr/bin/memstats and mkfs/root/usr/bin/ip
 
@@ -1472,63 +2216,70 @@ fn cmd_ping(args: &[u8]) {
             uart::write_bytes(trimmed_args);
             uart::write_line("...");
             
-            unsafe {
-                if let Some(ref mut state) = NET_STATE {
-                    match dns::resolve(state, trimmed_args, net::DNS_SERVER, 5000, get_time_ms) {
-                        Some(resolved_ip) => {
-                            let mut ip_buf = [0u8; 16];
-                            let ip_len = net::format_ipv4(resolved_ip, &mut ip_buf);
-                            uart::write_str("\x1b[1;32m[DNS]\x1b[0m Resolved to \x1b[1;97m");
-                            uart::write_bytes(&ip_buf[..ip_len]);
-                            uart::write_line("\x1b[0m");
-                            resolved_ip
-                        }
-                        None => {
-                            uart::write_str("\x1b[1;31m[DNS]\x1b[0m Failed to resolve: ");
-                            uart::write_bytes(trimmed_args);
-                            uart::write_line("");
-                            return;
-                        }
-                    }
+            let resolve_result = {
+                let mut net_guard = NET_STATE.lock();
+                if let Some(ref mut state) = *net_guard {
+                    dns::resolve(state, trimmed_args, net::DNS_SERVER, 5000, get_time_ms)
                 } else {
                     uart::write_line("\x1b[1;31m✗\x1b[0m Network not initialized");
+                    return;
+                }
+            };
+            
+            match resolve_result {
+                Some(resolved_ip) => {
+                    let mut ip_buf = [0u8; 16];
+                    let ip_len = net::format_ipv4(resolved_ip, &mut ip_buf);
+                    uart::write_str("\x1b[1;32m[DNS]\x1b[0m Resolved to \x1b[1;97m");
+                    uart::write_bytes(&ip_buf[..ip_len]);
+                    uart::write_line("\x1b[0m");
+                    resolved_ip
+                }
+                None => {
+                    uart::write_str("\x1b[1;31m[DNS]\x1b[0m Failed to resolve: ");
+                    uart::write_bytes(trimmed_args);
+                    uart::write_line("");
                     return;
                 }
             }
         }
     };
     
-    unsafe {
-        if let Some(ref mut state) = NET_STATE {
-            let timestamp = get_time_ms();
-            
-            let mut ip_buf = [0u8; 16];
-            let ip_len = net::format_ipv4(target, &mut ip_buf);
-            uart::write_str("PING ");
-            uart::write_bytes(&ip_buf[..ip_len]);
-            uart::write_line(" 56(84) bytes of data.");
-            
-            // Set up continuous ping state
-            let mut ping_state = PingState::new(target, timestamp);
-            ping_state.seq = 1;
-            ping_state.sent_time = timestamp;
-            ping_state.last_send_time = timestamp;
-            ping_state.packets_sent = 1;
-            ping_state.waiting = true;
-            
-            // Send the first ICMP echo request immediately
-            match state.send_ping(target, ping_state.seq, timestamp) {
-                Ok(()) => {
-                    PING_STATE = Some(ping_state);
-                    COMMAND_RUNNING = true;
-                }
-                Err(e) => {
-                    uart::write_str("ping: ");
-                    uart::write_line(e);
-                }
-            }
+    let timestamp = get_time_ms();
+    
+    let mut ip_buf = [0u8; 16];
+    let ip_len = net::format_ipv4(target, &mut ip_buf);
+    uart::write_str("PING ");
+    uart::write_bytes(&ip_buf[..ip_len]);
+    uart::write_line(" 56(84) bytes of data.");
+    
+    // Set up continuous ping state
+    let mut ping_state = PingState::new(target, timestamp);
+    ping_state.seq = 1;
+    ping_state.sent_time = timestamp;
+    ping_state.last_send_time = timestamp;
+    ping_state.packets_sent = 1;
+    ping_state.waiting = true;
+    
+    // Send the first ICMP echo request immediately
+    let send_result = {
+        let mut net_guard = NET_STATE.lock();
+        if let Some(ref mut state) = *net_guard {
+            state.send_ping(target, ping_state.seq, timestamp)
         } else {
             uart::write_line("\x1b[1;31m✗\x1b[0m Network not initialized");
+            return;
+        }
+    };
+    
+    match send_result {
+        Ok(()) => {
+            *PING_STATE.lock() = Some(ping_state);
+            *COMMAND_RUNNING.lock() = true;
+        }
+        Err(e) => {
+            uart::write_str("ping: ");
+            uart::write_line(e);
         }
     }
 }
@@ -1547,44 +2298,48 @@ fn cmd_nslookup(args: &[u8]) {
     }
     let hostname = &args[..hostname_len];
     
-    unsafe {
-        if let Some(ref mut state) = NET_STATE {
-            uart::write_line("");
-            uart::write_str("\x1b[1;33mServer:\x1b[0m  ");
-            let mut ip_buf = [0u8; 16];
-            let dns_len = net::format_ipv4(net::DNS_SERVER, &mut ip_buf);
-            uart::write_bytes(&ip_buf[..dns_len]);
-            uart::write_line("");
-            uart::write_line("\x1b[1;33mPort:\x1b[0m    53");
-            uart::write_line("");
-            
-            uart::write_str("\x1b[0;90mQuerying ");
-            uart::write_bytes(hostname);
-            uart::write_line("...\x1b[0m");
-            
-            // Perform DNS lookup with 5 second timeout
-            match dns::resolve(state, hostname, net::DNS_SERVER, 5000, get_time_ms) {
-                Some(addr) => {
-                    uart::write_line("");
-                    uart::write_str("\x1b[1;32mName:\x1b[0m    ");
-                    uart::write_bytes(hostname);
-                    uart::write_line("");
-                    let addr_len = net::format_ipv4(addr, &mut ip_buf);
-                    uart::write_str("\x1b[1;32mAddress:\x1b[0m \x1b[1;97m");
-                    uart::write_bytes(&ip_buf[..addr_len]);
-                    uart::write_line("\x1b[0m");
-                    uart::write_line("");
-                }
-                None => {
-                    uart::write_line("");
-                    uart::write_str("\x1b[1;31m*** Can't find ");
-                    uart::write_bytes(hostname);
-                    uart::write_line(": No response from server\x1b[0m");
-                    uart::write_line("");
-                }
-            }
+    uart::write_line("");
+    uart::write_str("\x1b[1;33mServer:\x1b[0m  ");
+    let mut ip_buf = [0u8; 16];
+    let dns_len = net::format_ipv4(net::DNS_SERVER, &mut ip_buf);
+    uart::write_bytes(&ip_buf[..dns_len]);
+    uart::write_line("");
+    uart::write_line("\x1b[1;33mPort:\x1b[0m    53");
+    uart::write_line("");
+    
+    uart::write_str("\x1b[0;90mQuerying ");
+    uart::write_bytes(hostname);
+    uart::write_line("...\x1b[0m");
+    
+    // Perform DNS lookup with 5 second timeout
+    let resolve_result = {
+        let mut net_guard = NET_STATE.lock();
+        if let Some(ref mut state) = *net_guard {
+            dns::resolve(state, hostname, net::DNS_SERVER, 5000, get_time_ms)
         } else {
             uart::write_line("\x1b[1;31m✗\x1b[0m Network not initialized");
+            return;
+        }
+    };
+    
+    match resolve_result {
+        Some(addr) => {
+            uart::write_line("");
+            uart::write_str("\x1b[1;32mName:\x1b[0m    ");
+            uart::write_bytes(hostname);
+            uart::write_line("");
+            let addr_len = net::format_ipv4(addr, &mut ip_buf);
+            uart::write_str("\x1b[1;32mAddress:\x1b[0m \x1b[1;97m");
+            uart::write_bytes(&ip_buf[..addr_len]);
+            uart::write_line("\x1b[0m");
+            uart::write_line("");
+        }
+        None => {
+            uart::write_line("");
+            uart::write_str("\x1b[1;31m*** Can't find ");
+            uart::write_bytes(hostname);
+            uart::write_line(": No response from server\x1b[0m");
+            uart::write_line("");
         }
     }
 }
@@ -1623,17 +2378,18 @@ fn cmd_cd(args: &str) {
 }
 
 /// Resolve a path relative to CWD
-fn resolve_path(path: &str) -> alloc::string::String {
+pub fn resolve_path(path: &str) -> alloc::string::String {
     use alloc::string::String;
     use alloc::vec::Vec;
     
     let mut result = String::new();
     
     // Start from root or CWD
-    let base = if path.starts_with('/') {
+    let cwd = cwd_get();
+    let base: &str = if path.starts_with('/') {
         "/"
     } else {
-        cwd_get()
+        &cwd
     };
     
     // Combine base and path, then normalize
@@ -1676,31 +2432,31 @@ fn resolve_path(path: &str) -> alloc::string::String {
 
 /// Check if a path exists (has files under it or is a file)
 fn path_exists(path: &str) -> bool {
-    unsafe {
-        if let (Some(fs), Some(dev)) = (FS_STATE.as_ref(), BLK_DEV.as_mut()) {
-            // Root always exists
-            if path == "/" {
+    let fs_guard = FS_STATE.lock();
+    let mut blk_guard = BLK_DEV.lock();
+    if let (Some(fs), Some(dev)) = (fs_guard.as_ref(), blk_guard.as_mut()) {
+        // Root always exists
+        if path == "/" {
+            return true;
+        }
+        
+        let files = fs.list_dir(dev, "/");
+        let path_with_slash = if path.ends_with('/') {
+            alloc::string::String::from(path)
+        } else {
+            let mut s = alloc::string::String::from(path);
+            s.push('/');
+            s
+        };
+        
+        for file in files {
+            // Check if any file starts with this path (it's a directory)
+            if file.name.starts_with(&path_with_slash) {
                 return true;
             }
-            
-            let files = fs.list_dir(dev, "/");
-            let path_with_slash = if path.ends_with('/') {
-                alloc::string::String::from(path)
-            } else {
-                let mut s = alloc::string::String::from(path);
-                s.push('/');
-                s
-            };
-            
-            for file in files {
-                // Check if any file starts with this path (it's a directory)
-                if file.name.starts_with(&path_with_slash) {
-                    return true;
-                }
-                // Or if it exactly matches (it's a file)
-                if file.name == path {
-                    return true;
-                }
+            // Or if it exactly matches (it's a file)
+            if file.name == path {
+                return true;
             }
         }
     }

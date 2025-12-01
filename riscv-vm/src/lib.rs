@@ -15,6 +15,8 @@ pub mod emulator;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod console;
 
+#[cfg(target_arch = "wasm32")]
+pub mod worker;
 
 use serde::{Deserialize, Serialize};
 
@@ -36,12 +38,37 @@ pub enum NetworkStatus {
     Error = 3,
 }
 
+// ============================================================================
+// Hart Count Detection
+// ============================================================================
+
+/// Detect the number of hardware threads available.
+/// Limits to half the available CPU cores to leave resources for the host.
+#[cfg(target_arch = "wasm32")]
+fn detect_hart_count() -> usize {
+    // In browsers, navigator.hardwareConcurrency gives logical CPU count
+    let count = web_sys::window()
+        .and_then(|w| Some(w.navigator().hardware_concurrency() as usize))
+        .unwrap_or(2);
+    
+    (count / 2).max(1) // Use half the CPUs, ensure at least 1
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn detect_hart_count() -> usize {
+    let count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
+    (count / 2).max(1) // Use half the CPUs, ensure at least 1
+}
+
 /// WASM-exposed VM wrapper for running RISC-V kernels in the browser.
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub struct WasmVm {
     bus: SystemBus,
-    cpu: cpu::Cpu,
+    cpus: Vec<cpu::Cpu>,      // Multiple CPUs for SMP
+    num_harts: usize,          // Track hart count
     net_status: NetworkStatus,
     poll_counter: u32,
     halted: bool,
@@ -84,14 +111,26 @@ impl WasmVm {
             DRAM_BASE
         };
 
-        let cpu = cpu::Cpu::new(entry_pc);
+        // Create multiple CPUs
+        let num_harts = detect_hart_count();
+        
+        // Set hart count in CLINT so kernel can read it
+        bus.set_num_harts(num_harts);
+        
+        let mut cpus = Vec::with_capacity(num_harts);
+        
+        for hart_id in 0..num_harts {
+            let cpu = cpu::Cpu::new(entry_pc, hart_id as u64);
+            cpus.push(cpu);
+        }
         
         web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
-            &format!("[VM] CPU initialized, starting at PC=0x{:x}", entry_pc)));
+            &format!("[VM] Created {} harts, entry PC=0x{:x}", num_harts, entry_pc)));
 
         Ok(WasmVm { 
             bus, 
-            cpu, 
+            cpus,
+            num_harts,
             net_status: NetworkStatus::Disconnected,
             poll_counter: 0,
             halted: false,
@@ -119,8 +158,8 @@ impl WasmVm {
         let backend = WebTransportBackend::new(url, cert_hash);
         // Note: WebTransport connect is async, so backend.init() will start connection
         // but actual connection happens in background.
-        let mut vnet = VirtioNet::new(Box::new(backend));
-        vnet.debug = false;
+        let vnet = VirtioNet::new(Box::new(backend));
+        // debug defaults to false in VirtioNet
 
         self.bus.virtio_devices.push(Box::new(vnet));
         // Don't set to Connected here - let network_status() check the actual state
@@ -162,7 +201,7 @@ impl WasmVm {
         self.net_status
     }
 
-    /// Execute a single instruction.
+    /// Execute one instruction on each CPU (round-robin).
     /// Returns true if the VM is still running, false if halted.
     pub fn step(&mut self) -> bool {
         // If already halted, don't execute more instructions
@@ -177,31 +216,34 @@ impl WasmVm {
             self.bus.poll_virtio();
         }
         
-        // Execute instruction and check for halt condition
-        match self.cpu.step(&mut self.bus) {
-            Ok(()) => true,
-            Err(Trap::RequestedTrap(code)) => {
-                // Guest requested shutdown via TEST_FINISHER
-                self.halted = true;
-                self.halt_code = code;
-                web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
-                    &format!("[VM] Halted by guest request (code: {:#x})", code)));
-                false
-            }
-            Err(Trap::Fatal(msg)) => {
-                // Fatal emulator error - log and halt
-                web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(
-                    &format!("[VM] Fatal error: {} at PC=0x{:x}", msg, self.cpu.pc)));
-                self.halted = true;
-                false
-            }
-            Err(_trap) => {
-                // Architectural traps (interrupts, page faults, ecalls) are handled
-                // by the CPU's trap handler which updates CSRs and redirects PC.
-                // These are normal operation - continue execution.
-                true
+        // Round-robin: execute one instruction on each hart
+        for cpu in &mut self.cpus {
+            match cpu.step(&self.bus) {
+                Ok(()) => {}
+                Err(Trap::RequestedTrap(code)) => {
+                    // Any hart can trigger shutdown
+                    self.halted = true;
+                    self.halt_code = code;
+                    web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
+                        &format!("[VM] Hart requested halt (code: {:#x})", code)));
+                    return false;
+                }
+                Err(Trap::Fatal(msg)) => {
+                    // Fatal emulator error - log and halt
+                    web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(
+                        &format!("[VM] Fatal error on hart: {} at PC=0x{:x}", msg, cpu.pc)));
+                    self.halted = true;
+                    return false;
+                }
+                Err(_trap) => {
+                    // Architectural traps (interrupts, page faults, ecalls) are handled
+                    // by the CPU's trap handler which updates CSRs and redirects PC.
+                    // These are normal operation - continue execution.
+                }
             }
         }
+        
+        true
     }
 
     /// Execute up to N instructions in a batch.
@@ -242,7 +284,7 @@ impl WasmVm {
     /// Check how many bytes are pending in the UART output buffer.
     /// Useful for debugging output issues.
     pub fn uart_output_pending(&self) -> usize {
-        self.bus.uart.output.len()
+        self.bus.uart.output_len()
     }
     
     /// Write a string to the UART output buffer (VM host message).
@@ -298,7 +340,7 @@ impl WasmVm {
 
     /// Get current memory usage (DRAM size) in bytes.
     pub fn get_memory_usage(&self) -> u64 {
-        self.bus.dram.data.len() as u64
+        self.bus.dram_size() as u64
     }
 }
 

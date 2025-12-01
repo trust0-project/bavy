@@ -119,7 +119,7 @@ impl Tlb {
 /// `addr` is a virtual address. Returns the translated physical address or a
 /// `Trap` corresponding to the appropriate page/access fault.
 pub fn translate(
-    bus: &mut dyn Bus,
+    bus: &dyn Bus,
     tlb: &mut Tlb,
     mode: Mode,
     satp: u64,

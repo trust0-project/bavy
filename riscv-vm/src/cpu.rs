@@ -3,7 +3,7 @@ use crate::clint::{CLINT_BASE, MTIME_OFFSET};
 use crate::csr::{
     Mode, CSR_MCAUSE, CSR_MEPC, CSR_MISA, CSR_MSTATUS, CSR_MTVEC, CSR_MTVAL, CSR_MIDELEG,
     CSR_MIE, CSR_MIP, CSR_SATP, CSR_MEDELEG, CSR_STVEC, CSR_SEPC, CSR_SCAUSE, CSR_STVAL, CSR_SIE,
-    CSR_SSTATUS, CSR_SIP, CSR_TIME, CSR_MENVCFG, CSR_STIMECMP,
+    CSR_SSTATUS, CSR_SIP, CSR_TIME, CSR_MENVCFG, CSR_STIMECMP, CSR_MHARTID,
 };
 use crate::decoder::{self, Op, Register};
 use crate::mmu::{self, AccessType as MmuAccessType, Tlb};
@@ -22,15 +22,22 @@ pub struct Cpu {
     /// Per-hart TLB for Sv39/Sv48 translation.
     pub tlb: Tlb,
     /// Poll counter for batching interrupt checks (rolls over every 256 instructions).
-    poll_counter: u8,
+    /// Exposed for testing to force immediate interrupt polling.
+    pub poll_counter: u8,
 }
 
 impl Cpu {
-    pub fn new(pc: u64) -> Self {
+    /// Create a new CPU with the given entry point and hart ID.
+    /// 
+    /// # Arguments
+    /// * `pc` - Initial program counter (kernel entry point)
+    /// * `hart_id` - Hardware thread ID (0 for primary, 1+ for secondary)
+    pub fn new(pc: u64, hart_id: u64) -> Self {
         let mut csrs = [0u64; 4096];
         // misa: rv64imac_zicsr_zifencei (value from phase-0.md)
         const MISA_RV64IMAC_ZICSR_ZIFENCEI: u64 = 0x4000_0000_0018_1125;
         csrs[CSR_MISA as usize] = MISA_RV64IMAC_ZICSR_ZIFENCEI;
+        csrs[CSR_MHARTID as usize] = hart_id;  // Initialize hart ID
 
         // mstatus initial value: all zeros except UXL/SXL can be left as 0 (WARL).
         csrs[CSR_MSTATUS as usize] = 0;
@@ -325,7 +332,7 @@ impl Cpu {
     /// trap via `Err`.
     fn translate_addr(
         &mut self,
-        bus: &mut dyn Bus,
+        bus: &dyn Bus,
         vaddr: u64,
         access: MmuAccessType,
         pc: u64,
@@ -340,7 +347,7 @@ impl Cpu {
     }
 
     #[inline]
-    fn fetch_and_expand(&mut self, bus: &mut dyn Bus) -> Result<(u32, u8), Trap> {
+    fn fetch_and_expand(&mut self, bus: &dyn Bus) -> Result<(u32, u8), Trap> {
         let pc = self.pc;
         if pc % 2 != 0 {
             return self.handle_trap(Trap::InstructionAddressMisaligned(pc), pc, None);
@@ -457,14 +464,20 @@ impl Cpu {
         None
     }
 
-    pub fn step(&mut self, bus: &mut dyn Bus) -> Result<(), Trap> {
+    /// Execute one instruction.
+    ///
+    /// Takes shared reference to bus; the bus uses interior mutability
+    /// for any state changes.
+    pub fn step(&mut self, bus: &dyn Bus) -> Result<(), Trap> {
         // Batch interrupt polling: only check every 256 instructions for performance.
         // This significantly reduces overhead while maintaining responsiveness.
         self.poll_counter = self.poll_counter.wrapping_add(1);
         
         if self.poll_counter == 0 {
             // Poll device-driven interrupts into MIP mask.
-            let mut hw_mip = bus.poll_interrupts();
+            // Each hart must check its own interrupts to receive IPIs correctly.
+            let hart_id = self.csrs[CSR_MHARTID as usize] as usize;
+            let mut hw_mip = bus.poll_interrupts_for_hart(hart_id);
 
             // Sstc support: raise STIP (bit 5) when time >= stimecmp and Sstc enabled.
             // menvcfg[63] gate is optional; xv6 enables it.
@@ -1342,22 +1355,22 @@ mod tests {
 
     #[test]
     fn test_addi() {
-        let mut bus = make_bus();
-        let mut cpu = Cpu::new(0x8000_0000);
+        let bus = make_bus();
+        let mut cpu = Cpu::new(0x8000_0000, 0);
 
         // ADDI x1, x0, -1
         let insn = encode_i(-1, 0, 0, 1, 0x13);
         bus.write32(0x8000_0000, insn).unwrap();
 
-        cpu.step(&mut bus).unwrap();
+        cpu.step(&bus).unwrap();
         assert_eq!(cpu.read_reg(Register::X1), 0xFFFF_FFFF_FFFF_FFFF);
         assert_eq!(cpu.pc, 0x8000_0004);
     }
 
     #[test]
     fn test_lui() {
-        let mut bus = make_bus();
-        let mut cpu = Cpu::new(0x8000_0000);
+        let bus = make_bus();
+        let mut cpu = Cpu::new(0x8000_0000, 0);
 
         // LUI x2, 0x12345
         // imm field is already << 12 in the encoding helper
@@ -1365,14 +1378,14 @@ mod tests {
         let insn = ((imm as u32) & 0xFFFFF000) | (2 << 7) | 0x37;
         bus.write32(0x8000_0000, insn).unwrap();
 
-        cpu.step(&mut bus).unwrap();
+        cpu.step(&bus).unwrap();
         assert_eq!(cpu.read_reg(Register::X2), 0x0000_0000_1234_5000);
     }
 
     #[test]
     fn test_load_store() {
-        let mut bus = make_bus();
-        let mut cpu = Cpu::new(0x8000_0000);
+        let bus = make_bus();
+        let mut cpu = Cpu::new(0x8000_0000, 0);
 
         // SD x1, 0(x2) -> Store x1 at x2+0
         // x1 = 0xDEADBEEF, x2 = 0x8000_0100
@@ -1384,7 +1397,7 @@ mod tests {
         let sd_insn = (1 << 20) | (2 << 15) | (3 << 12) | 0x23;
         bus.write32(0x8000_0000, sd_insn).unwrap();
 
-        cpu.step(&mut bus).unwrap();
+        cpu.step(&bus).unwrap();
         assert_eq!(bus.read64(0x8000_0100).unwrap(), 0xDEADBEEF);
 
         // LD x3, 0(x2) -> Load x3 from x2+0
@@ -1392,7 +1405,7 @@ mod tests {
         let ld_insn = (2 << 15) | (3 << 12) | (3 << 7) | 0x03;
         bus.write32(0x8000_0004, ld_insn).unwrap();
 
-        cpu.step(&mut bus).unwrap(); // Execute SD (pc was incremented in previous step? No wait)
+        cpu.step(&bus).unwrap(); // Execute SD (pc was incremented in previous step? No wait)
                                      // Previous step PC went 0->4. Now at 4.
 
         assert_eq!(cpu.read_reg(Register::X3), 0xDEADBEEF);
@@ -1400,8 +1413,8 @@ mod tests {
 
     #[test]
     fn test_x0_invariant() {
-        let mut bus = make_bus();
-        let mut cpu = Cpu::new(0x8000_0000);
+        let bus = make_bus();
+        let mut cpu = Cpu::new(0x8000_0000, 0);
 
         // Place a value in memory
         let addr = 0x8000_0100;
@@ -1418,8 +1431,8 @@ mod tests {
         bus.write32(0x8000_0000, addi_x0).unwrap();
         bus.write32(0x8000_0004, ld_x0).unwrap();
 
-        cpu.step(&mut bus).unwrap();
-        cpu.step(&mut bus).unwrap();
+        cpu.step(&bus).unwrap();
+        cpu.step(&bus).unwrap();
 
         // x0 must remain hard-wired to zero
         assert_eq!(cpu.read_reg(Register::X0), 0);
@@ -1427,8 +1440,8 @@ mod tests {
 
     #[test]
     fn test_branch_taken_and_not_taken() {
-        let mut bus = make_bus();
-        let mut cpu = Cpu::new(0x8000_0000);
+        let bus = make_bus();
+        let mut cpu = Cpu::new(0x8000_0000, 0);
 
         // BEQ x1, x2, +8 (pc + 8 when taken)
         let beq_insn = encode_b(8, 2, 1, 0x0, 0x63);
@@ -1438,21 +1451,21 @@ mod tests {
         cpu.write_reg(Register::X1, 5);
         cpu.write_reg(Register::X2, 5);
         cpu.pc = 0x8000_0000;
-        cpu.step(&mut bus).unwrap();
+        cpu.step(&bus).unwrap();
         assert_eq!(cpu.pc, 0x8000_0008);
 
         // Not taken: x1 != x2
         cpu.write_reg(Register::X1, 1);
         cpu.write_reg(Register::X2, 2);
         cpu.pc = 0x8000_0000;
-        cpu.step(&mut bus).unwrap();
+        cpu.step(&bus).unwrap();
         assert_eq!(cpu.pc, 0x8000_0004);
     }
 
     #[test]
     fn test_w_ops_sign_extension() {
-        let mut bus = make_bus();
-        let mut cpu = Cpu::new(0x8000_0000);
+        let bus = make_bus();
+        let mut cpu = Cpu::new(0x8000_0000, 0);
 
         // Set x1 = 0x0000_0000_8000_0000 (low 32 bits have sign bit set)
         cpu.write_reg(Register::X1, 0x0000_0000_8000_0000);
@@ -1462,7 +1475,7 @@ mod tests {
         let addw = encode_r(0x00, 2, 1, 0x0, 3, 0x3B);
         bus.write32(0x8000_0000, addw).unwrap();
 
-        cpu.step(&mut bus).unwrap();
+        cpu.step(&bus).unwrap();
 
         // Expect sign-extended 32-bit result: 0xFFFF_FFFF_8000_0000
         assert_eq!(cpu.read_reg(Register::X3), 0xFFFF_FFFF_8000_0000);
@@ -1470,15 +1483,15 @@ mod tests {
 
     #[test]
     fn test_m_extension_mul_div_rem() {
-        let mut bus = make_bus();
-        let mut cpu = Cpu::new(0x8000_0000);
+        let bus = make_bus();
+        let mut cpu = Cpu::new(0x8000_0000, 0);
 
         // MUL: 3 * 4 = 12
         cpu.write_reg(Register::X1, 3);
         cpu.write_reg(Register::X2, 4);
         let mul = encode_r(0x01, 2, 1, 0x0, 3, 0x33); // MUL x3, x1, x2
         bus.write32(0x8000_0000, mul).unwrap();
-        cpu.step(&mut bus).unwrap();
+        cpu.step(&bus).unwrap();
         assert_eq!(cpu.read_reg(Register::X3), 12);
 
         // MULH / MULHSU / MULHU basic sanity using large values
@@ -1491,9 +1504,9 @@ mod tests {
         bus.write32(0x8000_0004, mulh).unwrap();
         bus.write32(0x8000_0008, mulhsu).unwrap();
         bus.write32(0x8000_000C, mulhu).unwrap();
-        cpu.step(&mut bus).unwrap();
-        cpu.step(&mut bus).unwrap();
-        cpu.step(&mut bus).unwrap();
+        cpu.step(&bus).unwrap();
+        cpu.step(&bus).unwrap();
+        cpu.step(&bus).unwrap();
 
         // From spec example: low product is 0, high signed part negative
         assert_eq!(cpu.read_reg(Register::X3), 12);
@@ -1515,7 +1528,7 @@ mod tests {
         bus.write32(0x8000_001C, remu).unwrap();
 
         for _ in 0..4 {
-            cpu.step(&mut bus).unwrap();
+            cpu.step(&bus).unwrap();
         }
 
         assert_eq!(cpu.read_reg(Register::X7), u64::MAX); // DIV by 0 -> -1
@@ -1531,8 +1544,8 @@ mod tests {
         let rem_over = encode_r(0x01, 2, 1, 0x6, 12, 0x33); // REM x12, x1, x2
         bus.write32(0x8000_0020, div_over).unwrap();
         bus.write32(0x8000_0024, rem_over).unwrap();
-        cpu.step(&mut bus).unwrap();
-        cpu.step(&mut bus).unwrap();
+        cpu.step(&bus).unwrap();
+        cpu.step(&bus).unwrap();
 
         assert_eq!(cpu.read_reg(Register::X11), i64::MIN as u64);
         assert_eq!(cpu.read_reg(Register::X12), 0);
@@ -1540,8 +1553,8 @@ mod tests {
 
     #[test]
     fn test_compressed_addi_and_lwsp_paths() {
-        let mut bus = make_bus();
-        let mut cpu = Cpu::new(0x8000_0000);
+        let bus = make_bus();
+        let mut cpu = Cpu::new(0x8000_0000, 0);
 
         // Encodings from assembler with rv64imac (see rvc_test.S in dev notes):
         let c_addi_x11_1: u16 = 0x0585; // addi x11,x11,1 (C.ADDI)
@@ -1561,23 +1574,23 @@ mod tests {
         bus.write16(0x8000_0004, c_lwsp_a5_12).unwrap();
 
         // Execute three steps; PC should advance by 2 for each compressed inst.
-        cpu.step(&mut bus).unwrap();
+        cpu.step(&bus).unwrap();
         assert_eq!(cpu.pc, 0x8000_0002);
         assert_eq!(cpu.read_reg(Register::X11), 11);
 
-        cpu.step(&mut bus).unwrap();
+        cpu.step(&bus).unwrap();
         assert_eq!(cpu.pc, 0x8000_0004);
         assert_eq!(cpu.read_reg(Register::X2), 0x8000_0110); // sp + 16
 
-        cpu.step(&mut bus).unwrap();
+        cpu.step(&bus).unwrap();
         assert_eq!(cpu.pc, 0x8000_0006);
         assert_eq!(cpu.read_reg(Register::X15), 0xFFFF_FFFF_DEAD_BEEF); // a5 (sign-extended lw)
     }
 
     #[test]
     fn test_zicsr_basic_csrs() {
-        let mut bus = make_bus();
-        let mut cpu = Cpu::new(0x8000_0000);
+        let bus = make_bus();
+        let mut cpu = Cpu::new(0x8000_0000, 0);
         let csr_addr: u32 = 0x300; // mstatus
 
         // CSRRWI x1, mstatus, 5  (mstatus = 5, x1 = old = 0)
@@ -1586,7 +1599,7 @@ mod tests {
             (csr_addr << 20) | (zimm << 15) | (0x5 << 12) | (1 << 7) | 0x73
         };
         bus.write32(0x8000_0000, csrrwi).unwrap();
-        cpu.step(&mut bus).unwrap();
+        cpu.step(&bus).unwrap();
         assert_eq!(cpu.read_reg(Register::X1), 0);
 
         // CSRRSI x2, mstatus, 0xA  (mstatus = 5 | 0xA = 0xF, x2 = old = 5)
@@ -1595,7 +1608,7 @@ mod tests {
             (csr_addr << 20) | (zimm << 15) | (0x6 << 12) | (2 << 7) | 0x73
         };
         bus.write32(0x8000_0004, csrrsi).unwrap();
-        cpu.step(&mut bus).unwrap();
+        cpu.step(&bus).unwrap();
         assert_eq!(cpu.read_reg(Register::X2), 5);
 
         // CSRRCI x3, mstatus, 0x3  (mstatus = 0xF & !0x3 = 0xC, x3 = old = 0xF)
@@ -1604,14 +1617,14 @@ mod tests {
             (csr_addr << 20) | (zimm << 15) | (0x7 << 12) | (3 << 7) | 0x73
         };
         bus.write32(0x8000_0008, csrrci).unwrap();
-        cpu.step(&mut bus).unwrap();
+        cpu.step(&bus).unwrap();
         assert_eq!(cpu.read_reg(Register::X3), 0xF);
     }
 
     #[test]
     fn test_a_extension_lr_sc_basic() {
-        let mut bus = make_bus();
-        let mut cpu = Cpu::new(0x8000_0000);
+        let bus = make_bus();
+        let mut cpu = Cpu::new(0x8000_0000, 0);
 
         let addr = 0x8000_0200;
         bus.write64(addr, 0xDEAD_BEEF_DEAD_BEEF).unwrap();
@@ -1627,18 +1640,18 @@ mod tests {
         bus.write32(0x8000_0000, lr_d).unwrap();
         bus.write32(0x8000_0004, sc_d).unwrap();
 
-        cpu.step(&mut bus).unwrap();
+        cpu.step(&bus).unwrap();
         assert_eq!(cpu.read_reg(Register::X3), 0xDEAD_BEEF_DEAD_BEEF);
 
-        cpu.step(&mut bus).unwrap();
+        cpu.step(&bus).unwrap();
         assert_eq!(cpu.read_reg(Register::X4), 0); // SC success
         assert_eq!(bus.read64(addr).unwrap(), 0x0123_4567_89AB_CDEF);
     }
 
     #[test]
     fn test_a_extension_reservation_and_misaligned_sc() {
-        let mut bus = make_bus();
-        let mut cpu = Cpu::new(0x8000_0000);
+        let bus = make_bus();
+        let mut cpu = Cpu::new(0x8000_0000, 0);
 
         let addr = 0x8000_0300;
         bus.write64(addr, 0xCAFEBABE_F00D_F00D).unwrap();
@@ -1657,9 +1670,9 @@ mod tests {
         bus.write32(0x8000_0004, amoadd_d).unwrap();
         bus.write32(0x8000_0008, sc_d).unwrap();
 
-        cpu.step(&mut bus).unwrap(); // LR
-        cpu.step(&mut bus).unwrap(); // AMOADD
-        cpu.step(&mut bus).unwrap(); // SC (should fail)
+        cpu.step(&bus).unwrap(); // LR
+        cpu.step(&bus).unwrap(); // AMOADD
+        cpu.step(&bus).unwrap(); // SC (should fail)
 
         assert_eq!(cpu.read_reg(Register::X5), 1);
 
@@ -1669,7 +1682,7 @@ mod tests {
         let sc_misaligned = encode_amo(0b00011, false, false, 2, 1, 0x3, 6);
         bus.write32(0x8000_0010, sc_misaligned).unwrap();
 
-        let res = cpu.step(&mut bus);
+        let res = cpu.step(&bus);
         match res {
             Err(Trap::StoreAddressMisaligned(a)) => assert_eq!(a, addr + 1),
             _ => panic!("Expected StoreAddressMisaligned trap"),
@@ -1678,8 +1691,8 @@ mod tests {
 
     #[test]
     fn test_load_sign_and_zero_extension() {
-        let mut bus = make_bus();
-        let mut cpu = Cpu::new(0x8000_0000);
+        let bus = make_bus();
+        let mut cpu = Cpu::new(0x8000_0000, 0);
 
         let addr = 0x8000_0100;
         // 0xFFEE_DDCC_BBAA_9988 laid out little-endian in memory
@@ -1709,7 +1722,7 @@ mod tests {
 
         // Execute all loads
         for _ in 0..7 {
-            cpu.step(&mut bus).unwrap();
+            cpu.step(&bus).unwrap();
         }
 
         assert_eq!(cpu.read_reg(Register::X2), 0xFFFF_FFFF_FFFF_FF88); // LB (sign-extended 0x88)
@@ -1723,8 +1736,8 @@ mod tests {
 
     #[test]
     fn test_misaligned_load_and_store_traps() {
-        let mut bus = make_bus();
-        let mut cpu = Cpu::new(0x8000_0000);
+        let bus = make_bus();
+        let mut cpu = Cpu::new(0x8000_0000, 0);
 
         // x2 = misaligned address
         cpu.write_reg(Register::X2, 0x8000_0001);
@@ -1733,7 +1746,7 @@ mod tests {
         let lw = encode_i(0, 2, 2, 1, 0x03);
         bus.write32(0x8000_0000, lw).unwrap();
 
-        let res = cpu.step(&mut bus);
+        let res = cpu.step(&bus);
         match res {
             Err(Trap::LoadAddressMisaligned(a)) => assert_eq!(a, 0x8000_0001),
             _ => panic!("Expected LoadAddressMisaligned trap"),
@@ -1744,7 +1757,7 @@ mod tests {
         let sw = encode_s(0, 1, 2, 2, 0x23);
         bus.write32(0x8000_0000, sw).unwrap();
 
-        let res = cpu.step(&mut bus);
+        let res = cpu.step(&bus);
         match res {
             Err(Trap::StoreAddressMisaligned(a)) => assert_eq!(a, 0x8000_0001),
             _ => panic!("Expected StoreAddressMisaligned trap"),
@@ -1753,14 +1766,14 @@ mod tests {
 
     #[test]
     fn test_access_fault_outside_dram() {
-        let mut bus = make_bus();
-        let mut cpu = Cpu::new(0x8000_0000);
+        let bus = make_bus();
+        let mut cpu = Cpu::new(0x8000_0000, 0);
 
         // LW x1, 0(x0) -> effective address 0x0 (outside DRAM, but aligned)
         let lw = encode_i(0, 0, 2, 1, 0x03);
         bus.write32(0x8000_0000, lw).unwrap();
 
-        let res = cpu.step(&mut bus);
+        let res = cpu.step(&bus);
         match res {
             Err(Trap::LoadAccessFault(a)) => assert_eq!(a, 0),
             _ => panic!("Expected LoadAccessFault trap"),
@@ -1769,8 +1782,8 @@ mod tests {
 
     #[test]
     fn test_jal() {
-        let mut bus = make_bus();
-        let mut cpu = Cpu::new(0x8000_0000);
+        let bus = make_bus();
+        let mut cpu = Cpu::new(0x8000_0000, 0);
 
         // JAL x1, 8
         // Op=0x6F, rd=1, imm=8.
@@ -1787,17 +1800,17 @@ mod tests {
         let jal_insn = (4 << 21) | (1 << 7) | 0x6F;
         bus.write32(0x8000_0000, jal_insn).unwrap();
 
-        cpu.step(&mut bus).unwrap();
+        cpu.step(&bus).unwrap();
         assert_eq!(cpu.read_reg(Register::X1), 0x8000_0004); // Link address
         assert_eq!(cpu.pc, 0x8000_0008); // Target
     }
 
     #[test]
     fn test_misaligned_fetch() {
-        let mut bus = make_bus();
-        let mut cpu = Cpu::new(0x8000_0001); // Odd PC
+        let bus = make_bus();
+        let mut cpu = Cpu::new(0x8000_0001, 0); // Odd PC
 
-        let res = cpu.step(&mut bus);
+        let res = cpu.step(&bus);
         match res {
             Err(Trap::InstructionAddressMisaligned(addr)) => assert_eq!(addr, 0x8000_0001),
             _ => panic!("Expected misaligned trap"),
@@ -1806,8 +1819,8 @@ mod tests {
 
     #[test]
     fn test_smoke_sum() {
-        let mut bus = make_bus();
-        let mut cpu = Cpu::new(0x8000_0000);
+        let bus = make_bus();
+        let mut cpu = Cpu::new(0x8000_0000, 0);
 
         // Data at 0x8000_0100
         let data: [u32; 5] = [1, 2, 3, 4, 5];
@@ -1846,7 +1859,7 @@ mod tests {
             if steps > 1000 {
                 panic!("Infinite loop");
             }
-            match cpu.step(&mut bus) {
+            match cpu.step(&bus) {
                 Ok(_) => {}
                 Err(Trap::Breakpoint) => break,
                 Err(e) => panic!("Unexpected trap at pc 0x{:x}: {:?}", cpu.pc, e),
@@ -1859,8 +1872,10 @@ mod tests {
 
     #[test]
     fn test_interrupts_clint_plic() {
-        let mut bus = make_bus();
-        let mut cpu = Cpu::new(0x8000_0000);
+        let bus = make_bus();
+        let mut cpu = Cpu::new(0x8000_0000, 0);
+        // Set poll_counter to 255 so the first step triggers immediate interrupt check
+        cpu.poll_counter = 255;
 
         // 1. Setup MTVEC to 0x8000_1000 (Direct)
         let mtvec_val = 0x8000_1000;
@@ -1878,14 +1893,14 @@ mod tests {
 
         // --- Test CLINT Timer Interrupt ---
         // Set mtimecmp[0] to 100
-        bus.clint.mtimecmp[0] = 100;
+        bus.clint.set_mtimecmp(0, 100);
         // Set mtime to 101 (trigger condition)
         bus.clint.set_mtime(101);
 
         // We need a valid instruction at PC to attempt fetch, although interrupt checks before fetch.
         bus.write32(0x8000_0000, 0x00000013).unwrap(); // NOP (addi x0, x0, 0)
 
-        let res = cpu.step(&mut bus);
+        let res = cpu.step(&bus);
         match res {
              Err(Trap::MachineTimerInterrupt) => {
                  // Success
@@ -1898,7 +1913,7 @@ mod tests {
         }
 
         // Clear the interrupt condition
-        bus.clint.mtimecmp[0] = 200; 
+        bus.clint.set_mtimecmp(0, 200); 
         // CPU is now at handler. We need to "return" (mret) or just reset state for next test.
         // Reset PC back to start
         cpu.pc = 0x8000_0000;
@@ -1906,6 +1921,8 @@ mod tests {
         let mut mstatus = cpu.read_csr(CSR_MSTATUS).unwrap();
         mstatus |= 1 << 3;
         cpu.write_csr(CSR_MSTATUS, mstatus).unwrap();
+        // Set poll_counter to 255 for immediate interrupt check on next step
+        cpu.poll_counter = 255;
 
         // --- Test PLIC UART Interrupt ---
         // Configure PLIC
@@ -1928,7 +1945,7 @@ mod tests {
         bus.check_interrupts();
 
         // Step CPU
-        let res = cpu.step(&mut bus);
+        let res = cpu.step(&bus);
         match res {
             Err(Trap::MachineExternalInterrupt) => {
                 // Success

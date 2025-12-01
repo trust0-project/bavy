@@ -71,6 +71,4 @@ version = "2"
 default-features = false
 features = ["static_secrets", "alloc"]
 
-[profile.release]
-strip = true
-lto = true
+# Note: Release profile is defined at workspace root (Cargo.toml)
