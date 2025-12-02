@@ -27,26 +27,59 @@ static INIT_COMPLETE: AtomicBool = AtomicBool::new(false);
 /// Number of services started
 static SERVICES_STARTED: AtomicUsize = AtomicUsize::new(0);
 
+/// Service status
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ServiceStatus {
+    Stopped,
+    Running,
+    Failed,
+}
+
+impl ServiceStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ServiceStatus::Stopped => "stopped",
+            ServiceStatus::Running => "running",
+            ServiceStatus::Failed => "failed",
+        }
+    }
+}
+
+/// Service definition - describes a service that can be started/stopped
+#[derive(Clone)]
+pub struct ServiceDef {
+    pub name: String,
+    pub description: String,
+    pub entry: crate::task::TaskEntry,
+    pub priority: crate::task::Priority,
+    pub preferred_hart: Option<usize>,
+}
+
+/// Service runtime info
+#[derive(Clone)]
+pub struct ServiceInfo {
+    pub name: String,
+    pub pid: u32,
+    pub status: ServiceStatus,
+    pub started_at: u64,
+    pub hart: Option<usize>,
+}
+
 /// Init state
 struct InitState {
-    /// Services that have been started
+    /// Registered service definitions
+    service_defs: Vec<ServiceDef>,
+    /// Running services
     services: Vec<ServiceInfo>,
 }
 
 impl InitState {
     const fn new() -> Self {
         Self {
+            service_defs: Vec::new(),
             services: Vec::new(),
         }
     }
-}
-
-/// Service information
-#[derive(Clone)]
-pub struct ServiceInfo {
-    pub name: String,
-    pub pid: u32,
-    pub started_at: u64,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -107,48 +140,192 @@ fn start_system_services() {
     let num_harts = crate::HARTS_ONLINE.load(Ordering::Relaxed);
     klog_info("init", &format!("{} harts available for parallel tasks", num_harts));
     
-    // Spawn bootlog service on a secondary hart (if available)
-    // This is a one-shot task that writes boot info to /var/log/kernel.log
+    // Register service definitions (available services)
+    register_service_def(
+        "klogd",
+        "Kernel logger daemon - logs system memory stats",
+        klogd_service,
+        Priority::Normal,
+        Some(1),
+    );
+    
+    register_service_def(
+        "sysmond",
+        "System monitor daemon - monitors system health",
+        sysmond_service,
+        Priority::Normal,
+        Some(2),
+    );
+    
+    // Auto-start klogd on hart 1 (if available)
     if num_harts > 1 {
-        let bootlog_pid = SCHEDULER.spawn_on_hart(
-            "bootlog",
-            bootlog_service,
-            Priority::Normal,
-            Some(1), // Run on hart 1
-        );
-        register_service("bootlog", bootlog_pid);
-        klog_info("init", &format!("Spawned bootlog service (PID {}) on hart 1", bootlog_pid));
-        
-        // Send IPI to wake hart 1
-        crate::send_ipi(1);
+        if let Ok(()) = start_service("klogd") {
+            klog_info("init", "Auto-started klogd");
+        }
     }
     
-    // Spawn sysmon service on another hart (if available)
-    // This writes system stats to the log
+    // Auto-start sysmond on hart 2 (if available)
     if num_harts > 2 {
-        let sysmon_pid = SCHEDULER.spawn_on_hart(
-            "sysmon",
-            sysmon_service,
-            Priority::Normal,
-            Some(2), // Run on hart 2
-        );
-        register_service("sysmon", sysmon_pid);
-        klog_info("init", &format!("Spawned sysmon service (PID {}) on hart 2", sysmon_pid));
-        
-        // Send IPI to wake hart 2
-        crate::send_ipi(2);
+        if let Ok(()) = start_service("sysmond") {
+            klog_info("init", "Auto-started sysmond");
+        }
     }
 }
 
-/// Register a started service
-fn register_service(name: &str, pid: u32) {
+// ═══════════════════════════════════════════════════════════════════════════════
+// PUBLIC SERVICE CONTROL API
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Start a service by name
+/// Returns Ok(()) on success, Err(message) on failure
+pub fn start_service(name: &str) -> Result<(), &'static str> {
+    let state = INIT_STATE.lock();
+    
+    // Check if already running
+    if let Some(svc) = state.services.iter().find(|s| s.name == name) {
+        if svc.status == ServiceStatus::Running {
+            return Err("Service is already running");
+        }
+    }
+    
+    // Find service definition
+    let def = state.service_defs.iter().find(|d| d.name == name)
+        .ok_or("Service not found")?;
+    
+    let entry = def.entry;
+    let priority = def.priority;
+    let preferred_hart = def.preferred_hart;
+    let name_owned = def.name.clone();
+    
+    drop(state); // Release lock before spawning
+    
+    // Spawn the service
+    let pid = SCHEDULER.spawn_daemon_on_hart(
+        &name_owned,
+        entry,
+        priority,
+        preferred_hart,
+    );
+    
+    // Register as running
+    register_service(&name_owned, pid, preferred_hart);
+    
+    // Wake the target hart
+    if let Some(hart) = preferred_hart {
+        crate::send_ipi(hart);
+    }
+    
+    Ok(())
+}
+
+/// Stop a service by name
+/// Returns Ok(()) on success, Err(message) on failure
+pub fn stop_service(name: &str) -> Result<(), &'static str> {
+    let state = INIT_STATE.lock();
+    
+    // Find the running service
+    let svc = state.services.iter().find(|s| s.name == name)
+        .ok_or("Service not found")?;
+    
+    if svc.status != ServiceStatus::Running {
+        return Err("Service is not running");
+    }
+    
+    let pid = svc.pid;
+    drop(state); // Release lock before killing
+    
+    // Kill the service task
+    if pid > 0 {
+        SCHEDULER.kill(pid);
+    }
+    
+    // Mark as stopped
+    mark_service_stopped(name);
+    
+    Ok(())
+}
+
+/// Restart a service by name
+/// Returns Ok(()) on success, Err(message) on failure
+pub fn restart_service(name: &str) -> Result<(), &'static str> {
+    // Stop if running (ignore error if not running)
+    let _ = stop_service(name);
+    
+    // Small delay to let things settle
+    for _ in 0..10000 {
+        core::hint::spin_loop();
+    }
+    
+    // Start the service
+    start_service(name)
+}
+
+/// Get status of a service
+pub fn service_status(name: &str) -> Option<ServiceStatus> {
+    let state = INIT_STATE.lock();
+    state.services.iter()
+        .find(|s| s.name == name)
+        .map(|s| s.status)
+}
+
+/// Get detailed info about a service
+pub fn get_service_info(name: &str) -> Option<ServiceInfo> {
+    let state = INIT_STATE.lock();
+    state.services.iter()
+        .find(|s| s.name == name)
+        .cloned()
+}
+
+/// List all registered services (definitions)
+pub fn list_service_defs() -> Vec<(String, String)> {
+    let state = INIT_STATE.lock();
+    state.service_defs.iter()
+        .map(|d| (d.name.clone(), d.description.clone()))
+        .collect()
+}
+
+/// Register a service definition (what the service is and how to start it)
+fn register_service_def(name: &str, description: &str, entry: crate::task::TaskEntry, priority: crate::task::Priority, preferred_hart: Option<usize>) {
     let mut state = INIT_STATE.lock();
-    state.services.push(ServiceInfo {
+    state.service_defs.push(ServiceDef {
         name: String::from(name),
-        pid,
-        started_at: crate::get_time_ms() as u64,
+        description: String::from(description),
+        entry,
+        priority,
+        preferred_hart,
     });
+}
+
+/// Register a running service instance
+fn register_service(name: &str, pid: u32, hart: Option<usize>) {
+    let mut state = INIT_STATE.lock();
+    
+    // Update existing or add new
+    if let Some(svc) = state.services.iter_mut().find(|s| s.name == name) {
+        svc.pid = pid;
+        svc.status = ServiceStatus::Running;
+        svc.started_at = crate::get_time_ms() as u64;
+        svc.hart = hart;
+    } else {
+        state.services.push(ServiceInfo {
+            name: String::from(name),
+            pid,
+            status: ServiceStatus::Running,
+            started_at: crate::get_time_ms() as u64,
+            hart,
+        });
+    }
     SERVICES_STARTED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Mark a service as stopped
+fn mark_service_stopped(name: &str) {
+    let mut state = INIT_STATE.lock();
+    if let Some(svc) = state.services.iter_mut().find(|s| s.name == name) {
+        svc.status = ServiceStatus::Stopped;
+        svc.pid = 0;
+        svc.hart = None;
+    }
 }
 
 /// Run init scripts from /etc/init.d/
@@ -218,143 +395,156 @@ fn write_boot_log() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// SYSTEM SERVICES (one-shot tasks that run on secondary harts)
+// SYSTEM SERVICES (long-running daemons on secondary harts)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Boot log service - writes detailed boot information to /var/log/kernel.log
-/// 
-/// This is a one-shot service that runs on a secondary hart during boot.
-/// It collects system information and writes it to the kernel log file.
-pub fn bootlog_service() {
-    let hart_id = crate::get_hart_id();
-    let timestamp = crate::get_time_ms();
-    
-    // Collect boot information
-    let num_harts = crate::HARTS_ONLINE.load(Ordering::Relaxed);
-    let (heap_used, heap_free) = crate::allocator::heap_stats();
-    let heap_total = crate::allocator::heap_size();
-    
-    // Build the boot log entry
-    let log_content = format!(
-        "══════════════════════════════════════════════════════════════\n\
-         BAVY OS Boot Log\n\
-         ══════════════════════════════════════════════════════════════\n\
-         Timestamp:      {}ms since boot\n\
-         Written by:     bootlog service (hart {})\n\
-         \n\
-         ── System Information ──\n\
-         Architecture:   RISC-V 64-bit (RV64GC)\n\
-         Mode:           Machine Mode (M-Mode)\n\
-         Harts Online:   {}\n\
-         \n\
-         ── Memory Status ──\n\
-         Heap Total:     {} bytes ({} KiB)\n\
-         Heap Used:      {} bytes\n\
-         Heap Free:      {} bytes\n\
-         Usage:          {}%\n\
-         \n\
-         ── Services ──\n\
-         bootlog:        Running (this service)\n\
-         sysmon:         Scheduled\n\
-         \n\
-         Boot completed successfully.\n\
-         ══════════════════════════════════════════════════════════════\n\n",
-        timestamp,
-        hart_id,
-        num_harts,
-        heap_total, heap_total / 1024,
-        heap_used,
-        heap_free,
-        (heap_used * 100) / heap_total,
-    );
-    
-    // Write to /var/log/kernel.log
-    {
-        let mut fs_guard = crate::FS_STATE.lock();
-        let mut blk_guard = crate::BLK_DEV.lock();
-        
-        if let (Some(fs), Some(dev)) = (fs_guard.as_mut(), blk_guard.as_mut()) {
-            match fs.write_file(dev, "/var/log/kernel.log", log_content.as_bytes()) {
-                Ok(()) => {
-                    klog_info("bootlog", &format!("Boot log written by hart {}", hart_id));
-                }
-                Err(e) => {
-                    klog_error("bootlog", &format!("Failed to write boot log: {}", e));
-                }
-            }
+/// Spin-delay for approximately the given milliseconds
+/// Uses busy-waiting since secondary harts don't have timer interrupts
+#[inline(never)]
+fn spin_delay_ms(ms: u64) {
+    let start = crate::get_time_ms() as u64;
+    let target = start + ms;
+    while (crate::get_time_ms() as u64) < target {
+        // Yield CPU hints to save power
+        for _ in 0..100 {
+            core::hint::spin_loop();
         }
     }
-    
-    // Service completes - task will be marked as finished by scheduler
-    klog_info("bootlog", &format!("Service completed on hart {}", hart_id));
 }
 
-/// System monitor service - writes system statistics to /var/log/kernel.log
-/// 
-/// This is a one-shot service that appends system stats to the log.
-pub fn sysmon_service() {
-    let hart_id = crate::get_hart_id();
-    let timestamp = crate::get_time_ms();
+/// Append a line to the kernel log file
+/// Returns true on success
+fn append_to_log(line: &str) -> bool {
+    let mut fs_guard = crate::FS_STATE.lock();
+    let mut blk_guard = crate::BLK_DEV.lock();
     
-    // Small delay to let bootlog finish first
-    for _ in 0..10000 {
-        core::hint::spin_loop();
-    }
-    
-    // Collect system stats
-    let task_count = SCHEDULER.task_count();
-    let queued = SCHEDULER.queued_count();
-    
-    // Check network status
-    let net_status = {
-        let net_guard = crate::NET_STATE.lock();
-        if net_guard.is_some() {
-            "Connected"
-        } else {
-            "Not available"
-        }
-    };
-    
-    // Check filesystem status
-    let fs_status = {
-        let fs_guard = crate::FS_STATE.lock();
-        if fs_guard.is_some() {
-            "Mounted"
-        } else {
-            "Not available"
-        }
-    };
-    
-    let log_entry = format!(
-        "[{}ms] sysmon (hart {}): tasks={}, queued={}, net={}, fs={}\n",
-        timestamp,
-        hart_id,
-        task_count,
-        queued,
-        net_status,
-        fs_status,
-    );
-    
-    // Append to log file
-    {
-        let mut fs_guard = crate::FS_STATE.lock();
-        let mut blk_guard = crate::BLK_DEV.lock();
+    if let (Some(fs), Some(dev)) = (fs_guard.as_mut(), blk_guard.as_mut()) {
+        // Read existing content
+        let existing = fs.read_file(dev, "/var/log/kernel.log")
+            .map(|v| String::from_utf8_lossy(&v).into_owned())
+            .unwrap_or_default();
         
-        if let (Some(fs), Some(dev)) = (fs_guard.as_mut(), blk_guard.as_mut()) {
-            // Read existing content
-            let existing = fs.read_file(dev, "/var/log/kernel.log")
-                .map(|v| String::from_utf8_lossy(&v).into_owned())
-                .unwrap_or_default();
-            
-            let new_content = format!("{}{}", existing, log_entry);
-            
-            if let Err(e) = fs.write_file(dev, "/var/log/kernel.log", new_content.as_bytes()) {
-                let _ = e; // Can't log without risk of recursion
-            }
+        // Truncate if too large (keep last 16KB)
+        let trimmed = if existing.len() > 16384 {
+            String::from(&existing[existing.len() - 16384..])
+        } else {
+            existing
+        };
+        
+        let new_content = format!("{}{}\n", trimmed, line);
+        
+        return fs.write_file(dev, "/var/log/kernel.log", new_content.as_bytes()).is_ok();
+    }
+    false
+}
+
+/// Kernel Logger Daemon (klogd)
+/// 
+/// Runs continuously on a secondary hart, periodically writing system status
+/// to /var/log/kernel.log every 5 seconds.
+pub fn klogd_service() {
+    let hart_id = crate::get_hart_id();
+    let mut tick: u64 = 0;
+    
+    // Write startup message
+    let startup_msg = format!(
+        "══════════════════════════════════════════════════════════════\n\
+         BAVY OS - Kernel Logger Started\n\
+         ══════════════════════════════════════════════════════════════\n\
+         Time: {}ms | Hart: {} | klogd daemon initialized\n\
+         ──────────────────────────────────────────────────────────────",
+        crate::get_time_ms(),
+        hart_id
+    );
+    append_to_log(&startup_msg);
+    
+    // Main daemon loop
+    loop {
+        tick += 1;
+        
+        // Wait 5 seconds between log entries
+        spin_delay_ms(5000);
+        
+        let timestamp = crate::get_time_ms();
+        let (heap_used, heap_free) = crate::allocator::heap_stats();
+        let heap_total = crate::allocator::heap_size();
+        let usage_pct = (heap_used * 100) / heap_total.max(1);
+        
+        // Format log entry
+        let log_entry = format!(
+            "[{:>10}ms] klogd #{}: mem={}%({}/{}KB)",
+            timestamp,
+            tick,
+            usage_pct,
+            heap_used / 1024,
+            heap_total / 1024,
+        );
+        
+        append_to_log(&log_entry);
+    }
+}
+
+/// System Monitor Daemon (sysmond)  
+/// 
+/// Runs continuously on a secondary hart, monitoring system health
+/// and logging statistics every 10 seconds.
+pub fn sysmond_service() {
+    let hart_id = crate::get_hart_id();
+    let mut tick: u64 = 0;
+    
+    // Small initial delay to let klogd start first
+    spin_delay_ms(2000);
+    
+    // Write startup message
+    let startup_msg = format!(
+        "[{:>10}ms] sysmond started on hart {}",
+        crate::get_time_ms(),
+        hart_id
+    );
+    append_to_log(&startup_msg);
+    
+    // Main daemon loop
+    loop {
+        tick += 1;
+        
+        // Wait 10 seconds between checks
+        spin_delay_ms(10000);
+        
+        let timestamp = crate::get_time_ms();
+        
+        // Collect system stats (minimize lock hold time)
+        let task_count = SCHEDULER.task_count();
+        let queued = SCHEDULER.queued_count();
+        let num_harts = crate::HARTS_ONLINE.load(Ordering::Relaxed);
+        
+        let net_ok = crate::NET_STATE.lock().is_some();
+        let fs_ok = crate::FS_STATE.lock().is_some();
+        
+        // Format log entry
+        let log_entry = format!(
+            "[{:>10}ms] sysmond #{}: harts={} tasks={} queued={} net={} fs={}",
+            timestamp,
+            tick,
+            num_harts,
+            task_count,
+            queued,
+            if net_ok { "UP" } else { "DOWN" },
+            if fs_ok { "OK" } else { "ERR" },
+        );
+        
+        append_to_log(&log_entry);
+        
+        // Reap zombie processes periodically
+        let reaped = SCHEDULER.reap_zombies();
+        if reaped > 0 {
+            let reap_msg = format!(
+                "[{:>10}ms] sysmond: reaped {} zombie process(es)",
+                crate::get_time_ms(),
+                reaped
+            );
+            append_to_log(&reap_msg);
         }
     }
-    
-    klog_info("sysmon", &format!("Stats recorded on hart {}", hart_id));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -366,9 +556,27 @@ pub fn is_init_complete() -> bool {
     INIT_COMPLETE.load(Ordering::Acquire)
 }
 
-/// Get list of running services
+/// Get list of all services (running and stopped)
 pub fn list_services() -> Vec<ServiceInfo> {
-    INIT_STATE.lock().services.clone()
+    let state = INIT_STATE.lock();
+    
+    // Return all services, adding stopped ones from definitions
+    let mut result = state.services.clone();
+    
+    // Add any defined services that aren't in the running list
+    for def in &state.service_defs {
+        if !result.iter().any(|s| s.name == def.name) {
+            result.push(ServiceInfo {
+                name: def.name.clone(),
+                pid: 0,
+                status: ServiceStatus::Stopped,
+                started_at: 0,
+                hart: None,
+            });
+        }
+    }
+    
+    result
 }
 
 /// Get number of services started

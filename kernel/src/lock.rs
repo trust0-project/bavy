@@ -5,10 +5,17 @@
 
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 #[cfg(debug_assertions)]
 use core::sync::atomic::AtomicUsize;
 use core::hint::spin_loop;
+
+// Lock states as u32 for 32-bit atomic operations.
+// On RISC-V, AtomicBool uses byte operations which may not be properly
+// synchronized across harts in some emulators. Using AtomicU32 ensures
+// we get proper AMOSWAP.W instructions that are correctly serialized.
+const UNLOCKED: u32 = 0;
+const LOCKED: u32 = 1;
 
 /// A mutual exclusion primitive based on spinning.
 ///
@@ -23,7 +30,10 @@ use core::hint::spin_loop;
 /// }
 /// ```
 pub struct Spinlock<T> {
-    locked: AtomicBool,
+    // Use AtomicU32 instead of AtomicBool to ensure 32-bit atomic operations.
+    // This guarantees we use AMOSWAP.W for swap and aligned LW/SW for load/store,
+    // which are properly synchronized across harts.
+    locked: AtomicU32,
     data: UnsafeCell<T>,
     #[cfg(debug_assertions)]
     holder: AtomicUsize, // Debug: track which hart holds the lock
@@ -37,7 +47,7 @@ impl<T> Spinlock<T> {
     /// Create a new spinlock wrapping the given value.
     pub const fn new(data: T) -> Self {
         Self {
-            locked: AtomicBool::new(false),
+            locked: AtomicU32::new(UNLOCKED),
             data: UnsafeCell::new(data),
             #[cfg(debug_assertions)]
             holder: AtomicUsize::new(usize::MAX),
@@ -47,19 +57,21 @@ impl<T> Spinlock<T> {
     /// Acquire the lock, blocking until available.
     ///
     /// Returns a guard that releases the lock when dropped.
+    /// 
+    /// NOTE: Uses `swap` (AMOSWAP.W instruction) for acquisition because it's a single
+    /// atomic instruction that works correctly for SMP. We use AtomicU32 instead of
+    /// AtomicBool to ensure we get 32-bit operations (AMOSWAP.W, LW, SW) which are
+    /// properly synchronized across harts, rather than byte operations which may not be.
     #[inline]
     pub fn lock(&self) -> SpinlockGuard<T> {
-        // Test-and-set with exponential backoff
         let mut spin_count = 0u32;
 
         loop {
-            // Try to acquire
-            if self
-                .locked
-                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-            {
-                // Acquired!
+            // Try to acquire using swap (AMOSWAP.W instruction on RISC-V)
+            // swap(LOCKED) atomically sets the lock and returns the old value
+            // If old value was UNLOCKED, we acquired the lock
+            if self.locked.swap(LOCKED, Ordering::Acquire) == UNLOCKED {
+                // Acquired! (old value was UNLOCKED)
                 #[cfg(debug_assertions)]
                 {
                     let hart_id = get_hart_id();
@@ -71,8 +83,11 @@ impl<T> Spinlock<T> {
                 };
             }
 
-            // Spin while locked
-            while self.locked.load(Ordering::Relaxed) {
+            // Lock was already held - spin until we can acquire it
+            // Note: We continue trying swap instead of just loading, because
+            // the emulator's AMO operations are properly serialized while
+            // regular loads may not have proper visibility across harts.
+            loop {
                 spin_loop();
                 spin_count = spin_count.wrapping_add(1);
 
@@ -89,6 +104,20 @@ impl<T> Spinlock<T> {
                     }
                     spin_count = 0; // Reset counter
                 }
+                
+                // Try to acquire again with swap
+                if self.locked.swap(LOCKED, Ordering::Acquire) == UNLOCKED {
+                    // Got it!
+                    #[cfg(debug_assertions)]
+                    {
+                        let hart_id = get_hart_id();
+                        self.holder.store(hart_id, Ordering::Relaxed);
+                    }
+                    return SpinlockGuard {
+                        lock: self,
+                        _not_send: core::marker::PhantomData,
+                    };
+                }
             }
         }
     }
@@ -98,11 +127,8 @@ impl<T> Spinlock<T> {
     /// Returns `Some(guard)` if successful, `None` if lock is held.
     #[inline]
     pub fn try_lock(&self) -> Option<SpinlockGuard<T>> {
-        if self
-            .locked
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-        {
+        // Use swap instead of compare_exchange to ensure AMOSWAP.W is used
+        if self.locked.swap(LOCKED, Ordering::Acquire) == UNLOCKED {
             #[cfg(debug_assertions)]
             self.holder.store(get_hart_id(), Ordering::Relaxed);
             Some(SpinlockGuard {
@@ -116,7 +142,7 @@ impl<T> Spinlock<T> {
 
     /// Check if the lock is currently held (for debugging).
     pub fn is_locked(&self) -> bool {
-        self.locked.load(Ordering::Relaxed)
+        self.locked.load(Ordering::Relaxed) != UNLOCKED
     }
 
     /// Get the data without locking (unsafe).
@@ -179,8 +205,10 @@ impl<T> Drop for SpinlockGuard<'_, T> {
         #[cfg(debug_assertions)]
         self.lock.holder.store(usize::MAX, Ordering::Relaxed);
 
-        // Release the lock
-        self.lock.locked.store(false, Ordering::Release);
+        // Release the lock using AMOSWAP.W to ensure visibility across harts.
+        // Using swap instead of store because the emulator serializes AMO operations
+        // but may not properly synchronize regular store visibility across hart threads.
+        self.lock.locked.swap(UNLOCKED, Ordering::Release);
     }
 }
 

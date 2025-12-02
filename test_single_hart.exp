@@ -1,0 +1,47 @@
+#!/usr/bin/expect -f
+
+set timeout 60
+
+# Start the VM with just 1 hart (no SMP, no daemons)
+spawn cargo run -p riscv-vm --release -- --kernel target/riscv64gc-unknown-none-elf/release/kernel --disk target/riscv64gc-unknown-none-elf/release/fs.img --harts 1
+
+# Wait for boot
+expect {
+    "BOOT COMPLETE" {
+        puts "\n>>> Boot complete"
+    }
+    timeout {
+        puts "\n>>> TIMEOUT waiting for boot"
+        exit 1
+    }
+}
+
+sleep 3
+puts ">>> Waiting 30 seconds..."
+sleep 30
+
+# Test ps command
+puts ">>> Testing 'ps' command with single hart..."
+send "ps\r"
+
+expect {
+    -re "PID.*STATE" {
+        puts "\n>>> 'ps' header seen!"
+    }
+    -re "no processes" {
+        puts "\n>>> No processes (expected with single hart)"
+    }
+    -re "Bavy.*#" {
+        puts "\n>>> Got prompt"
+    }
+    timeout {
+        puts "\n>>> TIMEOUT on 'ps' - single hart also hangs!"
+        exit 2
+    }
+}
+
+puts "\n>>> Single hart test completed"
+send "\x03"
+sleep 1
+expect eof
+

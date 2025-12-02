@@ -5,6 +5,8 @@ use js_sys::{DataView, SharedArrayBuffer, Uint8Array};
 use thiserror::Error;
 #[cfg(not(target_arch = "wasm32"))]
 use std::cell::UnsafeCell;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Base physical address of DRAM as seen by devices that work directly with
 /// physical addresses (VirtIO, etc.).
@@ -171,10 +173,11 @@ impl Dram {
         if off + 4 > self.size {
             return Err(MemoryError::OutOfBounds(offset));
         }
-        // SAFETY: Alignment and bounds checked
+        // Use atomic load with SeqCst to ensure visibility across threads.
+        // This is crucial for spinlock synchronization in SMP mode.
         unsafe {
-            let ptr = self.mem_ptr().add(off) as *const u32;
-            Ok(ptr.read_unaligned().to_le())
+            let ptr = self.mem_ptr().add(off) as *const AtomicU32;
+            Ok((*ptr).load(Ordering::SeqCst).to_le())
         }
     }
 
@@ -187,10 +190,11 @@ impl Dram {
         if off + 8 > self.size {
             return Err(MemoryError::OutOfBounds(offset));
         }
-        // SAFETY: Alignment and bounds checked
+        // Use atomic load with SeqCst to ensure visibility across threads.
+        // This is crucial for spinlock synchronization in SMP mode.
         unsafe {
-            let ptr = self.mem_ptr().add(off) as *const u64;
-            Ok(ptr.read_unaligned().to_le())
+            let ptr = self.mem_ptr().add(off) as *const AtomicU64;
+            Ok((*ptr).load(Ordering::SeqCst).to_le())
         }
     }
 
@@ -235,10 +239,11 @@ impl Dram {
         if off + 4 > self.size {
             return Err(MemoryError::OutOfBounds(offset));
         }
-        // SAFETY: Alignment and bounds checked
+        // Use atomic store with SeqCst to ensure visibility across threads.
+        // This is crucial for spinlock synchronization in SMP mode.
         unsafe {
-            let ptr = self.mem_ptr().add(off) as *mut u32;
-            ptr.write_unaligned((value as u32).to_le());
+            let ptr = self.mem_ptr().add(off) as *const AtomicU32;
+            (*ptr).store((value as u32).to_le(), Ordering::SeqCst);
         }
         Ok(())
     }
@@ -252,10 +257,11 @@ impl Dram {
         if off + 8 > self.size {
             return Err(MemoryError::OutOfBounds(offset));
         }
-        // SAFETY: Alignment and bounds checked
+        // Use atomic store with SeqCst to ensure visibility across threads.
+        // This is crucial for spinlock synchronization in SMP mode.
         unsafe {
-            let ptr = self.mem_ptr().add(off) as *mut u64;
-            ptr.write_unaligned(value.to_le());
+            let ptr = self.mem_ptr().add(off) as *const AtomicU64;
+            (*ptr).store(value.to_le(), Ordering::SeqCst);
         }
         Ok(())
     }

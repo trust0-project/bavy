@@ -323,7 +323,7 @@ fn secondary_hart_entry(hart_id: usize) -> ! {
 /// 
 /// Secondary harts wait for work (IPI wakeup), then check for:
 /// 1. Benchmark tasks (high priority, checked first)
-/// 2. Scheduler tasks
+/// 2. Scheduler tasks (including long-running daemons)
 fn secondary_hart_idle(hart_id: usize) -> ! {
     loop {
         // Wait for work via IPI - this is the primary coordination mechanism
@@ -368,16 +368,15 @@ fn secondary_hart_idle(hart_id: usize) -> ! {
                 let start_time = get_time_ms() as u64;
                 
                 // Execute the task's entry point
+                // Note: Daemon tasks have infinite loops and won't return
                 (task.entry)();
                 
-                // Update CPU time
+                // If we get here, the task returned (non-daemon or daemon that exited)
                 let elapsed = (get_time_ms() as u64).saturating_sub(start_time);
                 task.add_cpu_time(elapsed);
                 
-                // Mark task as finished (unless it's a daemon that should restart)
-                if !task.is_daemon {
-                    SCHEDULER.finish_task(task.pid, 0);
-                }
+                // Mark task as finished
+                SCHEDULER.finish_task(task.pid, 0);
             }
         }
     }

@@ -167,22 +167,31 @@ impl Scheduler {
     
     /// Spawn a daemon task (long-running service)
     pub fn spawn_daemon(&self, name: &str, entry: TaskEntry, priority: Priority) -> Pid {
+        self.spawn_daemon_on_hart(name, entry, priority, None)
+    }
+    
+    /// Spawn a daemon task on a specific hart
+    pub fn spawn_daemon_on_hart(
+        &self,
+        name: &str,
+        entry: TaskEntry,
+        priority: Priority,
+        hart_affinity: Option<usize>,
+    ) -> Pid {
         let pid = self.next_pid.fetch_add(1, Ordering::SeqCst) as Pid;
-        let task = Task::new_daemon(pid, name, entry, priority);
+        let mut task = Task::new_daemon(pid, name, entry, priority);
+        task.hart_affinity = hart_affinity;
+        
         let task = Arc::new(task);
         
         self.tasks.lock().insert(pid, task.clone());
         
-        let target_hart = self.find_least_loaded_hart();
+        let target_hart = hart_affinity.unwrap_or_else(|| self.find_least_loaded_hart());
         self.queues[target_hart].lock().enqueue(task);
         
-        crate::klog::klog_info("sched", &alloc::format!(
+        crate::klog::klog_debug("sched", &alloc::format!(
             "Spawned daemon '{}' (PID {}) on hart {}", name, pid, target_hart
         ));
-        
-        if target_hart != 0 {
-            crate::send_ipi(target_hart);
-        }
         
         pid
     }

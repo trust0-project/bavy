@@ -1,0 +1,90 @@
+// /etc/init.d/klogd - Kernel Logger Daemon init script
+// Usage: /etc/init.d/klogd {start|stop|restart|status}
+
+let SERVICE = "klogd";
+
+fn show_usage() {
+    print("Usage: /etc/init.d/" + SERVICE + " {start|stop|restart|status}");
+}
+
+fn do_start() {
+    let status = service_status(SERVICE);
+    if status == "running" {
+        print(SERVICE + " is already running");
+        return;
+    }
+    
+    print("Starting " + SERVICE + "...");
+    if start_service(SERVICE) {
+        print("\x1b[1;32m[OK]\x1b[0m " + SERVICE + " started");
+    } else {
+        print("\x1b[1;31m[FAIL]\x1b[0m Failed to start " + SERVICE);
+    }
+}
+
+fn do_stop() {
+    let status = service_status(SERVICE);
+    if status != "running" {
+        print(SERVICE + " is not running");
+        return;
+    }
+    
+    print("Stopping " + SERVICE + "...");
+    if stop_service(SERVICE) {
+        print("\x1b[1;32m[OK]\x1b[0m " + SERVICE + " stopped");
+    } else {
+        print("\x1b[1;31m[FAIL]\x1b[0m Failed to stop " + SERVICE);
+    }
+}
+
+fn do_restart() {
+    print("Restarting " + SERVICE + "...");
+    if restart_service(SERVICE) {
+        print("\x1b[1;32m[OK]\x1b[0m " + SERVICE + " restarted");
+    } else {
+        print("\x1b[1;31m[FAIL]\x1b[0m Failed to restart " + SERVICE);
+    }
+}
+
+fn do_status() {
+    let status = service_status(SERVICE);
+    let services = services();
+    
+    for svc in services {
+        if svc.name == SERVICE {
+            print("● " + SERVICE + " - Kernel Logger Daemon");
+            if status == "running" {
+                print("   \x1b[1;32mActive: running\x1b[0m");
+                print("   PID: " + svc.pid);
+                print("   Hart: " + svc.hart);
+                print("   Started: " + svc.started_at + "ms ago");
+            } else if status == "stopped" {
+                print("   \x1b[1;31mActive: stopped\x1b[0m");
+            } else {
+                print("   \x1b[1;33mActive: " + status + "\x1b[0m");
+            }
+            return;
+        }
+    }
+    print(SERVICE + ": service not found");
+}
+
+// Main entry point
+if ARGS.len() < 1 {
+    show_usage();
+} else {
+    let cmd = ARGS[0];
+    if cmd == "start" {
+        do_start();
+    } else if cmd == "stop" {
+        do_stop();
+    } else if cmd == "restart" {
+        do_restart();
+    } else if cmd == "status" {
+        do_status();
+    } else {
+        print("Unknown command: " + cmd);
+        show_usage();
+    }
+}
+

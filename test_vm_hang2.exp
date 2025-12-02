@@ -1,0 +1,64 @@
+#!/usr/bin/expect -f
+
+set timeout 180
+
+# Start the VM
+spawn cargo run -p riscv-vm --release -- --kernel target/riscv64gc-unknown-none-elf/release/kernel --disk target/riscv64gc-unknown-none-elf/release/fs.img --harts 4
+
+# Wait for boot to complete
+expect {
+    "BOOT COMPLETE" {
+        puts "\n>>> Boot complete message seen"
+    }
+    timeout {
+        puts "\n>>> TIMEOUT waiting for boot"
+        exit 1
+    }
+}
+
+# Wait for prompt
+sleep 3
+puts ">>> Waiting 30 seconds before testing commands..."
+sleep 30
+
+# Test ls first
+puts ">>> Testing 'ls' command..."
+send "ls\r"
+
+expect {
+    -re "etc/|home/|usr/|var/" {
+        puts "\n>>> 'ls' command worked"
+    }
+    -re "Bavy.*#" {
+        puts "\n>>> Got prompt after ls"
+    }
+    timeout {
+        puts "\n>>> TIMEOUT on 'ls' command - 180 seconds!"
+        exit 2
+    }
+}
+
+sleep 2
+
+# Now test ps with extra long timeout
+puts ">>> Testing 'ps' command (180 second timeout)..."
+send "ps\r"
+
+expect {
+    -re "klogd|sysmond|PID.*STATE" {
+        puts "\n>>> 'ps' command worked!"
+    }
+    -re "Bavy.*#" {
+        puts "\n>>> Got prompt after ps"
+    }
+    timeout {
+        puts "\n>>> CRITICAL: 'ps' command hung for 180 seconds!"
+        exit 3
+    }
+}
+
+puts "\n>>> Test passed - commands work correctly!"
+send "\x03"
+sleep 1
+expect eof
+

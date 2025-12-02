@@ -9,6 +9,18 @@ use crate::decoder::{self, Op, Register};
 use crate::mmu::{self, AccessType as MmuAccessType, Tlb};
 use crate::Trap;
 use std::collections::HashMap;
+use std::sync::Mutex;
+
+/// Global mutex for AMO (Atomic Memory Operations) to ensure atomicity across harts.
+/// 
+/// On real RISC-V hardware, AMO instructions perform read-modify-write atomically.
+/// In our emulator, each hart runs in a separate thread, so we need explicit
+/// synchronization to prevent race conditions.
+/// 
+/// This is a coarse-grained lock - all AMO operations serialize through it.
+/// A finer-grained approach would use per-cache-line locks, but this is simpler
+/// and sufficient for correctness.
+static AMO_LOCK: Mutex<()> = Mutex::new(());
 
 /// Cached decode result.
 /// Stores (pc, raw_instruction, decoded_op) for cache hit checking.
@@ -1066,7 +1078,7 @@ impl Cpu {
                             self.write_reg(rd, 1);
                         }
                     }
-                    // AMO* operations
+                    // AMO* operations - MUST be atomic across all harts
                     0b00001 | // AMOSWAP
                     0b00000 | // AMOADD
                     0b00100 | // AMOXOR
@@ -1079,6 +1091,10 @@ impl Cpu {
                     => {
                         // Any AMO acts like a store to the address, so clear reservation.
                         self.clear_reservation_if_conflict(addr);
+
+                        // Acquire global AMO lock to ensure atomicity across harts.
+                        // This makes the read-modify-write sequence atomic.
+                        let _amo_guard = AMO_LOCK.lock().unwrap();
 
                         let old = if is_word {
                             match bus.read32(pa) {
@@ -1127,6 +1143,10 @@ impl Cpu {
                         } else {
                             bus.write64(pa, new_val)
                         };
+                        
+                        // Lock is released here when _amo_guard goes out of scope
+                        drop(_amo_guard);
+                        
                         if let Err(e) = res {
                             return self.handle_trap(e, pc, Some(insn_raw));
                         }

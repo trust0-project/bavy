@@ -637,7 +637,7 @@ impl ScriptRuntime {
                 .collect()
         });
         
-        // services() -> Array of {name, pid, started_at}
+        // services() -> Array of {name, pid, status, started_at, hart}
         engine.register_fn("services", || -> Array {
             let mut list = Array::new();
             let services = crate::init::list_services();
@@ -645,10 +645,57 @@ impl ScriptRuntime {
                 let mut map = Map::new();
                 map.insert("name".into(), Dynamic::from(svc.name));
                 map.insert("pid".into(), Dynamic::from(svc.pid as i64));
+                map.insert("status".into(), Dynamic::from(svc.status.as_str()));
                 map.insert("started_at".into(), Dynamic::from(svc.started_at as i64));
+                map.insert("hart".into(), Dynamic::from(svc.hart.map(|h| h as i64).unwrap_or(-1)));
                 list.push(Dynamic::from(map));
             }
             list
+        });
+        
+        // service_defs() -> Array of {name, description}
+        engine.register_fn("service_defs", || -> Array {
+            let mut list = Array::new();
+            let defs = crate::init::list_service_defs();
+            for (name, desc) in defs {
+                let mut map = Map::new();
+                map.insert("name".into(), Dynamic::from(name));
+                map.insert("description".into(), Dynamic::from(desc));
+                list.push(Dynamic::from(map));
+            }
+            list
+        });
+        
+        // start_service(name) -> bool
+        engine.register_fn("start_service", |name: ImmutableString| -> bool {
+            match crate::init::start_service(name.as_str()) {
+                Ok(()) => true,
+                Err(_) => false,
+            }
+        });
+        
+        // stop_service(name) -> bool
+        engine.register_fn("stop_service", |name: ImmutableString| -> bool {
+            match crate::init::stop_service(name.as_str()) {
+                Ok(()) => true,
+                Err(_) => false,
+            }
+        });
+        
+        // restart_service(name) -> bool
+        engine.register_fn("restart_service", |name: ImmutableString| -> bool {
+            match crate::init::restart_service(name.as_str()) {
+                Ok(()) => true,
+                Err(_) => false,
+            }
+        });
+        
+        // service_status(name) -> String ("running", "stopped", "failed", or "unknown")
+        engine.register_fn("service_status", |name: ImmutableString| -> ImmutableString {
+            match crate::init::service_status(name.as_str()) {
+                Some(status) => status.as_str().into(),
+                None => "unknown".into(),
+            }
         });
     }
     
