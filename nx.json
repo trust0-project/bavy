@@ -13,11 +13,7 @@
       "specifierSource": "conventional-commits",
       "currentVersionResolver": "git-tag",
       "fallbackCurrentVersionResolver": "disk",
-      "versionActions": "./scripts/release-version-action.js",
-      "git": {
-        "commit": true,
-        "tag": true
-      }
+      "versionActions": "./scripts/release-version-action.js"
     },
     "projectsRelationship": "independent",
     "changelog": {
@@ -28,11 +24,11 @@
         },
         "createRelease": "github"
       },
-      "workspaceChangelog": false,
-      "git": {
-        "commit": false,
-        "tag": false
-      }
+      "workspaceChangelog": false
+    },
+    "git": {
+      "commit": true,
+      "tag": true
     }
   }
 }
