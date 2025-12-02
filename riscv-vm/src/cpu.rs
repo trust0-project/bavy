@@ -1,3 +1,5 @@
+use crate::block::{Block, BlockCompiler, CompileResult, MAX_BLOCK_SIZE};
+use crate::block_cache::BlockCache;
 use crate::bus::Bus;
 use crate::clint::{CLINT_BASE, MTIME_OFFSET};
 use crate::csr::{
@@ -6,6 +8,7 @@ use crate::csr::{
     CSR_SSTATUS, CSR_SIP, CSR_TIME, CSR_MENVCFG, CSR_STIMECMP, CSR_MHARTID,
 };
 use crate::decoder::{self, Op, Register};
+use crate::microop::MicroOp;
 use crate::mmu::{self, AccessType as MmuAccessType, Tlb};
 use crate::Trap;
 use std::collections::HashMap;
@@ -18,6 +21,16 @@ type DecodeCacheEntry = (u64, u32, Op);
 /// Cache size (power of 2 for fast modulo)
 const DECODE_CACHE_SIZE: usize = 256;
 const DECODE_CACHE_MASK: usize = DECODE_CACHE_SIZE - 1;
+
+/// Result of block execution.
+enum BlockExecResult {
+    /// Block completed normally, next PC.
+    Continue(u64),
+    /// Block ended with a trap.
+    Trap { trap: Trap, fault_pc: u64 },
+    /// Block needs to exit to interpreter (CSR, atomic, etc.).
+    Exit { next_pc: u64 },
+}
 
 /// RISC-V CPU core.
 ///
@@ -43,6 +56,10 @@ pub struct Cpu {
     /// Key: pc & DECODE_CACHE_MASK
     /// Value: Some((full_pc, raw_insn, decoded_op)) or None
     decode_cache: [Option<DecodeCacheEntry>; DECODE_CACHE_SIZE],
+    /// Block cache for superblock execution.
+    pub block_cache: BlockCache,
+    /// Enable/disable superblock optimization.
+    pub use_blocks: bool,
 }
 
 impl Cpu {
@@ -70,6 +87,8 @@ impl Cpu {
             tlb: Tlb::new(),
             poll_counter: 0,
             decode_cache: [None; DECODE_CACHE_SIZE],
+            block_cache: BlockCache::new(),
+            use_blocks: false, // Disabled by default; enable for production workloads
         }
     }
 
@@ -122,6 +141,12 @@ impl Cpu {
     /// Invalidate entire decode cache (call on TLB flush, context switch)
     pub fn invalidate_decode_cache(&mut self) {
         self.decode_cache = [None; DECODE_CACHE_SIZE];
+    }
+
+    /// Invalidate block cache on SATP write or SFENCE.VMA
+    pub fn invalidate_blocks(&mut self) {
+        self.block_cache.flush();
+        self.invalidate_decode_cache();
     }
 
     pub fn read_reg(&self, reg: Register) -> u64 {
@@ -390,6 +415,615 @@ impl Cpu {
         }
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // Block Execution Engine
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Result of block execution.
+    /// Continue(next_pc): Block completed normally
+    /// Trap: Block ended with a trap
+    /// Exit: Block needs to exit to interpreter
+    fn execute_block_inner(&mut self, block: &Block, bus: &dyn Bus) -> BlockExecResult {
+        let base_pc = block.start_pc;
+        let len = block.len as usize;
+        // Copy the ops array to avoid borrow issues during execution
+        let ops = block.ops;
+
+        let mut idx = 0usize;
+
+        while idx < len {
+            let op = ops[idx];
+            idx += 1;
+
+            match op {
+                // ═══════════════════════════════════════════════════════════
+                // Fast path: ALU operations (no memory, no traps)
+                // ═══════════════════════════════════════════════════════════
+
+                MicroOp::Addi { rd, rs1, imm } => {
+                    let val = self.regs[rs1 as usize].wrapping_add(imm as u64);
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                MicroOp::Add { rd, rs1, rs2 } => {
+                    let val = self.regs[rs1 as usize].wrapping_add(self.regs[rs2 as usize]);
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                MicroOp::Sub { rd, rs1, rs2 } => {
+                    let val = self.regs[rs1 as usize].wrapping_sub(self.regs[rs2 as usize]);
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                MicroOp::Xori { rd, rs1, imm } => {
+                    let val = self.regs[rs1 as usize] ^ (imm as u64);
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                MicroOp::Ori { rd, rs1, imm } => {
+                    let val = self.regs[rs1 as usize] | (imm as u64);
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                MicroOp::Andi { rd, rs1, imm } => {
+                    let val = self.regs[rs1 as usize] & (imm as u64);
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                MicroOp::Xor { rd, rs1, rs2 } => {
+                    let val = self.regs[rs1 as usize] ^ self.regs[rs2 as usize];
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                MicroOp::Or { rd, rs1, rs2 } => {
+                    let val = self.regs[rs1 as usize] | self.regs[rs2 as usize];
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                MicroOp::And { rd, rs1, rs2 } => {
+                    let val = self.regs[rs1 as usize] & self.regs[rs2 as usize];
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                MicroOp::Slli { rd, rs1, shamt } => {
+                    let val = self.regs[rs1 as usize] << shamt;
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                MicroOp::Srli { rd, rs1, shamt } => {
+                    let val = self.regs[rs1 as usize] >> shamt;
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                MicroOp::Srai { rd, rs1, shamt } => {
+                    let val = ((self.regs[rs1 as usize] as i64) >> shamt) as u64;
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                MicroOp::Sll { rd, rs1, rs2 } => {
+                    let val = self.regs[rs1 as usize] << (self.regs[rs2 as usize] & 0x3F);
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                MicroOp::Srl { rd, rs1, rs2 } => {
+                    let val = self.regs[rs1 as usize] >> (self.regs[rs2 as usize] & 0x3F);
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                MicroOp::Sra { rd, rs1, rs2 } => {
+                    let val = ((self.regs[rs1 as usize] as i64) >> (self.regs[rs2 as usize] & 0x3F)) as u64;
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                MicroOp::Slti { rd, rs1, imm } => {
+                    let val = if (self.regs[rs1 as usize] as i64) < imm { 1 } else { 0 };
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                MicroOp::Sltiu { rd, rs1, imm } => {
+                    let val = if self.regs[rs1 as usize] < (imm as u64) { 1 } else { 0 };
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                MicroOp::Slt { rd, rs1, rs2 } => {
+                    let val = if (self.regs[rs1 as usize] as i64) < (self.regs[rs2 as usize] as i64) { 1 } else { 0 };
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                MicroOp::Sltu { rd, rs1, rs2 } => {
+                    let val = if self.regs[rs1 as usize] < self.regs[rs2 as usize] { 1 } else { 0 };
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                MicroOp::Lui { rd, imm } => {
+                    if rd != 0 { self.regs[rd as usize] = imm as u64; }
+                }
+
+                MicroOp::Auipc { rd, imm, pc_offset } => {
+                    let pc = base_pc.wrapping_add(pc_offset as u64);
+                    let val = pc.wrapping_add(imm as u64);
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                // ═══════════════════════════════════════════════════════════
+                // 32-bit ALU operations
+                // ═══════════════════════════════════════════════════════════
+
+                MicroOp::Addiw { rd, rs1, imm } => {
+                    let val = (self.regs[rs1 as usize].wrapping_add(imm as u64) as i32) as i64 as u64;
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                MicroOp::Addw { rd, rs1, rs2 } => {
+                    let val = (self.regs[rs1 as usize].wrapping_add(self.regs[rs2 as usize]) as i32) as i64 as u64;
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                MicroOp::Subw { rd, rs1, rs2 } => {
+                    let val = (self.regs[rs1 as usize].wrapping_sub(self.regs[rs2 as usize]) as i32) as i64 as u64;
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                MicroOp::Slliw { rd, rs1, shamt } => {
+                    let val = ((self.regs[rs1 as usize] as u32) << shamt) as i32 as i64 as u64;
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                MicroOp::Srliw { rd, rs1, shamt } => {
+                    let val = ((self.regs[rs1 as usize] as u32) >> shamt) as i32 as i64 as u64;
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                MicroOp::Sraiw { rd, rs1, shamt } => {
+                    let val = ((self.regs[rs1 as usize] as i32) >> shamt) as i64 as u64;
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                MicroOp::Sllw { rd, rs1, rs2 } => {
+                    let val = ((self.regs[rs1 as usize] as u32) << (self.regs[rs2 as usize] & 0x1F)) as i32 as i64 as u64;
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                MicroOp::Srlw { rd, rs1, rs2 } => {
+                    let val = ((self.regs[rs1 as usize] as u32) >> (self.regs[rs2 as usize] & 0x1F)) as i32 as i64 as u64;
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                MicroOp::Sraw { rd, rs1, rs2 } => {
+                    let val = ((self.regs[rs1 as usize] as i32) >> (self.regs[rs2 as usize] & 0x1F)) as i64 as u64;
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                // ═══════════════════════════════════════════════════════════
+                // M-extension (Multiply/Divide)
+                // ═══════════════════════════════════════════════════════════
+
+                MicroOp::Mul { rd, rs1, rs2 } => {
+                    let a = self.regs[rs1 as usize] as i64 as i128;
+                    let b = self.regs[rs2 as usize] as i64 as i128;
+                    let val = (a.wrapping_mul(b) as i64) as u64;
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                MicroOp::Mulh { rd, rs1, rs2 } => {
+                    let a = self.regs[rs1 as usize] as i64 as i128;
+                    let b = self.regs[rs2 as usize] as i64 as i128;
+                    let val = ((a.wrapping_mul(b) >> 64) as i64) as u64;
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                MicroOp::Mulhsu { rd, rs1, rs2 } => {
+                    let a = self.regs[rs1 as usize] as i64 as i128;
+                    let b = self.regs[rs2 as usize] as u64 as i128;
+                    let val = ((a.wrapping_mul(b) >> 64) as i64) as u64;
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                MicroOp::Mulhu { rd, rs1, rs2 } => {
+                    let a = self.regs[rs1 as usize] as u128;
+                    let b = self.regs[rs2 as usize] as u128;
+                    let val = (a.wrapping_mul(b) >> 64) as u64;
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                MicroOp::Div { rd, rs1, rs2 } => {
+                    let a = self.regs[rs1 as usize] as i64;
+                    let b = self.regs[rs2 as usize] as i64;
+                    let val = if b == 0 {
+                        -1i64 as u64
+                    } else if a == i64::MIN && b == -1 {
+                        i64::MIN as u64
+                    } else {
+                        (a / b) as u64
+                    };
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                MicroOp::Divu { rd, rs1, rs2 } => {
+                    let a = self.regs[rs1 as usize];
+                    let b = self.regs[rs2 as usize];
+                    let val = if b == 0 { u64::MAX } else { a / b };
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                MicroOp::Rem { rd, rs1, rs2 } => {
+                    let a = self.regs[rs1 as usize] as i64;
+                    let b = self.regs[rs2 as usize] as i64;
+                    let val = if b == 0 {
+                        a as u64
+                    } else if a == i64::MIN && b == -1 {
+                        0
+                    } else {
+                        (a % b) as u64
+                    };
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                MicroOp::Remu { rd, rs1, rs2 } => {
+                    let a = self.regs[rs1 as usize];
+                    let b = self.regs[rs2 as usize];
+                    let val = if b == 0 { a } else { a % b };
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                MicroOp::Mulw { rd, rs1, rs2 } => {
+                    let a = self.regs[rs1 as usize] as i32 as i64;
+                    let b = self.regs[rs2 as usize] as i32 as i64;
+                    let val = (a.wrapping_mul(b) as i32) as i64 as u64;
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                MicroOp::Divw { rd, rs1, rs2 } => {
+                    let a = self.regs[rs1 as usize] as i32;
+                    let b = self.regs[rs2 as usize] as i32;
+                    let val = if b == 0 {
+                        -1i32 as i64 as u64
+                    } else if a == i32::MIN && b == -1 {
+                        i32::MIN as i64 as u64
+                    } else {
+                        (a / b) as i64 as u64
+                    };
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                MicroOp::Divuw { rd, rs1, rs2 } => {
+                    let a = self.regs[rs1 as usize] as u32;
+                    let b = self.regs[rs2 as usize] as u32;
+                    let val = if b == 0 {
+                        u32::MAX as i32 as i64 as u64
+                    } else {
+                        (a / b) as i32 as i64 as u64
+                    };
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                MicroOp::Remw { rd, rs1, rs2 } => {
+                    let a = self.regs[rs1 as usize] as i32;
+                    let b = self.regs[rs2 as usize] as i32;
+                    let val = if b == 0 {
+                        a as i64 as u64
+                    } else if a == i32::MIN && b == -1 {
+                        0
+                    } else {
+                        (a % b) as i64 as u64
+                    };
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                MicroOp::Remuw { rd, rs1, rs2 } => {
+                    let a = self.regs[rs1 as usize] as u32;
+                    let b = self.regs[rs2 as usize] as u32;
+                    let val = if b == 0 {
+                        a as i32 as i64 as u64
+                    } else {
+                        (a % b) as i32 as i64 as u64
+                    };
+                    if rd != 0 { self.regs[rd as usize] = val; }
+                }
+
+                // ═══════════════════════════════════════════════════════════
+                // Load operations (may trap)
+                // ═══════════════════════════════════════════════════════════
+
+                MicroOp::Ld { rd, rs1, imm, pc_offset } => {
+                    let addr = self.regs[rs1 as usize].wrapping_add(imm as u64);
+                    let pc = base_pc.wrapping_add(pc_offset as u64);
+                    let pa = match self.translate_addr_for_block(bus, addr, MmuAccessType::Load) {
+                        Ok(pa) => pa,
+                        Err(trap) => return BlockExecResult::Trap { trap, fault_pc: pc },
+                    };
+                    match bus.read64(pa) {
+                        Ok(val) => if rd != 0 { self.regs[rd as usize] = val; },
+                        Err(trap) => return BlockExecResult::Trap { trap, fault_pc: pc },
+                    }
+                }
+
+                MicroOp::Lw { rd, rs1, imm, pc_offset } => {
+                    let addr = self.regs[rs1 as usize].wrapping_add(imm as u64);
+                    let pc = base_pc.wrapping_add(pc_offset as u64);
+                    let pa = match self.translate_addr_for_block(bus, addr, MmuAccessType::Load) {
+                        Ok(pa) => pa,
+                        Err(trap) => return BlockExecResult::Trap { trap, fault_pc: pc },
+                    };
+                    match bus.read32(pa) {
+                        Ok(val) => if rd != 0 { self.regs[rd as usize] = (val as i32) as i64 as u64; },
+                        Err(trap) => return BlockExecResult::Trap { trap, fault_pc: pc },
+                    }
+                }
+
+                MicroOp::Lwu { rd, rs1, imm, pc_offset } => {
+                    let addr = self.regs[rs1 as usize].wrapping_add(imm as u64);
+                    let pc = base_pc.wrapping_add(pc_offset as u64);
+                    let pa = match self.translate_addr_for_block(bus, addr, MmuAccessType::Load) {
+                        Ok(pa) => pa,
+                        Err(trap) => return BlockExecResult::Trap { trap, fault_pc: pc },
+                    };
+                    match bus.read32(pa) {
+                        Ok(val) => if rd != 0 { self.regs[rd as usize] = val as u64; },
+                        Err(trap) => return BlockExecResult::Trap { trap, fault_pc: pc },
+                    }
+                }
+
+                MicroOp::Lh { rd, rs1, imm, pc_offset } => {
+                    let addr = self.regs[rs1 as usize].wrapping_add(imm as u64);
+                    let pc = base_pc.wrapping_add(pc_offset as u64);
+                    let pa = match self.translate_addr_for_block(bus, addr, MmuAccessType::Load) {
+                        Ok(pa) => pa,
+                        Err(trap) => return BlockExecResult::Trap { trap, fault_pc: pc },
+                    };
+                    match bus.read16(pa) {
+                        Ok(val) => if rd != 0 { self.regs[rd as usize] = (val as i16) as i64 as u64; },
+                        Err(trap) => return BlockExecResult::Trap { trap, fault_pc: pc },
+                    }
+                }
+
+                MicroOp::Lhu { rd, rs1, imm, pc_offset } => {
+                    let addr = self.regs[rs1 as usize].wrapping_add(imm as u64);
+                    let pc = base_pc.wrapping_add(pc_offset as u64);
+                    let pa = match self.translate_addr_for_block(bus, addr, MmuAccessType::Load) {
+                        Ok(pa) => pa,
+                        Err(trap) => return BlockExecResult::Trap { trap, fault_pc: pc },
+                    };
+                    match bus.read16(pa) {
+                        Ok(val) => if rd != 0 { self.regs[rd as usize] = val as u64; },
+                        Err(trap) => return BlockExecResult::Trap { trap, fault_pc: pc },
+                    }
+                }
+
+                MicroOp::Lb { rd, rs1, imm, pc_offset } => {
+                    let addr = self.regs[rs1 as usize].wrapping_add(imm as u64);
+                    let pc = base_pc.wrapping_add(pc_offset as u64);
+                    let pa = match self.translate_addr_for_block(bus, addr, MmuAccessType::Load) {
+                        Ok(pa) => pa,
+                        Err(trap) => return BlockExecResult::Trap { trap, fault_pc: pc },
+                    };
+                    match bus.read8(pa) {
+                        Ok(val) => if rd != 0 { self.regs[rd as usize] = (val as i8) as i64 as u64; },
+                        Err(trap) => return BlockExecResult::Trap { trap, fault_pc: pc },
+                    }
+                }
+
+                MicroOp::Lbu { rd, rs1, imm, pc_offset } => {
+                    let addr = self.regs[rs1 as usize].wrapping_add(imm as u64);
+                    let pc = base_pc.wrapping_add(pc_offset as u64);
+                    let pa = match self.translate_addr_for_block(bus, addr, MmuAccessType::Load) {
+                        Ok(pa) => pa,
+                        Err(trap) => return BlockExecResult::Trap { trap, fault_pc: pc },
+                    };
+                    match bus.read8(pa) {
+                        Ok(val) => if rd != 0 { self.regs[rd as usize] = val as u64; },
+                        Err(trap) => return BlockExecResult::Trap { trap, fault_pc: pc },
+                    }
+                }
+
+                // ═══════════════════════════════════════════════════════════
+                // Store operations (may trap)
+                // ═══════════════════════════════════════════════════════════
+
+                MicroOp::Sd { rs1, rs2, imm, pc_offset } => {
+                    let addr = self.regs[rs1 as usize].wrapping_add(imm as u64);
+                    let val = self.regs[rs2 as usize];
+                    let pc = base_pc.wrapping_add(pc_offset as u64);
+                    let pa = match self.translate_addr_for_block(bus, addr, MmuAccessType::Store) {
+                        Ok(pa) => pa,
+                        Err(trap) => return BlockExecResult::Trap { trap, fault_pc: pc },
+                    };
+                    if let Err(trap) = bus.write64(pa, val) {
+                        return BlockExecResult::Trap { trap, fault_pc: pc };
+                    }
+                    self.clear_reservation_if_conflict(addr);
+                }
+
+                MicroOp::Sw { rs1, rs2, imm, pc_offset } => {
+                    let addr = self.regs[rs1 as usize].wrapping_add(imm as u64);
+                    let val = self.regs[rs2 as usize] as u32;
+                    let pc = base_pc.wrapping_add(pc_offset as u64);
+                    let pa = match self.translate_addr_for_block(bus, addr, MmuAccessType::Store) {
+                        Ok(pa) => pa,
+                        Err(trap) => return BlockExecResult::Trap { trap, fault_pc: pc },
+                    };
+                    if let Err(trap) = bus.write32(pa, val) {
+                        return BlockExecResult::Trap { trap, fault_pc: pc };
+                    }
+                    self.clear_reservation_if_conflict(addr);
+                }
+
+                MicroOp::Sh { rs1, rs2, imm, pc_offset } => {
+                    let addr = self.regs[rs1 as usize].wrapping_add(imm as u64);
+                    let val = self.regs[rs2 as usize] as u16;
+                    let pc = base_pc.wrapping_add(pc_offset as u64);
+                    let pa = match self.translate_addr_for_block(bus, addr, MmuAccessType::Store) {
+                        Ok(pa) => pa,
+                        Err(trap) => return BlockExecResult::Trap { trap, fault_pc: pc },
+                    };
+                    if let Err(trap) = bus.write16(pa, val) {
+                        return BlockExecResult::Trap { trap, fault_pc: pc };
+                    }
+                    self.clear_reservation_if_conflict(addr);
+                }
+
+                MicroOp::Sb { rs1, rs2, imm, pc_offset } => {
+                    let addr = self.regs[rs1 as usize].wrapping_add(imm as u64);
+                    let val = self.regs[rs2 as usize] as u8;
+                    let pc = base_pc.wrapping_add(pc_offset as u64);
+                    let pa = match self.translate_addr_for_block(bus, addr, MmuAccessType::Store) {
+                        Ok(pa) => pa,
+                        Err(trap) => return BlockExecResult::Trap { trap, fault_pc: pc },
+                    };
+                    if let Err(trap) = bus.write8(pa, val) {
+                        return BlockExecResult::Trap { trap, fault_pc: pc };
+                    }
+                    self.clear_reservation_if_conflict(addr);
+                }
+
+                // ═══════════════════════════════════════════════════════════
+                // Control flow (block terminators)
+                // ═══════════════════════════════════════════════════════════
+
+                MicroOp::Jal { rd, imm, pc_offset, insn_len } => {
+                    let pc = base_pc.wrapping_add(pc_offset as u64);
+                    let link = pc.wrapping_add(insn_len as u64);
+                    if rd != 0 { self.regs[rd as usize] = link; }
+                    let next_pc = pc.wrapping_add(imm as u64);
+                    return BlockExecResult::Continue(next_pc);
+                }
+
+                MicroOp::Jalr { rd, rs1, imm, pc_offset, insn_len } => {
+                    let pc = base_pc.wrapping_add(pc_offset as u64);
+                    let link = pc.wrapping_add(insn_len as u64);
+                    let target = (self.regs[rs1 as usize].wrapping_add(imm as u64)) & !1;
+                    if rd != 0 { self.regs[rd as usize] = link; }
+                    return BlockExecResult::Continue(target);
+                }
+
+                MicroOp::Beq { rs1, rs2, imm, pc_offset, insn_len } => {
+                    let pc = base_pc.wrapping_add(pc_offset as u64);
+                    let next = if self.regs[rs1 as usize] == self.regs[rs2 as usize] {
+                        pc.wrapping_add(imm as u64)
+                    } else {
+                        pc.wrapping_add(insn_len as u64)
+                    };
+                    return BlockExecResult::Continue(next);
+                }
+
+                MicroOp::Bne { rs1, rs2, imm, pc_offset, insn_len } => {
+                    let pc = base_pc.wrapping_add(pc_offset as u64);
+                    let next = if self.regs[rs1 as usize] != self.regs[rs2 as usize] {
+                        pc.wrapping_add(imm as u64)
+                    } else {
+                        pc.wrapping_add(insn_len as u64)
+                    };
+                    return BlockExecResult::Continue(next);
+                }
+
+                MicroOp::Blt { rs1, rs2, imm, pc_offset, insn_len } => {
+                    let pc = base_pc.wrapping_add(pc_offset as u64);
+                    let taken = (self.regs[rs1 as usize] as i64) < (self.regs[rs2 as usize] as i64);
+                    let next = if taken { pc.wrapping_add(imm as u64) } else { pc.wrapping_add(insn_len as u64) };
+                    return BlockExecResult::Continue(next);
+                }
+
+                MicroOp::Bge { rs1, rs2, imm, pc_offset, insn_len } => {
+                    let pc = base_pc.wrapping_add(pc_offset as u64);
+                    let taken = (self.regs[rs1 as usize] as i64) >= (self.regs[rs2 as usize] as i64);
+                    let next = if taken { pc.wrapping_add(imm as u64) } else { pc.wrapping_add(insn_len as u64) };
+                    return BlockExecResult::Continue(next);
+                }
+
+                MicroOp::Bltu { rs1, rs2, imm, pc_offset, insn_len } => {
+                    let pc = base_pc.wrapping_add(pc_offset as u64);
+                    let taken = self.regs[rs1 as usize] < self.regs[rs2 as usize];
+                    let next = if taken { pc.wrapping_add(imm as u64) } else { pc.wrapping_add(insn_len as u64) };
+                    return BlockExecResult::Continue(next);
+                }
+
+                MicroOp::Bgeu { rs1, rs2, imm, pc_offset, insn_len } => {
+                    let pc = base_pc.wrapping_add(pc_offset as u64);
+                    let taken = self.regs[rs1 as usize] >= self.regs[rs2 as usize];
+                    let next = if taken { pc.wrapping_add(imm as u64) } else { pc.wrapping_add(insn_len as u64) };
+                    return BlockExecResult::Continue(next);
+                }
+
+                // ═══════════════════════════════════════════════════════════
+                // System operations (exit to interpreter)
+                // ═══════════════════════════════════════════════════════════
+
+                MicroOp::Ecall { pc_offset }
+                | MicroOp::Ebreak { pc_offset }
+                | MicroOp::Mret { pc_offset }
+                | MicroOp::Sret { pc_offset }
+                | MicroOp::SfenceVma { pc_offset }
+                | MicroOp::Csrrw { pc_offset, .. }
+                | MicroOp::Csrrs { pc_offset, .. }
+                | MicroOp::Csrrc { pc_offset, .. }
+                | MicroOp::Csrrwi { pc_offset, .. }
+                | MicroOp::Csrrsi { pc_offset, .. }
+                | MicroOp::Csrrci { pc_offset, .. }
+                | MicroOp::LrW { pc_offset, .. }
+                | MicroOp::LrD { pc_offset, .. }
+                | MicroOp::ScW { pc_offset, .. }
+                | MicroOp::ScD { pc_offset, .. }
+                | MicroOp::AmoSwap { pc_offset, .. }
+                | MicroOp::AmoAdd { pc_offset, .. }
+                | MicroOp::AmoXor { pc_offset, .. }
+                | MicroOp::AmoAnd { pc_offset, .. }
+                | MicroOp::AmoOr { pc_offset, .. }
+                | MicroOp::AmoMin { pc_offset, .. }
+                | MicroOp::AmoMax { pc_offset, .. }
+                | MicroOp::AmoMinu { pc_offset, .. }
+                | MicroOp::AmoMaxu { pc_offset, .. } => {
+                    let pc = base_pc.wrapping_add(pc_offset as u64);
+                    return BlockExecResult::Exit { next_pc: pc };
+                }
+
+                MicroOp::Wfi { pc_offset: _ } => {
+                    // WFI: spin briefly and continue
+                    for _ in 0..10 {
+                        std::hint::spin_loop();
+                    }
+                    // Continue to next instruction in block
+                }
+
+                MicroOp::Fence => {
+                    // No-op in our memory model
+                }
+            }
+        }
+
+        // Block ended without terminator (shouldn't happen with valid compilation)
+        BlockExecResult::Continue(base_pc.wrapping_add(block.byte_len as u64))
+    }
+
+    /// Translate address without entering trap handler (for block execution)
+    fn translate_addr_for_block(
+        &mut self,
+        bus: &dyn Bus,
+        vaddr: u64,
+        access: MmuAccessType,
+    ) -> Result<u64, Trap> {
+        let satp = self.csrs[CSR_SATP as usize];
+        let mstatus = self.csrs[CSR_MSTATUS as usize];
+        mmu::translate(bus, &mut self.tlb, self.mode, satp, mstatus, vaddr, access)
+    }
+
+    /// Handle block execution result and return to normal step() flow
+    fn handle_block_result(&mut self, result: BlockExecResult, bus: &dyn Bus) -> Result<(), Trap> {
+        match result {
+            BlockExecResult::Continue(next_pc) => {
+                self.pc = next_pc;
+                Ok(())
+            }
+            BlockExecResult::Trap { trap, fault_pc } => {
+                self.handle_trap(trap, fault_pc, None)
+            }
+            BlockExecResult::Exit { next_pc } => {
+                // Re-run current instruction with interpreter
+                self.pc = next_pc;
+                self.step_single(bus)
+            }
+        }
+    }
+
     #[inline]
     fn fetch_and_expand(&mut self, bus: &dyn Bus) -> Result<(u32, u8), Trap> {
         let pc = self.pc;
@@ -508,28 +1142,28 @@ impl Cpu {
         None
     }
 
-    /// Execute one instruction.
+    /// Execute one instruction using superblock execution if available.
+    ///
+    /// This is the main entry point for instruction execution. It first tries
+    /// to execute a compiled block, and falls back to single-step interpretation
+    /// if no block is available or block execution is disabled.
     ///
     /// Takes shared reference to bus; the bus uses interior mutability
     /// for any state changes.
     pub fn step(&mut self, bus: &dyn Bus) -> Result<(), Trap> {
         // Batch interrupt polling: only check every 256 instructions for performance.
-        // This significantly reduces overhead while maintaining responsiveness.
         self.poll_counter = self.poll_counter.wrapping_add(1);
         
         if self.poll_counter == 0 {
             // Poll device-driven interrupts into MIP mask.
-            // Each hart must check its own interrupts to receive IPIs correctly.
             let hart_id = self.csrs[CSR_MHARTID as usize] as usize;
             let mut hw_mip = bus.poll_interrupts_for_hart(hart_id);
 
             // Sstc support: raise STIP (bit 5) when time >= stimecmp and Sstc enabled.
-            // menvcfg[63] gate is optional; xv6 enables it.
             let menvcfg = self.csrs[CSR_MENVCFG as usize];
             let sstc_enabled = ((menvcfg >> 63) & 1) == 1;
             let stimecmp = self.csrs[CSR_STIMECMP as usize];
             if sstc_enabled && stimecmp != 0 {
-                // Read CLINT MTIME directly (physical address).
                 if let Ok(now) = bus.read64(CLINT_BASE + MTIME_OFFSET) {
                     if now >= stimecmp {
                         hw_mip |= 1 << 5; // STIP
@@ -537,13 +1171,9 @@ impl Cpu {
                 }
             }
 
-            // Update MIP: preserve software-writable bits (SSIP=bit1, STIP=bit5 if not Sstc),
-            // but always update hardware-driven bits (MSIP=3, MTIP=7, SEIP=9, MEIP=11).
-            // SSIP (bit 1) is software-writable and should be preserved.
-            // STIP (bit 5) is normally read-only but Sstc makes it hardware-driven.
-            let hw_bits: u64 = (1 << 3) | (1 << 7) | (1 << 9) | (1 << 11); // MSIP, MTIP, SEIP, MEIP
-            let hw_bits_with_stip: u64 = hw_bits | (1 << 5); // Include STIP when Sstc enabled
-            
+            // Update MIP
+            let hw_bits: u64 = (1 << 3) | (1 << 7) | (1 << 9) | (1 << 11);
+            let hw_bits_with_stip: u64 = hw_bits | (1 << 5);
             let mask = if sstc_enabled { hw_bits_with_stip } else { hw_bits };
             let old_mip = self.csrs[CSR_MIP as usize];
             self.csrs[CSR_MIP as usize] = (old_mip & !mask) | (hw_mip & mask);
@@ -553,6 +1183,134 @@ impl Cpu {
             }
         }
 
+        // Try superblock execution if enabled
+        if self.use_blocks {
+            if let Some(result) = self.try_execute_block(bus) {
+                return result;
+            }
+        }
+
+        // Fallback to single-step interpretation
+        self.step_single_inner(bus)
+    }
+
+    /// Try to execute a compiled block at current PC.
+    /// Returns Some(result) if block was executed, None if should fall back to interpreter.
+    fn try_execute_block(&mut self, bus: &dyn Bus) -> Option<Result<(), Trap>> {
+        let pc = self.pc;
+
+        // Check block cache for existing block
+        if let Some(block) = self.block_cache.get(pc) {
+            // Clone needed values to avoid borrow issues
+            let block_start_pc = block.start_pc;
+            let block_len = block.len;
+            let block_byte_len = block.byte_len;
+            let block_ops: [MicroOp; MAX_BLOCK_SIZE] = block.ops;
+            
+            // Create a temporary block for execution
+            let exec_block = Block {
+                start_pc: block_start_pc,
+                start_pa: block.start_pa,
+                len: block_len,
+                byte_len: block_byte_len,
+                ops: block_ops,
+                exec_count: 0,
+                generation: block.generation,
+            };
+
+            // Execute the block
+            let result = self.execute_block_inner(&exec_block, bus);
+
+            // Update execution count
+            if let Some(cached_block) = self.block_cache.get_mut(pc) {
+                cached_block.exec_count = cached_block.exec_count.saturating_add(1);
+            }
+
+            return Some(self.handle_block_result(result, bus));
+        }
+
+        // Try to compile a new block
+        let generation = self.block_cache.generation;
+        let satp = self.csrs[CSR_SATP as usize];
+        let mstatus = self.csrs[CSR_MSTATUS as usize];
+        
+        let compile_result = {
+            let mut compiler = BlockCompiler {
+                bus,
+                satp,
+                mstatus,
+                mode: self.mode,
+                tlb: &mut self.tlb,
+            };
+            compiler.compile(pc, generation)
+        };
+
+        match compile_result {
+            CompileResult::Ok(block) => {
+                // Clone needed values before inserting
+                let exec_block = Block {
+                    start_pc: block.start_pc,
+                    start_pa: block.start_pa,
+                    len: block.len,
+                    byte_len: block.byte_len,
+                    ops: block.ops,
+                    exec_count: 0,
+                    generation: block.generation,
+                };
+
+                // Insert into cache
+                self.block_cache.insert(block);
+
+                // Execute the block
+                let result = self.execute_block_inner(&exec_block, bus);
+                Some(self.handle_block_result(result, bus))
+            }
+            CompileResult::Trap(trap) => {
+                Some(self.handle_trap(trap, pc, None))
+            }
+            CompileResult::Unsuitable => {
+                // Fall through to single-step
+                None
+            }
+        }
+    }
+
+    /// Execute a single instruction (interpreter mode).
+    /// This is the original step() implementation without the interrupt check.
+    fn step_single(&mut self, bus: &dyn Bus) -> Result<(), Trap> {
+        // Check interrupts (needed when called from block exit)
+        self.poll_counter = self.poll_counter.wrapping_add(1);
+        if self.poll_counter == 0 {
+            let hart_id = self.csrs[CSR_MHARTID as usize] as usize;
+            let mut hw_mip = bus.poll_interrupts_for_hart(hart_id);
+            
+            let menvcfg = self.csrs[CSR_MENVCFG as usize];
+            let sstc_enabled = ((menvcfg >> 63) & 1) == 1;
+            let stimecmp = self.csrs[CSR_STIMECMP as usize];
+            if sstc_enabled && stimecmp != 0 {
+                if let Ok(now) = bus.read64(CLINT_BASE + MTIME_OFFSET) {
+                    if now >= stimecmp {
+                        hw_mip |= 1 << 5;
+                    }
+                }
+            }
+
+            let hw_bits: u64 = (1 << 3) | (1 << 7) | (1 << 9) | (1 << 11);
+            let hw_bits_with_stip: u64 = hw_bits | (1 << 5);
+            let mask = if sstc_enabled { hw_bits_with_stip } else { hw_bits };
+            let old_mip = self.csrs[CSR_MIP as usize];
+            self.csrs[CSR_MIP as usize] = (old_mip & !mask) | (hw_mip & mask);
+            
+            if let Some(trap) = self.check_pending_interrupt() {
+                return self.handle_trap(trap, self.pc, None);
+            }
+        }
+        
+        self.step_single_inner(bus)
+    }
+
+    /// Inner implementation of single-step execution (no interrupt check).
+    fn step_single_inner(&mut self, bus: &dyn Bus) -> Result<(), Trap> {
         let pc = self.pc;
         // Fetch (supports compressed 16-bit and regular 32-bit instructions)
         let (insn_raw, insn_len) = self.fetch_and_expand(bus)?;
