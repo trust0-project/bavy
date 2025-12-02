@@ -11,9 +11,14 @@ pub mod net;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod net_async;
 pub mod net_webtransport;
+pub mod net_external;
 pub mod virtio;
 pub mod emulator;
 pub mod shared_mem;
+
+// Node.js native addon bindings (napi-rs)
+#[cfg(all(feature = "napi", not(target_arch = "wasm32")))]
+pub mod napi_bindings;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod console;
@@ -138,6 +143,8 @@ pub struct WasmVm {
     boot_steps: u64,
     /// Whether workers have been signaled to start
     workers_signaled: bool,
+    /// External network backend for Node.js native addon bridging
+    external_net: Option<std::sync::Arc<net_external::ExternalNetworkBackend>>,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -266,6 +273,7 @@ impl WasmVm {
             entry_pc,
             boot_steps: 0,
             workers_signaled: false,
+            external_net: None,
         })
     }
 
@@ -303,6 +311,134 @@ impl WasmVm {
         // Remove VirtioNet devices (device_id == 1)
         self.bus.virtio_devices.retain(|dev| dev.device_id() != 1);
         self.net_status = NetworkStatus::Disconnected;
+        self.external_net = None;
+    }
+    
+    // ========================================================================
+    // External Network Backend (for Node.js native addon bridging)
+    // ========================================================================
+    
+    /// Set up an external network backend for packet bridging.
+    /// This is used by the Node.js CLI to bridge packets between the native
+    /// WebTransport addon and the WASM VM.
+    /// 
+    /// @param mac_bytes - MAC address as 6 bytes [0x52, 0x54, 0x00, 0x12, 0x34, 0x56]
+    pub fn setup_external_network(&mut self, mac_bytes: js_sys::Uint8Array) -> Result<(), JsValue> {
+        use crate::net_external::{ExternalNetworkBackend, ExternalBackendWrapper};
+        use crate::virtio::VirtioNet;
+        use std::sync::Arc;
+        
+        // Parse MAC address
+        let mac_vec = mac_bytes.to_vec();
+        if mac_vec.len() != 6 {
+            return Err(JsValue::from_str("MAC address must be 6 bytes"));
+        }
+        let mut mac = [0u8; 6];
+        mac.copy_from_slice(&mac_vec);
+        
+        // Create external backend
+        let backend = Arc::new(ExternalNetworkBackend::new(mac));
+        self.external_net = Some(backend.clone());
+        
+        // Create a wrapper that implements NetworkBackend
+        let wrapper = ExternalBackendWrapper { inner: backend };
+        
+        // Create VirtIO network device
+        let vnet = VirtioNet::new(Box::new(wrapper));
+        self.bus.virtio_devices.push(Box::new(vnet));
+        
+        self.net_status = NetworkStatus::Connecting;
+        
+        // Log to console (works in both browser and Node.js with WASM)
+        let msg = format!("[VM] External network setup, MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&msg));
+        
+        Ok(())
+    }
+    
+    /// Inject a network packet to be received by the guest.
+    /// Called from JavaScript when the native WebTransport addon receives a packet.
+    pub fn inject_network_packet(&self, packet: js_sys::Uint8Array) -> bool {
+        if let Some(ref backend) = self.external_net {
+            backend.inject_rx_packet(packet.to_vec());
+            true
+        } else {
+            false
+        }
+    }
+    
+    /// Extract a network packet sent by the guest.
+    /// Returns the packet data or null if no packet is pending.
+    pub fn extract_network_packet(&self) -> Option<js_sys::Uint8Array> {
+        if let Some(ref backend) = self.external_net {
+            backend.extract_tx_packet().map(|p| {
+                let arr = js_sys::Uint8Array::new_with_length(p.len() as u32);
+                arr.copy_from(&p);
+                arr
+            })
+        } else {
+            None
+        }
+    }
+    
+    /// Extract all pending network packets sent by the guest.
+    /// Returns an array of packet data.
+    pub fn extract_all_network_packets(&self) -> js_sys::Array {
+        let arr = js_sys::Array::new();
+        if let Some(ref backend) = self.external_net {
+            for p in backend.extract_all_tx_packets() {
+                let uint8 = js_sys::Uint8Array::new_with_length(p.len() as u32);
+                uint8.copy_from(&p);
+                arr.push(&uint8);
+            }
+        }
+        arr
+    }
+    
+    /// Set the assigned IP address for the external network.
+    /// Called when the native WebTransport addon receives an IP assignment.
+    pub fn set_external_network_ip(&self, ip_bytes: js_sys::Uint8Array) -> bool {
+        let ip_vec = ip_bytes.to_vec();
+        if ip_vec.len() != 4 {
+            return false;
+        }
+        if let Some(ref backend) = self.external_net {
+            let mut ip = [0u8; 4];
+            ip.copy_from_slice(&ip_vec);
+            backend.set_assigned_ip(ip);
+            backend.set_connected(true);
+            true
+        } else {
+            false
+        }
+    }
+    
+    /// Check if external network is connected (has IP assigned).
+    pub fn is_external_network_connected(&self) -> bool {
+        if let Some(ref backend) = self.external_net {
+            backend.is_connected()
+        } else {
+            false
+        }
+    }
+    
+    /// Get the number of pending RX packets.
+    pub fn external_network_rx_pending(&self) -> usize {
+        if let Some(ref backend) = self.external_net {
+            backend.rx_queue_len()
+        } else {
+            0
+        }
+    }
+    
+    /// Get the number of pending TX packets.
+    pub fn external_network_tx_pending(&self) -> usize {
+        if let Some(ref backend) = self.external_net {
+            backend.tx_queue_len()
+        } else {
+            0
+        }
     }
     
     /// Get the current network connection status.

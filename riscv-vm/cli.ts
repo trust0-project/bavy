@@ -24,6 +24,32 @@ const DEFAULT_CERT_HASH =
   process.env.RELAY_CERT_HASH || '';
 
 /**
+ * Try to load the native WebTransport addon.
+ * Returns the WebTransportClient class if available, null otherwise.
+ */
+async function loadNativeWebTransport(): Promise<any | null> {
+  // Try to load from the native directory (built with npm run build:native)
+  // ESM requires explicit file path, not directory imports
+  const addonPath = path.resolve(__dirname, '..', 'native', 'index.js');
+  
+  try {
+    const addon = await import(addonPath);
+    if (addon.WebTransportClient) {
+      console.error('[CLI] Native WebTransport addon loaded');
+      return addon.WebTransportClient;
+    }
+    console.error('[CLI] Native addon loaded but WebTransportClient not found');
+  } catch (e: any) {
+    // Not available - likely not built yet
+    console.error('[CLI] Native WebTransport addon not available');
+    console.error(`[CLI] Tried to load from: ${addonPath}`);
+    console.error(`[CLI] Error: ${e.message || e}`);
+    console.error('[CLI] Build it with: cd riscv-vm && npm run build:native');
+  }
+  return null;
+}
+
+/**
  * Create and initialize a Wasm VM instance, mirroring the native VM:
  * - initializes the WASM module once via `WasmInternal`
  * - constructs `WasmVm` with the kernel bytes
@@ -94,30 +120,40 @@ async function createVm(
     }
   }
 
-  // Network setup via WebTransport (matching native --net-webtransport)
+  // Network setup via native WebTransport addon (Node.js)
+  let nativeNetClient: any = null;
   if (options?.netWebtransport) {
     const relayUrl = options.netWebtransport;
     const certHash = options.certHash || DEFAULT_CERT_HASH || undefined;
-
-    try {
-      if (typeof vm.connect_webtransport === 'function') {
-        vm.connect_webtransport(relayUrl, certHash);
-        if (options?.debug) {
-          console.error(
-            `[Network] Initiating WebTransport connection to ${relayUrl}`,
-          );
-        }
+    
+    // Try to use native WebTransport addon
+    const WebTransportClient = await loadNativeWebTransport();
+    
+    if (WebTransportClient) {
+      // Use native addon for WebTransport
+      nativeNetClient = new WebTransportClient(relayUrl, certHash);
+      
+      // Get MAC address from native client and set up external network
+      const macBytes = nativeNetClient.macBytes();
+      if (typeof vm.setup_external_network === 'function') {
+        vm.setup_external_network(new Uint8Array(macBytes));
+        console.error(`[Network] External network setup with native WebTransport`);
+        console.error(`[Network] MAC: ${nativeNetClient.macAddress()}`);
+        console.error(`[Network] Connecting to ${relayUrl}...`);
       } else {
-        console.error(
-          '[Network] No network methods available on VM (rebuild WASM with networking)',
-        );
+        console.error('[Network] VM does not support external network (rebuild WASM)');
+        nativeNetClient.shutdown();
+        nativeNetClient = null;
       }
-    } catch (err) {
-      console.error('[Network] Pre-boot connection failed:', err);
+    } else {
+      // Fall back to WASM WebTransport (won't work in Node.js but try anyway)
+      console.error('[Network] Warning: Native WebTransport addon not available');
+      console.error('[Network] WebTransport requires the native addon in Node.js');
+      console.error('[Network] Build the addon with: cd riscv-vm && npm run build:native');
     }
   }
 
-  return vm;
+  return { vm, nativeNetClient };
 }
 
 /**
@@ -125,13 +161,20 @@ async function createVm(
  * - executes a fixed number of instructions per tick
  * - drains the UART output buffer and writes to stdout
  * - feeds raw stdin bytes into the VM's UART input
+ * - bridges packets between native WebTransport addon and VM
  */
-function runVmLoop(vm: any) {
+function runVmLoop(vm: any, nativeNetClient: any | null) {
   let running = true;
+  let networkConnected = false;
 
   const shutdown = (code: number) => {
     if (!running) return;
     running = false;
+
+    // Shutdown native network client
+    if (nativeNetClient) {
+      nativeNetClient.shutdown();
+    }
 
     if (process.stdin.isTTY && (process.stdin as any).setRawMode) {
       (process.stdin as any).setRawMode(false);
@@ -207,6 +250,44 @@ function runVmLoop(vm: any) {
     }
   };
 
+  // Bridge packets between native WebTransport and VM
+  const bridgeNetwork = () => {
+    if (!nativeNetClient) return;
+    
+    // Check connection status
+    if (!networkConnected && nativeNetClient.isRegistered()) {
+      networkConnected = true;
+      const ip = nativeNetClient.assignedIp();
+      console.error(`\r\n[Network] Connected! IP: ${ip}`);
+      
+      // Set IP in VM's external network backend
+      const ipBytes = nativeNetClient.assignedIpBytes();
+      if (ipBytes && typeof vm.set_external_network_ip === 'function') {
+        vm.set_external_network_ip(new Uint8Array(ipBytes));
+      }
+    }
+    
+    // Forward packets from native client to VM (RX)
+    let packet = nativeNetClient.recv();
+    while (packet) {
+      if (typeof vm.inject_network_packet === 'function') {
+        // Convert Buffer to Uint8Array for WASM
+        vm.inject_network_packet(new Uint8Array(packet));
+      }
+      packet = nativeNetClient.recv();
+    }
+    
+    // Forward packets from VM to native client (TX)
+    if (typeof vm.extract_network_packet === 'function') {
+      let txPacket = vm.extract_network_packet();
+      while (txPacket) {
+        // txPacket is Uint8Array from WASM, convert to Buffer for native addon
+        nativeNetClient.send(Buffer.from(txPacket));
+        txPacket = vm.extract_network_packet();
+      }
+    }
+  };
+
   const loop = () => {
     if (!running) return;
 
@@ -218,6 +299,9 @@ function runVmLoop(vm: any) {
 
       // Drain output
       drainOutput();
+      
+      // Bridge network packets
+      bridgeNetwork();
 
       // Check if VM has halted (e.g., shutdown command)
       if (typeof vm.is_halted === 'function' && vm.is_halted()) {
@@ -316,14 +400,14 @@ const argv = (yargs(hideBin(process.argv)) as any)
   printBanner(kernelPath, numHarts, netWebtransport);
 
   try {
-    const vm = await createVm(kernelPath, {
+    const { vm, nativeNetClient } = await createVm(kernelPath, {
       disk: diskPath,
       harts: hartsArg, // Pass the requested value so createVm can warn if > 1
       netWebtransport,
       certHash,
       debug,
     });
-    runVmLoop(vm);
+    runVmLoop(vm, nativeNetClient);
   } catch (err) {
     console.error('[CLI] Failed to start VM:', err);
     process.exit(1);

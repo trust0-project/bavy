@@ -8,15 +8,19 @@ on:
       - "**/*.md"
 
 permissions:
-  contents: write # to push tags and create releases
+  contents: write
   issues: write
   pull-requests: write
-  id-token: write # for npm trusted publishing
+  id-token: write
 
 jobs:
-  release:
-    name: Trigger Release
+  # First, determine if riscv-vm needs releasing and do versioning
+  version:
+    name: Version & Release
     runs-on: ubuntu-latest
+    outputs:
+      riscv-vm-released: ${{ steps.check-release.outputs.riscv-vm-released }}
+      riscv-vm-version: ${{ steps.check-release.outputs.riscv-vm-version }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -25,13 +29,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: "npm"
+          cache: "yarn"
           registry-url: "https://registry.npmjs.org"
           always-auth: true
 
       - name: Configure npm authentication
-        # Configure npm authentication using token if available
-        # For trusted publishing with --provenance, npm can use OIDC automatically
         run: |
           if [ -n "${{ secrets.NPM_TOKEN }}" ]; then
             echo "//registry.npmjs.org/:_authToken=${{ secrets.NPM_TOKEN }}" >> ~/.npmrc
@@ -48,10 +50,187 @@ jobs:
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
 
-      - name: Run Nx Release
+      - name: Get version before release
+        id: before
+        run: echo "version=$(node -p "require('./riscv-vm/package.json').version")" >> $GITHUB_OUTPUT
+
+      - name: Run Nx Release (version only, skip publish)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx nx release --yes --skip-publish
+
+      - name: Get version after release
+        id: after
+        run: echo "version=$(node -p "require('./riscv-vm/package.json').version")" >> $GITHUB_OUTPUT
+
+      - name: Check if riscv-vm was released
+        id: check-release
+        run: |
+          if [ "${{ steps.before.outputs.version }}" != "${{ steps.after.outputs.version }}" ]; then
+            echo "riscv-vm-released=true" >> $GITHUB_OUTPUT
+            echo "riscv-vm-version=${{ steps.after.outputs.version }}" >> $GITHUB_OUTPUT
+            echo "riscv-vm version changed: ${{ steps.before.outputs.version }} -> ${{ steps.after.outputs.version }}"
+          else
+            echo "riscv-vm-released=false" >> $GITHUB_OUTPUT
+            echo "riscv-vm version unchanged"
+          fi
+
+  # Build native bindings for all platforms (only if riscv-vm is being released)
+  build-native:
+    name: Build Native ${{ matrix.target }}
+    needs: version
+    if: needs.version.outputs.riscv-vm-released == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            node_file: riscv-vm-native.darwin-x64.node
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            node_file: riscv-vm-native.darwin-arm64.node
+
+          # Linux (glibc)
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            node_file: riscv-vm-native.linux-x64-gnu.node
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            node_file: riscv-vm-native.linux-arm64-gnu.node
+            use_cross: true
+
+          # Linux (musl)
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            node_file: riscv-vm-native.linux-x64-musl.node
+            use_cross: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            node_file: riscv-vm-native.linux-arm64-musl.node
+            use_cross: true
+
+          # Windows
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            node_file: riscv-vm-native.win32-x64-msvc.node
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      # Pull latest changes (version bump from previous job)
+      - name: Pull latest changes
+        run: git pull origin main
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Setup Zig (for cross-compilation)
+        if: matrix.use_cross
+        uses: goto-bus-stop/setup-zig@v2
+
+      - name: Install dependencies
+        run: corepack enable && yarn install
+        working-directory: riscv-vm
+
+      - name: Build native binding (standard)
+        if: "!matrix.use_cross"
+        run: yarn build:native --target ${{ matrix.target }}
+        working-directory: riscv-vm
+
+      - name: Build native binding (cross with zig)
+        if: matrix.use_cross
+        run: yarn build:native --target ${{ matrix.target }} --zig
+        working-directory: riscv-vm
+
+      - name: Rename artifact (if needed)
+        run: |
+          cd native
+          # NAPI-RS generates files with target triple, rename to our convention
+          for f in *.node; do
+            if [[ "$f" != "${{ matrix.node_file }}" ]]; then
+              mv "$f" "${{ matrix.node_file }}" 2>/dev/null || true
+            fi
+          done
+        working-directory: riscv-vm
+        shell: bash
+
+      - name: Upload native binding
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.target }}
+          path: riscv-vm/native/${{ matrix.node_file }}
+          if-no-files-found: error
+
+  # Publish to npm with all native bindings
+  publish:
+    name: Publish npm package
+    needs: [version, build-native]
+    if: needs.version.outputs.riscv-vm-released == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Pull latest changes
+        run: git pull origin main
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Setup Rust (for WASM build)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Download all native bindings
+        uses: actions/download-artifact@v4
+        with:
+          path: riscv-vm/native
+          pattern: native-*
+          merge-multiple: true
+
+      - name: List native bindings
+        run: ls -la native/
+        working-directory: riscv-vm
+
+      - name: Install dependencies
+        run: corepack enable && yarn install
+        working-directory: riscv-vm
+
+      - name: Build package (WASM + TypeScript)
+        run: yarn build
+        working-directory: riscv-vm
+
+      - name: Verify package contents
+        run: |
+          echo "=== Package files ==="
+          npm pack --dry-run
+        working-directory: riscv-vm
+
+      - name: Publish to npm
+        run: npm publish --access public --provenance
+        working-directory: riscv-vm
+        env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           NPM_CONFIG_PROVENANCE: true
-        run: npx nx release --yes
