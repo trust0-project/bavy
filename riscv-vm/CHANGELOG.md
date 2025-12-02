@@ -1,3 +1,13 @@
+## 0.0.36 (2025-12-02)
+
+### 🩹 Fixes
+
+- reset npm ignore files to include .node binaries Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([d8df737](https://github.com/elribonazo/riscv-vm/commit/d8df737))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.0.35 (2025-12-02)
 
 ### 🩹 Fixes
