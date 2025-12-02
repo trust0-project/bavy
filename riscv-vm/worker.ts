@@ -1,15 +1,36 @@
 /**
  * Web Worker entry point for RISC-V hart.
  *
- * This worker runs a secondary RISC-V hart sharing memory with the main thread
- * via SharedArrayBuffer.
+ * This worker runs a secondary RISC-V hart (1, 2, 3, ...) sharing memory
+ * with the main thread via SharedArrayBuffer.
  *
- * Communication protocol:
- *   Main → Worker: WorkerInitMessage
- *   Worker → Main: WorkerReadyMessage | WorkerHaltedMessage | WorkerErrorMessage
+ * ## Architecture
+ *
+ * - Workers run secondary harts (1+)
+ * - Hart 0 runs on main thread (handles I/O)
+ * - Shared via SharedArrayBuffer:
+ *   - Control region (halt flags)
+ *   - CLINT (timer, IPI)
+ *   - DRAM (kernel memory)
+ *
+ * ## Communication Protocol
+ *
+ * Main → Worker: WorkerInitMessage
+ * Worker → Main: WorkerReadyMessage | WorkerHaltedMessage | WorkerErrorMessage
  */
 
-import init, { worker_entry } from "./pkg/riscv_vm.js";
+// Import WASM as embedded buffer (converted to base64 by tsup wasmPlugin)
+import wasmBuffer from "./pkg/riscv_vm_bg.wasm";
+import { initSync, WorkerState } from "./pkg/riscv_vm.js";
+
+// WorkerStepResult enum values (must match worker.rs)
+// wasm-bindgen exports enums as numeric values
+const WorkerStepResult = {
+  Continue: 0,
+  Halted: 1,
+  Shutdown: 2,
+  Error: 3,
+} as const;
 
 // ============================================================================
 // Message Types
@@ -18,6 +39,7 @@ import init, { worker_entry } from "./pkg/riscv_vm.js";
 /** Message sent from main thread to initialize the worker */
 export interface WorkerInitMessage {
   hartId: number;
+  /** SharedArrayBuffer containing control + CLINT + DRAM */
   sharedMem: SharedArrayBuffer;
   entryPc: number;
 }
@@ -32,6 +54,7 @@ export interface WorkerReadyMessage {
 export interface WorkerHaltedMessage {
   type: "halted";
   hartId: number;
+  stepCount?: number;
 }
 
 /** Message sent when an error occurs */
@@ -47,6 +70,14 @@ export type WorkerOutboundMessage =
   | WorkerErrorMessage;
 
 // ============================================================================
+// Shared Memory Layout (must match shared_mem.rs)
+// ============================================================================
+
+/** Control region offsets (i32 indices) */
+const CTRL_HALT_REQUESTED = 0;
+const CTRL_HALTED = 1;
+
+// ============================================================================
 // Worker Context
 // ============================================================================
 
@@ -60,16 +91,86 @@ interface WorkerGlobalScope {
 declare const self: WorkerGlobalScope;
 
 let initialized = false;
+let currentHartId: number | undefined;
+let workerState: WorkerState | null = null;
+let runLoopId: number | null = null;
+
+// Tuning parameters for cooperative scheduling
+const BATCH_SIZE = 1024;         // Instructions per batch
+const YIELD_INTERVAL_MS = 0;     // Yield after each batch (setTimeout(0) yields to event loop)
+
+/**
+ * Run loop using cooperative scheduling.
+ * Executes a batch of instructions, then yields to the event loop.
+ * This prevents the worker from blocking and allows it to respond to messages.
+ */
+function runLoop() {
+  if (!workerState || currentHartId === undefined) {
+    console.error('[Worker] runLoop called without workerState or hartId');
+    return;
+  }
+  
+  const hartId = currentHartId; // Capture for type narrowing
+  const result = workerState.step_batch(BATCH_SIZE);
+  
+  switch (result) {
+    case WorkerStepResult.Continue:
+      // Schedule next batch - use setTimeout(0) to yield to event loop
+      runLoopId = setTimeout(runLoop, YIELD_INTERVAL_MS) as unknown as number;
+      break;
+      
+    case WorkerStepResult.Halted:
+      console.log(`[Worker ${hartId}] Halted after ${workerState.step_count()} steps`);
+      self.postMessage({ type: "halted", hartId });
+      cleanup();
+      break;
+      
+    case WorkerStepResult.Shutdown:
+      console.log(`[Worker ${hartId}] Shutdown after ${workerState.step_count()} steps`);
+      self.postMessage({ type: "halted", hartId });
+      cleanup();
+      break;
+      
+    case WorkerStepResult.Error:
+      console.error(`[Worker ${hartId}] Error after ${workerState.step_count()} steps`);
+      self.postMessage({ type: "error", hartId, error: "Execution error" });
+      cleanup();
+      break;
+  }
+}
+
+function cleanup() {
+  if (runLoopId !== null) {
+    clearTimeout(runLoopId);
+    runLoopId = null;
+  }
+  workerState = null;
+}
 
 self.onmessage = async (event: MessageEvent<WorkerInitMessage>) => {
-  const { hartId, sharedMem, entryPc } = event.data;
-
+  const data = event.data;
+  
+  // Ignore messages from browser extensions (React DevTools, etc.)
+  if (!data || typeof data !== 'object' || 'source' in data) {
+    return;
+  }
+  
+  const { hartId, sharedMem, entryPc } = data;
+  
+  // Validate required fields
+  if (hartId === undefined || !sharedMem || entryPc === undefined) {
+    console.warn('[Worker] Invalid init message, missing fields');
+    return;
+  }
+  
+  currentHartId = hartId;
   console.log(`[Worker ${hartId}] Received init message`);
 
   if (!initialized) {
     try {
-      // Initialize WASM module
-      await init();
+      // Initialize WASM module with embedded buffer
+      console.log(`[Worker ${hartId}] Initializing WASM...`);
+      initSync(wasmBuffer);
       initialized = true;
       console.log(`[Worker ${hartId}] WASM initialized`);
     } catch (e) {
@@ -84,6 +185,17 @@ self.onmessage = async (event: MessageEvent<WorkerInitMessage>) => {
     }
   }
 
+  // Verify SharedArrayBuffer
+  if (!(sharedMem instanceof SharedArrayBuffer)) {
+    const msg: WorkerErrorMessage = {
+      type: "error",
+      hartId,
+      error: "sharedMem must be a SharedArrayBuffer",
+    };
+    self.postMessage(msg);
+    return;
+  }
+
   // Notify main thread that we're ready
   const readyMsg: WorkerReadyMessage = { type: "ready", hartId };
   self.postMessage(readyMsg);
@@ -92,7 +204,12 @@ self.onmessage = async (event: MessageEvent<WorkerInitMessage>) => {
     // Convert entryPc (number/float64) to BigInt for u64
     const pc = BigInt(Math.floor(entryPc));
     console.log(`[Worker ${hartId}] Starting execution at PC=0x${pc.toString(16)}`);
-    worker_entry(hartId, sharedMem, pc);
+    
+    // Create worker state for cooperative scheduling
+    workerState = new WorkerState(hartId, sharedMem, pc);
+    
+    // Start the cooperative run loop
+    runLoop();
   } catch (e) {
     console.error(`[Worker ${hartId}] Execution error:`, e);
     const msg: WorkerErrorMessage = {
@@ -101,20 +218,48 @@ self.onmessage = async (event: MessageEvent<WorkerInitMessage>) => {
       error: String(e),
     };
     self.postMessage(msg);
+    cleanup();
     return;
   }
-
-  // Signal completion
-  console.log(`[Worker ${hartId}] Halted`);
-  const haltedMsg: WorkerHaltedMessage = { type: "halted", hartId };
-  self.postMessage(haltedMsg);
 };
 
 self.onerror = (e: ErrorEvent) => {
   console.error("[Worker] Uncaught error:", e);
   const msg: WorkerErrorMessage = {
     type: "error",
+    hartId: currentHartId,
     error: e.message || String(e),
   };
   self.postMessage(msg);
 };
+
+// ============================================================================
+// Utility: Check if halt was requested (can be called from JS if needed)
+// ============================================================================
+
+/**
+ * Check if halt has been requested in the shared control region.
+ * This can be used for JS-side polling if needed.
+ */
+export function isHaltRequested(sharedMem: SharedArrayBuffer): boolean {
+  const view = new Int32Array(sharedMem);
+  return Atomics.load(view, CTRL_HALT_REQUESTED) !== 0;
+}
+
+/**
+ * Request halt by setting the flag in shared memory.
+ * This can be called from any thread.
+ */
+export function requestHalt(sharedMem: SharedArrayBuffer): void {
+  const view = new Int32Array(sharedMem);
+  Atomics.store(view, CTRL_HALT_REQUESTED, 1);
+  Atomics.notify(view, CTRL_HALT_REQUESTED);
+}
+
+/**
+ * Check if VM has halted.
+ */
+export function isHalted(sharedMem: SharedArrayBuffer): boolean {
+  const view = new Int32Array(sharedMem);
+  return Atomics.load(view, CTRL_HALTED) !== 0;
+}

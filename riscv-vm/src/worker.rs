@@ -1,12 +1,29 @@
 //! Web Worker entry point for WASM SMP.
 //!
 //! This module provides the Rust entry point that runs inside each Web Worker,
-//! executing CPU instructions in parallel with other workers.
+//! executing CPU instructions in parallel with other workers and the main thread.
+//!
+//! ## Architecture
+//!
+//! - Each worker runs one secondary hart (1, 2, 3, ...)
+//! - Hart 0 runs on the main thread (handles I/O)
+//! - Workers share DRAM and CLINT via SharedArrayBuffer
+//! - Workers do NOT have access to VirtIO devices (disk, network)
+//! - Inter-hart communication uses CLINT MSIP for IPIs
+//!
+//! ## Memory Layout
+//!
+//! The SharedArrayBuffer is laid out as:
+//! - Control region (4KB): halt flags, hart count
+//! - CLINT region (64KB): mtime, msip[], mtimecmp[]
+//! - DRAM region: kernel memory
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 #[cfg(target_arch = "wasm32")]
-use js_sys::{SharedArrayBuffer, Atomics, Int32Array};
+use js_sys::SharedArrayBuffer;
+#[cfg(target_arch = "wasm32")]
+use crate::shared_mem::{self, wasm::{SharedClint, SharedControl}};
 #[cfg(target_arch = "wasm32")]
 use crate::bus::SystemBus;
 #[cfg(target_arch = "wasm32")]
@@ -14,101 +31,196 @@ use crate::cpu::Cpu;
 #[cfg(target_arch = "wasm32")]
 use crate::Trap;
 
-/// Control region offsets in SharedArrayBuffer.
-/// First 4KB reserved for control/synchronization.
+/// Result of executing a batch of instructions.
 #[cfg(target_arch = "wasm32")]
-mod control {
-    /// Offset 0: halt_requested (i32)
-    pub const HALT_REQUESTED: u32 = 0;
-    /// Offset 4: halted (i32)
-    pub const HALTED: u32 = 1;
-    /// Offset 8-15: halt_code (i64 as two i32)
-    pub const HALT_CODE_LO: u32 = 2;
-    pub const HALT_CODE_HI: u32 = 3;
+#[wasm_bindgen]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum WorkerStepResult {
+    /// Continue executing - call step_batch again
+    Continue = 0,
+    /// Halt requested via control region
+    Halted = 1,
+    /// Shutdown requested by guest (RequestedTrap)
+    Shutdown = 2,
+    /// Fatal error occurred
+    Error = 3,
 }
 
-/// Worker entry point, called from JavaScript.
-///
-/// # Arguments
-/// * `hart_id` - This worker's hart ID (1, 2, 3, ...)
-/// * `shared_mem` - SharedArrayBuffer containing DRAM
-/// * `entry_pc` - Kernel entry point address
+/// Worker state stored in JS (passed back to Rust on each step_batch call).
+/// This avoids recreating CPU/bus state on every call.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub struct WorkerState {
+    cpu: Cpu,
+    bus: SystemBus,
+    control: SharedControl,
+    clint: SharedClint,
+    hart_id: usize,
+    step_count: u64,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+impl WorkerState {
+    /// Create a new worker state for a secondary hart.
+    #[wasm_bindgen(constructor)]
+    pub fn new(hart_id: usize, shared_mem: JsValue, entry_pc: u64) -> WorkerState {
+        // Convert JsValue to SharedArrayBuffer
+        let sab: SharedArrayBuffer = shared_mem.unchecked_into();
+        
+        // Create shared control and CLINT accessors
+        let control = SharedControl::new(&sab);
+        let clint = SharedClint::new(&sab);
+        
+        // Create bus view of shared DRAM
+        let dram_offset = shared_mem::dram_offset();
+        let shared_clint_for_bus = SharedClint::new(&sab);
+        // Workers read from shared UART input (is_worker = true)
+        let bus = SystemBus::from_shared_buffer(sab, dram_offset, shared_clint_for_bus, true);
+        
+        // Create CPU for this hart
+        let cpu = Cpu::new(entry_pc, hart_id as u64);
+        
+        web_sys::console::log_1(&JsValue::from_str(
+            &format!("[Worker {}] Initialized at PC=0x{:x}", hart_id, entry_pc)));
+        
+        WorkerState {
+            cpu,
+            bus,
+            control,
+            clint,
+            hart_id,
+            step_count: 0,
+        }
+    }
+    
+    /// Execute a batch of instructions and return.
+    /// 
+    /// This is designed to be called repeatedly from JavaScript, allowing
+    /// the event loop to yield between batches. This prevents the worker
+    /// from blocking indefinitely and allows it to respond to messages.
+    ///
+    /// Returns a WorkerStepResult indicating whether to continue, halt, etc.
+    pub fn step_batch(&mut self, batch_size: u32) -> WorkerStepResult {
+        // Check for halt request first
+        if self.control.should_stop() {
+            web_sys::console::log_1(&JsValue::from_str(
+                &format!("[Worker {}] Halt detected after {} steps", 
+                    self.hart_id, self.step_count)));
+            return WorkerStepResult::Halted;
+        }
+        
+        // Wait for main thread to signal that workers can start.
+        // This ensures hart 0 boots first and sets up memory before
+        // secondary harts start executing kernel code.
+        if !self.control.can_workers_start() {
+            // Still parked - return Continue to keep polling
+            return WorkerStepResult::Continue;
+        }
+        
+        // Execute batch of instructions
+        for _ in 0..batch_size {
+            match self.cpu.step(&self.bus) {
+                Ok(()) => {
+                    self.step_count += 1;
+                }
+                Err(Trap::RequestedTrap(code)) => {
+                    web_sys::console::log_1(&JsValue::from_str(
+                        &format!("[Worker {}] Shutdown requested (code: {:#x})", 
+                            self.hart_id, code)));
+                    self.control.signal_halted(code);
+                    return WorkerStepResult::Shutdown;
+                }
+                Err(Trap::Fatal(msg)) => {
+                    web_sys::console::error_1(&JsValue::from_str(
+                        &format!("[Worker {}] Fatal: {} at PC=0x{:x}", 
+                            self.hart_id, msg, self.cpu.pc)));
+                    self.control.signal_halted(0xDEAD);
+                    return WorkerStepResult::Error;
+                }
+                Err(_trap) => {
+                    // Architectural traps handled by CPU
+                    self.step_count += 1;
+                }
+            }
+        }
+        
+        // Check and deliver interrupts from shared CLINT
+        let (msip_pending, timer_pending) = self.clint.check_interrupts(self.hart_id);
+        if msip_pending || timer_pending {
+            if let Ok(mut mip) = self.cpu.read_csr(0x344) { // MIP
+                if msip_pending {
+                    mip |= 1 << 3; // MSIP
+                }
+                if timer_pending {
+                    mip |= 1 << 7; // MTIP
+                }
+                let _ = self.cpu.write_csr(0x344, mip);
+            }
+        }
+        
+        WorkerStepResult::Continue
+    }
+    
+    /// Get the total step count.
+    pub fn step_count(&self) -> u64 {
+        self.step_count
+    }
+    
+    /// Get the hart ID.
+    pub fn hart_id(&self) -> usize {
+        self.hart_id
+    }
+}
+
+/// Legacy worker entry point - DEPRECATED.
+/// 
+/// This function runs a blocking infinite loop. Use WorkerState + step_batch instead
+/// for cooperative scheduling that doesn't block the worker's event loop.
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub fn worker_entry(hart_id: usize, shared_mem: JsValue, entry_pc: u64) {
-    // Convert JsValue to SharedArrayBuffer
-    let sab: SharedArrayBuffer = shared_mem.unchecked_into();
+    web_sys::console::warn_1(&JsValue::from_str(
+        "[Worker] Using deprecated blocking worker_entry. Consider using WorkerState."));
     
-    // Create bus view of shared memory
-    let bus = SystemBus::from_shared_buffer(sab.clone());
+    let mut state = WorkerState::new(hart_id, shared_mem, entry_pc);
     
-    // Create CPU for this hart
-    let mut cpu = Cpu::new(entry_pc, hart_id as u64);
-    
-    web_sys::console::log_1(&JsValue::from_str(
-        &format!("[Worker {}] Started at PC=0x{:x}", hart_id, entry_pc)));
-
-    // Execution loop
-    let mut step_count: u64 = 0;
     loop {
-        // Check for halt request (via Atomics)
-        if check_halt_requested(&sab) {
-            web_sys::console::log_1(&JsValue::from_str(
-                &format!("[Worker {}] Halt requested after {} steps", hart_id, step_count)));
-            break;
-        }
-
-        match cpu.step(&bus) {
-            Ok(()) => {
-                step_count += 1;
-            }
-            Err(Trap::RequestedTrap(code)) => {
-                web_sys::console::log_1(&JsValue::from_str(
-                    &format!("[Worker {}] Shutdown requested (code: {:#x})", hart_id, code)));
-                signal_halted(&sab, code);
-                break;
-            }
-            Err(Trap::Fatal(msg)) => {
-                web_sys::console::error_1(&JsValue::from_str(
-                    &format!("[Worker {}] Fatal: {} at PC=0x{:x}", hart_id, msg, cpu.pc)));
-                signal_halted(&sab, 0xDEAD);
-                break;
-            }
-            Err(_trap) => {
-                // Architectural traps handled by CPU
-                step_count += 1;
-            }
-        }
-
-        // Yield periodically to prevent blocking browser
-        if step_count % 100_000 == 0 {
-            // Could use Atomics.wait() for cooperative scheduling
-            // For now, just continue
+        match state.step_batch(256) {
+            WorkerStepResult::Continue => continue,
+            _ => break,
         }
     }
-
+    
     web_sys::console::log_1(&JsValue::from_str(
-        &format!("[Worker {}] Exited after {} steps", hart_id, step_count)));
+        &format!("[Worker {}] Exited after {} steps", hart_id, state.step_count)));
 }
 
-/// Check if halt has been requested via shared memory.
+/// Check interrupts for this hart using the shared CLINT.
+///
+/// This is called periodically by the worker to check for:
+/// - Software interrupts (IPI via MSIP)
+/// - Timer interrupts (MTIP)
 #[cfg(target_arch = "wasm32")]
-fn check_halt_requested(sab: &SharedArrayBuffer) -> bool {
-    let view = Int32Array::new(sab);
-    Atomics::load(&view, control::HALT_REQUESTED)
-        .map(|v| v != 0)
-        .unwrap_or(false)
+#[wasm_bindgen]
+pub fn worker_check_interrupts(hart_id: usize, shared_mem: JsValue) -> u64 {
+    let sab: SharedArrayBuffer = shared_mem.unchecked_into();
+    let clint = SharedClint::new(&sab);
+    
+    let mut mip: u64 = 0;
+    let (msip, timer) = clint.check_interrupts(hart_id);
+    
+    if msip {
+        mip |= 1 << 3; // MSIP
+    }
+    if timer {
+        mip |= 1 << 7; // MTIP
+    }
+    
+    mip
 }
 
-/// Signal that this worker has halted.
-#[cfg(target_arch = "wasm32")]
-fn signal_halted(sab: &SharedArrayBuffer, code: u64) {
-    let view = Int32Array::new(sab);
-    // Set halted flag
-    let _ = Atomics::store(&view, control::HALTED, 1);
-    // Store halt code (as two 32-bit values)
-    let _ = Atomics::store(&view, control::HALT_CODE_LO, (code & 0xFFFFFFFF) as i32);
-    let _ = Atomics::store(&view, control::HALT_CODE_HI, (code >> 32) as i32);
-    // Wake any waiters
-    let _ = Atomics::notify(&view, control::HALTED);
+#[cfg(test)]
+mod tests {
+    // Worker tests require WASM environment
 }

@@ -13,6 +13,7 @@ pub mod net_async;
 pub mod net_webtransport;
 pub mod virtio;
 pub mod emulator;
+pub mod shared_mem;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod console;
@@ -47,6 +48,7 @@ pub enum NetworkStatus {
 /// Detect the number of hardware threads available.
 /// Limits to half the available CPU cores to leave resources for the host.
 #[cfg(target_arch = "wasm32")]
+#[allow(dead_code)] // Used in WASM builds only
 fn detect_hart_count() -> usize {
     // In browsers, navigator.hardwareConcurrency gives logical CPU count
     let count = web_sys::window()
@@ -54,6 +56,34 @@ fn detect_hart_count() -> usize {
         .unwrap_or(2);
     
     (count / 2).max(1) // Use half the CPUs, ensure at least 1
+}
+
+/// Check if SharedArrayBuffer is available for multi-threaded execution.
+#[cfg(target_arch = "wasm32")]
+fn check_shared_array_buffer_available() -> bool {
+    // SharedArrayBuffer requires cross-origin isolation (COOP/COEP headers)
+    
+    // Check if we're in a browser context
+    if let Some(window) = web_sys::window() {
+        // Check crossOriginIsolated property
+        let isolated: bool = js_sys::Reflect::get(&window, &JsValue::from_str("crossOriginIsolated"))
+            .ok()
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        
+        if !isolated {
+            web_sys::console::warn_1(&JsValue::from_str(
+                "[VM] Not cross-origin isolated. Add COOP/COEP headers for SMP support."));
+            return false;
+        }
+        
+        web_sys::console::log_1(&JsValue::from_str(
+            "[VM] Cross-origin isolated - SharedArrayBuffer should be available"));
+    }
+    
+    // If cross-origin isolated, SharedArrayBuffer should work
+    // Note: catch_unwind doesn't work in WASM, so we trust the isolation check
+    true
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -65,24 +95,78 @@ fn detect_hart_count() -> usize {
 }
 
 /// WASM-exposed VM wrapper for running RISC-V kernels in the browser.
+///
+/// ## Multi-Hart Architecture
+///
+/// When `SharedArrayBuffer` is available (requires COOP/COEP headers):
+/// - Hart 0 runs on the main thread (handles I/O devices)
+/// - Harts 1+ run on Web Workers (parallel execution)
+/// - DRAM and CLINT are shared via SharedArrayBuffer
+/// - Workers are managed automatically
+///
+/// When `SharedArrayBuffer` is NOT available:
+/// - Falls back to single-threaded round-robin execution
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub struct WasmVm {
     bus: SystemBus,
-    cpus: Vec<cpu::Cpu>,      // Multiple CPUs for SMP
-    num_harts: usize,          // Track hart count
+    cpu: cpu::Cpu,              // Primary CPU (hart 0)
+    num_harts: usize,           // Total hart count
     net_status: NetworkStatus,
     poll_counter: u32,
     halted: bool,
     halt_code: u64,
+    /// Shared memory buffer (for passing to workers)
+    shared_buffer: Option<js_sys::SharedArrayBuffer>,
+    /// Shared control region accessor
+    shared_control: Option<shared_mem::wasm::SharedControl>,
+    /// Shared CLINT accessor
+    shared_clint: Option<shared_mem::wasm::SharedClint>,
+    /// Shared UART output accessor (for reading worker output)
+    shared_uart_output: Option<shared_mem::wasm::SharedUartOutput>,
+    /// Shared UART input accessor (for sending keyboard input to workers)
+    shared_uart_input: Option<shared_mem::wasm::SharedUartInput>,
+    /// Worker handles
+    workers: Vec<web_sys::Worker>,
+    /// Worker ready flags
+    workers_ready: Vec<bool>,
+    /// Whether workers have been started
+    workers_started: bool,
+    /// Entry PC for workers
+    entry_pc: u64,
+    /// Boot step counter - used to delay worker start
+    boot_steps: u64,
+    /// Whether workers have been signaled to start
+    workers_signaled: bool,
 }
 
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 impl WasmVm {
     /// Create a new VM instance and load a kernel (ELF or raw binary).
+    ///
+    /// If SharedArrayBuffer is available, the VM will use true parallel
+    /// execution with Web Workers. Otherwise, falls back to single-threaded mode.
+    ///
+    /// Hart count is auto-detected as half of hardware_concurrency.
+    /// Use `new_with_harts()` to specify a custom hart count.
     #[wasm_bindgen(constructor)]
     pub fn new(kernel: &[u8]) -> Result<WasmVm, JsValue> {
+        Self::create_vm_internal(kernel, None)
+    }
+    
+    /// Create a new VM instance with a specified number of harts.
+    ///
+    /// # Arguments
+    /// * `kernel` - ELF kernel binary
+    /// * `num_harts` - Number of harts (0 = auto-detect)
+    pub fn new_with_harts(kernel: &[u8], num_harts: usize) -> Result<WasmVm, JsValue> {
+        let harts = if num_harts == 0 { None } else { Some(num_harts) };
+        Self::create_vm_internal(kernel, harts)
+    }
+    
+    /// Internal constructor with optional hart count.
+    fn create_vm_internal(kernel: &[u8], num_harts: Option<usize>) -> Result<WasmVm, JsValue> {
         // Set up panic hook for better error messages in the browser console
         console_error_panic_hook::set_once();
         
@@ -90,53 +174,98 @@ impl WasmVm {
             &format!("[VM] Creating new VM, kernel size: {} bytes", kernel.len())));
 
         const DRAM_SIZE: usize = 512 * 1024 * 1024; // 512 MiB
-        let mut bus = SystemBus::new(DRAM_BASE, DRAM_SIZE);
         
-        // Check if it's an ELF file and load appropriately
+        // Detect or use specified hart count
+        let num_harts = num_harts.unwrap_or_else(detect_hart_count);
+        
+        // Check if SharedArrayBuffer is available for true parallelism
+        let sab_available = check_shared_array_buffer_available();
+        
+        if sab_available {
+            web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
+                "[VM] SharedArrayBuffer available - enabling SMP mode"));
+        } else {
+            web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(
+                "[VM] SharedArrayBuffer not available - running single-threaded"));
+        }
+        
+        // Create bus with shared memory if available
+        let (bus, shared_buffer, shared_control, shared_clint, shared_uart_output, shared_uart_input) = if sab_available {
+            // Create SharedArrayBuffer for shared memory
+            let total_size = shared_mem::total_shared_size(DRAM_SIZE);
+            let sab = js_sys::SharedArrayBuffer::new(total_size as u32);
+            
+            // Initialize shared memory regions
+            shared_mem::wasm::init_shared_memory(&sab, num_harts);
+            
+            // Create bus with DRAM backed by shared buffer
+            // IMPORTANT: Pass the full SharedArrayBuffer with the DRAM byte offset,
+            // NOT a sliced copy (slice() creates a copy, breaking shared memory!)
+            // Also pass SharedClint so CLINT MMIO accesses go through shared memory.
+            let dram_offset = shared_mem::dram_offset();
+            let shared_clint_for_bus = shared_mem::wasm::SharedClint::new(&sab);
+            // Main thread (hart 0) reads from local UART, not shared input
+            let bus = SystemBus::from_shared_buffer(sab.clone(), dram_offset, shared_clint_for_bus, false);
+            
+            let control = shared_mem::wasm::SharedControl::new(&sab);
+            let clint = shared_mem::wasm::SharedClint::new(&sab);
+            let uart_output = shared_mem::wasm::SharedUartOutput::new(&sab);
+            let uart_input = shared_mem::wasm::SharedUartInput::new(&sab);
+            
+            (bus, Some(sab), Some(control), Some(clint), Some(uart_output), Some(uart_input))
+        } else {
+            // Standard bus without shared memory
+            let bus = SystemBus::new(DRAM_BASE, DRAM_SIZE);
+            (bus, None, None, None, None, None)
+        };
+        
+        // Load kernel
         let entry_pc = if kernel.starts_with(b"\x7FELF") {
             web_sys::console::log_1(&wasm_bindgen::JsValue::from_str("[VM] Detected ELF kernel"));
-            // Parse and load ELF
-            let entry = load_elf_wasm(kernel, &mut bus)
+            let entry = load_elf_wasm(kernel, &bus)
                 .map_err(|e| JsValue::from_str(&format!("Failed to load ELF kernel: {}", e)))?;
             web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
                 &format!("[VM] ELF loaded, entry point: 0x{:x}", entry)));
             entry
         } else {
-            // Not an ELF - this is likely an error (HTML error page, corrupted file, etc.)
             web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(
                 &format!("[VM] Warning: kernel does not appear to be an ELF file (magic: {:02x?}). Loading as raw binary.",
                     &kernel[..kernel.len().min(4)])));
-            // Load raw binary at DRAM_BASE
             bus.dram
                 .load(kernel, 0)
                 .map_err(|e| JsValue::from_str(&format!("Failed to load kernel: {}", e)))?;
             DRAM_BASE
         };
 
-        // Create multiple CPUs
-        let num_harts = detect_hart_count();
-        
-        // Set hart count in CLINT so kernel can read it
+        // Set hart count in CLINT (native CLINT in bus)
         bus.set_num_harts(num_harts);
         
-        let mut cpus = Vec::with_capacity(num_harts);
-        
-        for hart_id in 0..num_harts {
-            let cpu = cpu::Cpu::new(entry_pc, hart_id as u64);
-            cpus.push(cpu);
-        }
+        // Create primary CPU (hart 0)
+        let cpu = cpu::Cpu::new(entry_pc, 0);
         
         web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
-            &format!("[VM] Created {} harts, entry PC=0x{:x}", num_harts, entry_pc)));
+            &format!("[VM] Created {} harts, entry PC=0x{:x}, SMP={}", 
+                num_harts, entry_pc, sab_available)));
 
         Ok(WasmVm { 
             bus, 
-            cpus,
+            cpu,
             num_harts,
             net_status: NetworkStatus::Disconnected,
             poll_counter: 0,
             halted: false,
             halt_code: 0,
+            shared_buffer,
+            shared_control,
+            shared_clint,
+            shared_uart_output,
+            shared_uart_input,
+            workers: Vec::new(),
+            workers_ready: Vec::new(),
+            workers_started: false,
+            entry_pc,
+            boot_steps: 0,
+            workers_signaled: false,
         })
     }
 
@@ -203,7 +332,11 @@ impl WasmVm {
         self.net_status
     }
 
-    /// Execute one instruction on each CPU (round-robin).
+    /// Execute one instruction on hart 0 (primary hart).
+    ///
+    /// In SMP mode, secondary harts run in Web Workers and execute in parallel.
+    /// This method only steps hart 0, which handles I/O coordination.
+    ///
     /// Returns true if the VM is still running, false if halted.
     pub fn step(&mut self) -> bool {
         // If already halted, don't execute more instructions
@@ -211,41 +344,193 @@ impl WasmVm {
             return false;
         }
         
+        // Check if workers reported halt
+        if let Some(ref control) = self.shared_control {
+            if control.is_halted() {
+                self.halted = true;
+                self.halt_code = control.halt_code();
+                web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
+                    &format!("[VM] Worker signaled halt (code: {:#x})", self.halt_code)));
+                return false;
+            }
+        }
+        
+        // Track boot progress and signal workers after initial boot
+        // This ensures hart 0 has time to set up memory, page tables, etc.
+        // before secondary harts start executing.
+        const BOOT_STEPS_THRESHOLD: u64 = 500_000; // ~500K instructions for boot
+        if !self.workers_signaled {
+            self.boot_steps += 1;
+            if self.boot_steps >= BOOT_STEPS_THRESHOLD {
+                if let Some(ref control) = self.shared_control {
+                    control.allow_workers_to_start();
+                    self.workers_signaled = true;
+                    web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
+                        &format!("[VM] Workers signaled to start after {} boot steps", self.boot_steps)));
+                }
+            }
+        }
+        
         // Poll VirtIO devices periodically for incoming network packets
         // Poll every 100 instructions for good network responsiveness
         self.poll_counter = self.poll_counter.wrapping_add(1);
         if self.poll_counter % 100 == 0 {
             self.bus.poll_virtio();
+            
+            // Update shared CLINT timer (if in SMP mode)
+            if let Some(ref clint) = self.shared_clint {
+                // Increment mtime in shared memory
+                clint.tick(100); // 100 ticks per poll
+            }
         }
         
-        // Round-robin: execute one instruction on each hart
-        for cpu in &mut self.cpus {
-            match cpu.step(&self.bus) {
-                Ok(()) => {}
-                Err(Trap::RequestedTrap(code)) => {
-                    // Any hart can trigger shutdown
-                    self.halted = true;
-                    self.halt_code = code;
-                    web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
-                        &format!("[VM] Hart requested halt (code: {:#x})", code)));
-                    return false;
+        // Execute one instruction on hart 0 only
+        // (Secondary harts run in workers)
+        match self.cpu.step(&self.bus) {
+            Ok(()) => {}
+            Err(Trap::RequestedTrap(code)) => {
+                self.halted = true;
+                self.halt_code = code;
+                // Signal halt to workers
+                if let Some(ref control) = self.shared_control {
+                    control.signal_halted(code);
                 }
-                Err(Trap::Fatal(msg)) => {
-                    // Fatal emulator error - log and halt
-                    web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(
-                        &format!("[VM] Fatal error on hart: {} at PC=0x{:x}", msg, cpu.pc)));
-                    self.halted = true;
-                    return false;
+                web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
+                    &format!("[VM] Hart 0 requested halt (code: {:#x})", code)));
+                return false;
+            }
+            Err(Trap::Fatal(msg)) => {
+                web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(
+                    &format!("[VM] Fatal error: {} at PC=0x{:x}", msg, self.cpu.pc)));
+                self.halted = true;
+                if let Some(ref control) = self.shared_control {
+                    control.signal_halted(0xDEAD);
                 }
-                Err(_trap) => {
-                    // Architectural traps (interrupts, page faults, ecalls) are handled
-                    // by the CPU's trap handler which updates CSRs and redirects PC.
-                    // These are normal operation - continue execution.
-                }
+                return false;
+            }
+            Err(_trap) => {
+                // Architectural traps handled by CPU
             }
         }
         
         true
+    }
+    
+    /// Start worker threads for secondary harts (1..num_harts).
+    ///
+    /// Workers run in parallel with the main thread, sharing DRAM and CLINT
+    /// via SharedArrayBuffer.
+    ///
+    /// # Arguments
+    /// * `worker_url` - URL to the worker script (e.g., "/worker.js")
+    pub fn start_workers(&mut self, worker_url: &str) -> Result<(), JsValue> {
+        // Only start workers if we have shared memory and more than 1 hart
+        if self.shared_buffer.is_none() || self.num_harts <= 1 {
+            web_sys::console::log_1(&JsValue::from_str(
+                "[VM] Skipping worker creation (single-threaded mode or 1 hart)"));
+            return Ok(());
+        }
+        
+        if self.workers_started {
+            return Ok(());
+        }
+        
+        let shared_buffer = self.shared_buffer.as_ref().unwrap();
+        
+        web_sys::console::log_1(&JsValue::from_str(
+            &format!("[VM] Starting {} workers at {}", self.num_harts - 1, worker_url)));
+        
+        for hart_id in 1..self.num_harts {
+            // Create worker with ESM module type
+            let mut opts = web_sys::WorkerOptions::new();
+            opts.type_(web_sys::WorkerType::Module);
+            
+            let worker = web_sys::Worker::new_with_options(worker_url, &opts)
+                .map_err(|e| JsValue::from_str(&format!("Failed to create worker: {:?}", e)))?;
+            
+            // Set up message handler for this worker
+            let hart_id_copy = hart_id;
+            let onmessage = wasm_bindgen::closure::Closure::wrap(Box::new(move |event: web_sys::MessageEvent| {
+                let data = event.data();
+                if let Some(type_str) = js_sys::Reflect::get(&data, &JsValue::from_str("type"))
+                    .ok()
+                    .and_then(|v| v.as_string())
+                {
+                    match type_str.as_str() {
+                        "ready" => {
+                            web_sys::console::log_1(&JsValue::from_str(
+                                &format!("[VM] Worker {} ready", hart_id_copy)));
+                        }
+                        "halted" => {
+                            web_sys::console::log_1(&JsValue::from_str(
+                                &format!("[VM] Worker {} halted", hart_id_copy)));
+                        }
+                        "error" => {
+                            if let Ok(error) = js_sys::Reflect::get(&data, &JsValue::from_str("error")) {
+                                web_sys::console::error_1(&JsValue::from_str(
+                                    &format!("[VM] Worker {} error: {:?}", hart_id_copy, error)));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }) as Box<dyn FnMut(_)>);
+            
+            worker.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+            onmessage.forget(); // Leak the closure (lives for program lifetime)
+            
+            // Send init message to worker
+            let init_msg = js_sys::Object::new();
+            js_sys::Reflect::set(&init_msg, &JsValue::from_str("hartId"), &JsValue::from(hart_id as u32)).unwrap();
+            js_sys::Reflect::set(&init_msg, &JsValue::from_str("sharedMem"), shared_buffer).unwrap();
+            js_sys::Reflect::set(&init_msg, &JsValue::from_str("entryPc"), &JsValue::from(self.entry_pc as f64)).unwrap();
+            
+            worker.post_message(&init_msg)
+                .map_err(|e| JsValue::from_str(&format!("Failed to send init message: {:?}", e)))?;
+            
+            self.workers.push(worker);
+            self.workers_ready.push(false);
+        }
+        
+        self.workers_started = true;
+        web_sys::console::log_1(&JsValue::from_str(
+            &format!("[VM] Started {} workers", self.workers.len())));
+        
+        Ok(())
+    }
+    
+    /// Get the number of harts configured.
+    pub fn num_harts(&self) -> usize {
+        self.num_harts
+    }
+    
+    /// Check if running in SMP mode (with workers).
+    pub fn is_smp(&self) -> bool {
+        self.shared_buffer.is_some() && self.num_harts > 1
+    }
+    
+    /// Get the SharedArrayBuffer for external worker management.
+    /// Returns None if not in SMP mode.
+    pub fn get_shared_buffer(&self) -> Option<js_sys::SharedArrayBuffer> {
+        self.shared_buffer.clone()
+    }
+    
+    /// Terminate all workers.
+    pub fn terminate_workers(&mut self) {
+        // Signal halt to workers
+        if let Some(ref control) = self.shared_control {
+            control.request_halt();
+        }
+        
+        // Terminate worker threads
+        for worker in &self.workers {
+            worker.terminate();
+        }
+        self.workers.clear();
+        self.workers_ready.clear();
+        self.workers_started = false;
+        
+        web_sys::console::log_1(&JsValue::from_str("[VM] All workers terminated"));
     }
 
     /// Execute up to N instructions in a batch.
@@ -273,7 +558,18 @@ impl WasmVm {
     }
 
     /// Get a byte from the UART output buffer, if available.
+    /// 
+    /// In SMP mode, this checks both the shared UART output buffer (for worker output)
+    /// and the local UART buffer (for hart 0 output).
     pub fn get_output(&mut self) -> Option<u8> {
+        // First check shared UART output from workers
+        if let Some(ref shared_uart) = self.shared_uart_output {
+            if let Some(byte) = shared_uart.read_byte() {
+                return Some(byte);
+            }
+        }
+        
+        // Then check local UART (hart 0 output)
         let byte = self.bus.uart.pop_output();
         // Uncomment for debugging UART output:
         // if let Some(b) = byte {
@@ -336,8 +632,15 @@ impl WasmVm {
     }
 
     /// Push an input byte to the UART.
+    /// In SMP mode, this also writes to the shared input buffer so workers can receive it.
     pub fn input(&mut self, byte: u8) {
+        // Push to local UART for hart 0
         self.bus.uart.push_input(byte);
+        
+        // Also push to shared input buffer for workers to receive
+        if let Some(ref shared_input) = self.shared_uart_input {
+            let _ = shared_input.write_byte(byte);
+        }
     }
 
     /// Get current memory usage (DRAM size) in bytes.
@@ -348,7 +651,7 @@ impl WasmVm {
 
 /// Load an ELF kernel into DRAM (WASM-compatible version).
 #[cfg(target_arch = "wasm32")]
-fn load_elf_wasm(buffer: &[u8], bus: &mut SystemBus) -> Result<u64, String> {
+fn load_elf_wasm(buffer: &[u8], bus: &SystemBus) -> Result<u64, String> {
     use goblin::elf::{program_header::PT_LOAD, Elf};
     
     let elf = Elf::parse(buffer).map_err(|e| format!("ELF parse error: {}", e))?;

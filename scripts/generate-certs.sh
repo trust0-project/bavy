@@ -62,3 +62,4 @@ echo "   cargo run --release -- --cert-pem $CERTS_DIR/relay-cert.pem --key-pem $
 echo ""
 echo "Note: Certificates expire in $VALIDITY_DAYS days. Regenerate before expiry."
 
+

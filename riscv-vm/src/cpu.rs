@@ -9,18 +9,7 @@ use crate::decoder::{self, Op, Register};
 use crate::mmu::{self, AccessType as MmuAccessType, Tlb};
 use crate::Trap;
 use std::collections::HashMap;
-use std::sync::Mutex;
 
-/// Global mutex for AMO (Atomic Memory Operations) to ensure atomicity across harts.
-/// 
-/// On real RISC-V hardware, AMO instructions perform read-modify-write atomically.
-/// In our emulator, each hart runs in a separate thread, so we need explicit
-/// synchronization to prevent race conditions.
-/// 
-/// This is a coarse-grained lock - all AMO operations serialize through it.
-/// A finer-grained approach would use per-cache-line locks, but this is simpler
-/// and sufficient for correctness.
-static AMO_LOCK: Mutex<()> = Mutex::new(());
 
 /// Cached decode result.
 /// Stores (pc, raw_instruction, decoded_op) for cache hit checking.
@@ -1079,80 +1068,88 @@ impl Cpu {
                         }
                     }
                     // AMO* operations - MUST be atomic across all harts
-                    0b00001 | // AMOSWAP
-                    0b00000 | // AMOADD
-                    0b00100 | // AMOXOR
-                    0b01000 | // AMOOR
-                    0b01100 | // AMOAND
-                    0b10000 | // AMOMIN
-                    0b10100 | // AMOMAX
-                    0b11000 | // AMOMINU
-                    0b11100 // AMOMAXU
-                    => {
-                        // Any AMO acts like a store to the address, so clear reservation.
+                    // Use Bus trait's atomic methods which properly synchronize
+                    // across WASM workers using JavaScript Atomics API.
+                    0b00001 => {
+                        // AMOSWAP
                         self.clear_reservation_if_conflict(addr);
-
-                        // Acquire global AMO lock to ensure atomicity across harts.
-                        // This makes the read-modify-write sequence atomic.
-                        let _amo_guard = AMO_LOCK.lock().unwrap();
-
-                        let old = if is_word {
-                            match bus.read32(pa) {
-                                Ok(v) => v as i32 as i64 as u64,
-                                Err(e) => return self.handle_trap(e, pc, Some(insn_raw)),
-                            }
-                        } else {
-                            match bus.read64(pa) {
-                                Ok(v) => v,
-                                Err(e) => return self.handle_trap(e, pc, Some(insn_raw)),
-                            }
-                        };
                         let rs2_val = self.read_reg(rs2);
-
-                        let new_val = match funct5 {
-                            0b00001 => rs2_val,                        // AMOSWAP
-                            0b00000 => old.wrapping_add(rs2_val),      // AMOADD
-                            0b00100 => old ^ rs2_val,                  // AMOXOR
-                            0b01000 => old | rs2_val,                  // AMOOR
-                            0b01100 => old & rs2_val,                  // AMOAND
-                            0b10000 => {
-                                // AMOMIN (signed)
-                                let a = old as i64;
-                                let b = rs2_val as i64;
-                                if a < b { old } else { rs2_val }
-                            }
-                            0b10100 => {
-                                // AMOMAX (signed)
-                                let a = old as i64;
-                                let b = rs2_val as i64;
-                                if a > b { old } else { rs2_val }
-                            }
-                            0b11000 => {
-                                // AMOMINU (unsigned)
-                                if old < rs2_val { old } else { rs2_val }
-                            }
-                            0b11100 => {
-                                // AMOMAXU (unsigned)
-                                if old > rs2_val { old } else { rs2_val }
-                            }
-                            _ => unreachable!(),
-                        };
-
-                        let res = if is_word {
-                            bus.write32(pa, new_val as u32)
-                        } else {
-                            bus.write64(pa, new_val)
-                        };
-                        
-                        // Lock is released here when _amo_guard goes out of scope
-                        drop(_amo_guard);
-                        
-                        if let Err(e) = res {
-                            return self.handle_trap(e, pc, Some(insn_raw));
+                        match bus.atomic_swap(pa, rs2_val, is_word) {
+                            Ok(old) => self.write_reg(rd, old),
+                            Err(e) => return self.handle_trap(e, pc, Some(insn_raw)),
                         }
-
-                        // rd receives the original loaded value (sign-extended to XLEN)
-                        self.write_reg(rd, old);
+                    }
+                    0b00000 => {
+                        // AMOADD
+                        self.clear_reservation_if_conflict(addr);
+                        let rs2_val = self.read_reg(rs2);
+                        match bus.atomic_add(pa, rs2_val, is_word) {
+                            Ok(old) => self.write_reg(rd, old),
+                            Err(e) => return self.handle_trap(e, pc, Some(insn_raw)),
+                        }
+                    }
+                    0b00100 => {
+                        // AMOXOR
+                        self.clear_reservation_if_conflict(addr);
+                        let rs2_val = self.read_reg(rs2);
+                        match bus.atomic_xor(pa, rs2_val, is_word) {
+                            Ok(old) => self.write_reg(rd, old),
+                            Err(e) => return self.handle_trap(e, pc, Some(insn_raw)),
+                        }
+                    }
+                    0b01000 => {
+                        // AMOOR
+                        self.clear_reservation_if_conflict(addr);
+                        let rs2_val = self.read_reg(rs2);
+                        match bus.atomic_or(pa, rs2_val, is_word) {
+                            Ok(old) => self.write_reg(rd, old),
+                            Err(e) => return self.handle_trap(e, pc, Some(insn_raw)),
+                        }
+                    }
+                    0b01100 => {
+                        // AMOAND
+                        self.clear_reservation_if_conflict(addr);
+                        let rs2_val = self.read_reg(rs2);
+                        match bus.atomic_and(pa, rs2_val, is_word) {
+                            Ok(old) => self.write_reg(rd, old),
+                            Err(e) => return self.handle_trap(e, pc, Some(insn_raw)),
+                        }
+                    }
+                    0b10000 => {
+                        // AMOMIN (signed)
+                        self.clear_reservation_if_conflict(addr);
+                        let rs2_val = self.read_reg(rs2);
+                        match bus.atomic_min(pa, rs2_val, is_word) {
+                            Ok(old) => self.write_reg(rd, old),
+                            Err(e) => return self.handle_trap(e, pc, Some(insn_raw)),
+                        }
+                    }
+                    0b10100 => {
+                        // AMOMAX (signed)
+                        self.clear_reservation_if_conflict(addr);
+                        let rs2_val = self.read_reg(rs2);
+                        match bus.atomic_max(pa, rs2_val, is_word) {
+                            Ok(old) => self.write_reg(rd, old),
+                            Err(e) => return self.handle_trap(e, pc, Some(insn_raw)),
+                        }
+                    }
+                    0b11000 => {
+                        // AMOMINU (unsigned)
+                        self.clear_reservation_if_conflict(addr);
+                        let rs2_val = self.read_reg(rs2);
+                        match bus.atomic_minu(pa, rs2_val, is_word) {
+                            Ok(old) => self.write_reg(rd, old),
+                            Err(e) => return self.handle_trap(e, pc, Some(insn_raw)),
+                        }
+                    }
+                    0b11100 => {
+                        // AMOMAXU (unsigned)
+                        self.clear_reservation_if_conflict(addr);
+                        let rs2_val = self.read_reg(rs2);
+                        match bus.atomic_maxu(pa, rs2_val, is_word) {
+                            Ok(old) => self.write_reg(rd, old),
+                            Err(e) => return self.handle_trap(e, pc, Some(insn_raw)),
+                        }
                     }
                     _ => {
                         return self.handle_trap(

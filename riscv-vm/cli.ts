@@ -3,10 +3,11 @@
 /**
  * RISC-V VM CLI
  *
- * This CLI mirrors the browser VM wiring in `useVM`:
- * - loads a kernel image (ELF or raw binary)
- * - optionally loads a VirtIO block disk image (e.g. xv6 `fs.img`)
- * - can optionally connect to a network relay (WebTransport/WebSocket)
+ * This CLI mirrors the native Rust VM CLI interface:
+ * - loads a kernel image (ELF or raw binary) via --kernel/-k
+ * - optionally loads a VirtIO block disk image (e.g. xv6 `fs.img`) via --disk/-d
+ * - optionally specifies number of harts via --harts/-n
+ * - can optionally connect to a network relay via --net-webtransport
  * - runs the VM in a tight loop
  * - connects stdin → UART input and UART output → stdout
  */
@@ -16,14 +17,14 @@ import path from 'node:path';
 import yargs from 'yargs';
 import { hideBin } from 'yargs/helpers';
 
-// Default relay server URL and cert hash, mirroring the React hook.
+// Default relay server URL and cert hash.
 const DEFAULT_RELAY_URL =
   process.env.RELAY_URL || 'https://localhost:4433';
 const DEFAULT_CERT_HASH =
   process.env.RELAY_CERT_HASH || '';
 
 /**
- * Create and initialize a Wasm VM instance, mirroring the React `useVM` hook:
+ * Create and initialize a Wasm VM instance, mirroring the native VM:
  * - initializes the WASM module once via `WasmInternal`
  * - constructs `WasmVm` with the kernel bytes
  * - optionally attaches a VirtIO block device from a disk image
@@ -31,17 +32,20 @@ const DEFAULT_CERT_HASH =
  */
 async function createVm(
   kernelPath: string,
-  diskPath?: string,
   options?: {
-    network?: boolean;
-    relayUrl?: string;
+    disk?: string;
+    harts?: number;
+    netWebtransport?: string;
     certHash?: string;
+    debug?: boolean;
   },
 ) {
   let kernelBytes: Uint8Array;
 
   if (kernelPath.startsWith('http://') || kernelPath.startsWith('https://')) {
-    console.error(`[CLI] Downloading kernel from ${kernelPath}...`);
+    if (options?.debug) {
+      console.error(`[CLI] Downloading kernel from ${kernelPath}...`);
+    }
     const response = await fetch(kernelPath);
     if (!response.ok) {
       throw new Error(
@@ -66,34 +70,43 @@ async function createVm(
     throw new Error('WasmVm class not found in wasm module');
   }
 
+  // In Node.js CLI, multi-hart mode is not supported because WASM workers
+  // require browser Web Workers. Fall back to single-hart mode.
+  const requestedHarts = options?.harts ?? 1;
+  if (requestedHarts > 1) {
+    console.error('[CLI] Warning: Multi-hart mode (--harts > 1) is not supported in Node.js CLI');
+    console.error('[CLI] The WASM VM requires browser Web Workers for SMP. Falling back to single hart.');
+  }
+  
+  // Always use single hart in Node.js CLI
   const vm = new VmCtor(kernelBytes);
 
-  if (diskPath) {
-    const resolvedDisk = path.resolve(diskPath);
-    const diskBuf =  fs.readFileSync(resolvedDisk);
+  if (options?.disk) {
+    const resolvedDisk = path.resolve(options.disk);
+    const diskBuf = fs.readFileSync(resolvedDisk);
     const diskBytes = new Uint8Array(diskBuf);
 
     if (typeof vm.load_disk === 'function') {
       vm.load_disk(diskBytes);
+      if (options?.debug) {
+        console.error(`[VM] Loaded disk: ${resolvedDisk}`);
+      }
     }
   }
 
-  // Optional network setup (pre-boot), mirroring `useVM.startVM`.
-  if (options?.network) {
-    const relayUrl = options.relayUrl || DEFAULT_RELAY_URL;
+  // Network setup via WebTransport (matching native --net-webtransport)
+  if (options?.netWebtransport) {
+    const relayUrl = options.netWebtransport;
     const certHash = options.certHash || DEFAULT_CERT_HASH || undefined;
 
     try {
-      if (typeof (vm as any).connect_webtransport === 'function') {
-        (vm as any).connect_webtransport(relayUrl, certHash);
-        console.error(
-          `[Network] Initiating WebTransport connection to ${relayUrl}`,
-        );
-      } else if (typeof (vm as any).connect_network === 'function') {
-        (vm as any).connect_network(relayUrl);
-        console.error(
-          `[Network] Initiating WebSocket connection to ${relayUrl}`,
-        );
+      if (typeof vm.connect_webtransport === 'function') {
+        vm.connect_webtransport(relayUrl, certHash);
+        if (options?.debug) {
+          console.error(
+            `[Network] Initiating WebTransport connection to ${relayUrl}`,
+          );
+        }
       } else {
         console.error(
           '[Network] No network methods available on VM (rebuild WASM with networking)',
@@ -162,6 +175,38 @@ function runVmLoop(vm: any) {
 
   const INSTRUCTIONS_PER_TICK = 100_000;
 
+  const drainOutput = () => {
+    // Drain UART output buffer
+    // In raw terminal mode, we need \r\n for proper line breaks
+    const outChunks: string[] = [];
+    let limit = 2000;
+    let code = typeof vm.get_output === 'function' ? vm.get_output() : undefined;
+
+    while (code !== undefined && limit-- > 0) {
+      const c = Number(code);
+
+      if (c === 8) {
+        // Backspace – move cursor back, erase, move back
+        outChunks.push('\b \b');
+      } else if (c === 10) {
+        // LF -> CRLF for raw terminal mode (like native CLI)
+        outChunks.push('\r\n');
+      } else if (c === 13) {
+        // CR - just output CR
+        outChunks.push('\r');
+      } else {
+        // Pass through all other characters including ANSI escape sequences
+        outChunks.push(String.fromCharCode(c));
+      }
+
+      code = vm.get_output();
+    }
+
+    if (outChunks.length) {
+      process.stdout.write(outChunks.join(''));
+    }
+  };
+
   const loop = () => {
     if (!running) return;
 
@@ -171,31 +216,25 @@ function runVmLoop(vm: any) {
         vm.step();
       }
 
-      // Drain UART output buffer, similar to `useVM`
-      const outChunks: string[] = [];
-      let limit = 2000;
-      let code = typeof vm.get_output === 'function' ? vm.get_output() : undefined;
+      // Drain output
+      drainOutput();
 
-      while (code !== undefined && limit-- > 0) {
-        const c = Number(code);
-
-        if (c === 8) {
-          // Backspace – move cursor back, erase, move back
-          outChunks.push('\b \b');
-        } else if (c === 10 || c === 13) {
-          outChunks.push('\n');
-        } else if (c >= 32 && c <= 126) {
-          outChunks.push(String.fromCharCode(c));
+      // Check if VM has halted (e.g., shutdown command)
+      if (typeof vm.is_halted === 'function' && vm.is_halted()) {
+        // Drain any remaining output
+        drainOutput();
+        
+        const haltCode = typeof vm.halt_code === 'function' ? vm.halt_code() : 0n;
+        if (haltCode === 0x5555n) {
+          console.log('\r\n[VM] Clean shutdown (PASS)');
+        } else {
+          console.log(`\r\n[VM] Shutdown with code: 0x${haltCode.toString(16)}`);
         }
-
-        code = vm.get_output();
-      }
-
-      if (outChunks.length) {
-        process.stdout.write(outChunks.join(''));
+        shutdown(0);
+        return;
       }
     } catch (err) {
-      console.error('\n[VM] Error while executing:', err);
+      console.error('\r\n[VM] Error while executing:', err);
       shutdown(1);
       return;
     }
@@ -207,62 +246,86 @@ function runVmLoop(vm: any) {
   loop();
 }
 
-(yargs(hideBin(process.argv)) as any)
-  .command(
-    'run <kernel>',
-    'Runs a RISC-V kernel inside the virtual machine',
-    (y: any) =>
-      y
-        .positional('kernel', {
-          type: 'string',
-          describe: 'Path to the RISC-V kernel (ELF or raw binary)',
-          demandOption: true,
-        })
-        .option('disk', {
-          alias: 'd',
-          type: 'string',
-          describe: 'Optional path to a VirtIO block disk image (e.g. xv6 fs.img)',
-        })
-        .option('network', {
-          alias: 'n',
-          type: 'boolean',
-          describe:
-            'Enable network and connect to relay at boot (uses WebTransport/WebSocket)',
-        })
-        .option('relay-url', {
-          alias: 'r',
-          type: 'string',
-          describe: `Relay URL for WebTransport/WebSocket (default: ${DEFAULT_RELAY_URL})`,
-        })
-        .option('cert-hash', {
-          alias: 'c',
-          type: 'string',
-          describe:
-            'Optional certificate SHA-256 hash for self-signed TLS (used with WebTransport)',
-        }),
-    async (argv: any) => {
-      const kernelPath = argv.kernel as string;
-      const diskPath = (argv.disk ?? undefined) as string | undefined;
-      const relayUrlArg = (argv['relay-url'] ?? undefined) as string | undefined;
-      const certHashArg = (argv['cert-hash'] ?? undefined) as string | undefined;
-      // If user explicitly passes --network or a relay URL, enable networking.
-      const enableNetwork =
-        (argv.network as boolean | undefined) ?? !!relayUrlArg;
+/**
+ * Print banner matching native VM output
+ */
+function printBanner(kernelPath: string, numHarts: number, netWebtransport?: string) {
+  const kernelName = path.basename(kernelPath);
+  
+  console.log();
+  console.log('╔══════════════════════════════════════════════════════════════╗');
+  console.log('║              RISC-V Emulator (WASM Edition)                  ║');
+  console.log('╠══════════════════════════════════════════════════════════════╣');
+  console.log(`║  Kernel: ${kernelName.padEnd(50)} ║`);
+  console.log(`║  Harts:  ${String(numHarts).padEnd(50)} ║`);
+  if (netWebtransport) {
+    console.log(`║  Network: ${netWebtransport.padEnd(49)} ║`);
+  }
+  console.log('╚══════════════════════════════════════════════════════════════╝');
+  console.log();
+}
 
-      try {
-        const vm = await createVm(kernelPath, diskPath, {
-          network: enableNetwork,
-          relayUrl: relayUrlArg,
-          certHash: certHashArg,
-        });
-        runVmLoop(vm);
-      } catch (err) {
-        console.error('[CLI] Failed to start VM:', err);
-        process.exit(1);
-      }
-    },
-  )
-  .demandCommand(1, 'You need to specify a command')
-  .strict()
+const argv = (yargs(hideBin(process.argv)) as any)
+  .usage('Usage: $0 [options]')
+  .option('kernel', {
+    alias: 'k',
+    type: 'string',
+    describe: 'Path to kernel ELF or binary',
+    demandOption: true,
+  })
+  .option('disk', {
+    alias: 'd',
+    type: 'string',
+    describe: 'Path to disk image (optional)',
+  })
+  .option('harts', {
+    alias: 'n',
+    type: 'number',
+    describe: 'Number of harts (ignored in CLI - multi-hart requires browser Web Workers)',
+    default: 1,
+  })
+  .option('net-webtransport', {
+    type: 'string',
+    describe: 'WebTransport relay URL for networking (e.g., https://127.0.0.1:4433)',
+  })
+  .option('cert-hash', {
+    type: 'string',
+    describe: 'Certificate hash for WebTransport (for self-signed certs)',
+  })
+  .option('debug', {
+    type: 'boolean',
+    describe: 'Enable debug output',
+    default: false,
+  })
   .help()
-  .parse();
+  .version()
+  .parseSync();
+
+(async () => {
+  const kernelPath = argv.kernel as string;
+  const diskPath = argv.disk as string | undefined;
+  const hartsArg = argv.harts as number;
+  const netWebtransport = argv['net-webtransport'] as string | undefined;
+  const certHash = argv['cert-hash'] as string | undefined;
+  const debug = argv.debug as boolean;
+
+  // Node.js CLI always uses single hart - multi-hart requires browser Web Workers
+  const numHarts = 1;
+
+  // Print banner (always shows 1 hart for CLI)
+  printBanner(kernelPath, numHarts, netWebtransport);
+
+  try {
+    const vm = await createVm(kernelPath, {
+      disk: diskPath,
+      harts: hartsArg, // Pass the requested value so createVm can warn if > 1
+      netWebtransport,
+      certHash,
+      debug,
+    });
+    runVmLoop(vm);
+  } catch (err) {
+    console.error('[CLI] Failed to start VM:', err);
+    process.exit(1);
+  }
+})();

@@ -6,6 +6,23 @@ import { NodeResolvePlugin } from "@esbuild-plugins/node-resolve";
 import { defineConfig, type Format } from "tsup";
 
 const packagesDir = path.resolve(process.cwd());
+// Browser-compatible base64 to Uint8Array decoder
+const base64DecodeCode = `
+function __decodeBase64(base64) {
+  if (typeof Buffer !== 'undefined') {
+    // Node.js environment
+    return Buffer.from(base64, 'base64');
+  }
+  // Browser environment - use atob
+  const binaryString = atob(base64);
+  const bytes = new Uint8Array(binaryString.length);
+  for (let i = 0; i < binaryString.length; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes;
+}
+`;
+
 export const wasmPlugin = {
   name: "wasm",
   setup(build: any) {
@@ -19,7 +36,8 @@ export const wasmPlugin = {
       const buffer = await fs.promises.readFile(args.path);
       const base64 = buffer.toString("base64");
       return {
-        contents: `export default Buffer.from("${base64}", "base64")`,
+        // Use browser-compatible base64 decoding
+        contents: `${base64DecodeCode}\nexport default __decodeBase64("${base64}");`,
         loader: "js",
       };
     });

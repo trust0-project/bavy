@@ -141,12 +141,19 @@ fn start_system_services() {
     klog_info("init", &format!("{} harts available for parallel tasks", num_harts));
     
     // Register service definitions (available services)
+    // 
+    // NOTE: All daemons are pinned to hart 0 (Some(0)) because in WASM multi-hart
+    // mode, only hart 0 (main thread) has VirtIO access. Secondary harts (workers)
+    // only share DRAM via SharedArrayBuffer and cannot access disk/network.
+    // 
+    // In native mode, all harts share Arc<SystemBus> with VirtIO, but pinning to
+    // hart 0 is still safe and keeps behavior consistent across platforms.
     register_service_def(
         "klogd",
         "Kernel logger daemon - logs system memory stats",
         klogd_service,
         Priority::Normal,
-        Some(1),
+        Some(0),  // Pin to hart 0 - has VirtIO access in both native and WASM
     );
     
     register_service_def(
@@ -154,21 +161,15 @@ fn start_system_services() {
         "System monitor daemon - monitors system health",
         sysmond_service,
         Priority::Normal,
-        Some(2),
+        Some(0),  // Pin to hart 0 - has VirtIO access in both native and WASM
     );
     
-    // Auto-start klogd on hart 1 (if available)
-    if num_harts > 1 {
-        if let Ok(()) = start_service("klogd") {
-            klog_info("init", "Auto-started klogd");
-        }
+    // Auto-start daemons (they're pinned to hart 0, safe in all modes)
+    if let Ok(()) = start_service("klogd") {
+        klog_info("init", "Auto-started klogd on hart 0");
     }
-    
-    // Auto-start sysmond on hart 2 (if available)
-    if num_harts > 2 {
-        if let Ok(()) = start_service("sysmond") {
-            klog_info("init", "Auto-started sysmond");
-        }
+    if let Ok(()) = start_service("sysmond") {
+        klog_info("init", "Auto-started sysmond on hart 0");
     }
 }
 

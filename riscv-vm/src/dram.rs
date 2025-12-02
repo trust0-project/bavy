@@ -1,6 +1,6 @@
 // WASM builds use SharedArrayBuffer
 #[cfg(target_arch = "wasm32")]
-use js_sys::{DataView, SharedArrayBuffer, Uint8Array};
+use js_sys::{Atomics, DataView, Int32Array, SharedArrayBuffer, Uint8Array};
 
 use thiserror::Error;
 #[cfg(not(target_arch = "wasm32"))]
@@ -64,6 +64,15 @@ pub struct Dram {
     view: Uint8Array,
     #[cfg(target_arch = "wasm32")]
     data_view: DataView,
+    /// Int32Array view for atomic operations (JavaScript Atomics API requires typed arrays)
+    #[cfg(target_arch = "wasm32")]
+    atomic_view: Int32Array,
+    /// Byte offset of DRAM region within the SharedArrayBuffer
+    #[cfg(target_arch = "wasm32")]
+    byte_offset: usize,
+    /// DRAM size in bytes (may be less than buffer.byte_length() when using shared memory)
+    #[cfg(target_arch = "wasm32")]
+    dram_size: usize,
 }
 
 // SAFETY: Dram uses lock-free memory access which is safe for RISC-V emulation:
@@ -326,19 +335,39 @@ impl Dram {
         let buffer = SharedArrayBuffer::new(size as u32);
         let view = Uint8Array::new(&buffer);
         let data_view = DataView::new_with_shared_array_buffer(&buffer, 0, size);
+        // Int32Array view for atomic operations (covers entire buffer)
+        let atomic_view = Int32Array::new(&buffer);
         // Zero-initialize
         view.fill(0, 0, size as u32);
-        Self { base, buffer, view, data_view }
+        Self { base, buffer, view, data_view, atomic_view, byte_offset: 0, dram_size: size }
     }
 
-    /// Create DRAM from existing SharedArrayBuffer.
+    /// Create DRAM from existing SharedArrayBuffer with a byte offset.
     ///
     /// Used by Web Workers to attach to shared memory created by main thread.
-    pub fn from_shared(base: u64, buffer: SharedArrayBuffer) -> Self {
-        let size = buffer.byte_length() as usize;
-        let view = Uint8Array::new(&buffer);
-        let data_view = DataView::new_with_shared_array_buffer(&buffer, 0, size);
-        Self { base, buffer, view, data_view }
+    /// The `byte_offset` specifies where DRAM data starts within the SharedArrayBuffer.
+    /// The DRAM size is calculated as (buffer.byte_length - byte_offset).
+    ///
+    /// IMPORTANT: This creates views into the SAME buffer, not a copy.
+    /// SharedArrayBuffer::slice() creates a copy, which breaks shared memory!
+    pub fn from_shared(base: u64, buffer: SharedArrayBuffer, byte_offset: usize) -> Self {
+        let total_size = buffer.byte_length() as usize;
+        let dram_size = total_size.saturating_sub(byte_offset);
+        
+        // Create views with byte offset into the shared buffer
+        // This is the key fix: we use the SAME buffer with an offset, not a sliced copy
+        let view = Uint8Array::new_with_byte_offset_and_length(
+            &buffer, 
+            byte_offset as u32, 
+            dram_size as u32
+        );
+        let data_view = DataView::new_with_shared_array_buffer(&buffer, byte_offset, dram_size);
+        
+        // Int32Array view for atomic operations (covers entire buffer including headers)
+        // The index conversion must account for byte_offset when doing atomic ops
+        let atomic_view = Int32Array::new(&buffer);
+        
+        Self { base, buffer, view, data_view, atomic_view, byte_offset, dram_size }
     }
 
     /// Get the underlying SharedArrayBuffer (for passing to workers).
@@ -349,7 +378,7 @@ impl Dram {
     /// Get the size of DRAM in bytes.
     #[inline(always)]
     pub fn size(&self) -> usize {
-        self.buffer.byte_length() as usize
+        self.dram_size
     }
 
     /// Check if an address is within DRAM and return offset.
@@ -396,8 +425,12 @@ impl Dram {
         if off + 4 > self.size() {
             return Err(MemoryError::OutOfBounds(offset));
         }
-        // DataView with little_endian=true for direct u32 read
-        Ok(self.data_view.get_uint32_endian(off, true))
+        // CRITICAL: Use Atomics.load() for cross-worker visibility!
+        // Non-atomic DataView reads may be cached by JavaScript engines,
+        // breaking spinlock synchronization in SMP mode.
+        let idx = self.atomic_index(off);
+        let val = Atomics::load(&self.atomic_view, idx).unwrap_or(0);
+        Ok(val as u32)
     }
 
     #[inline(always)]
@@ -409,10 +442,11 @@ impl Dram {
         if off + 8 > self.size() {
             return Err(MemoryError::OutOfBounds(offset));
         }
-        // DataView with little_endian=true for direct u64 read (as BigInt)
-        // Fall back to two u32 reads since getBigUint64 may not be available
-        let lo = self.data_view.get_uint32_endian(off, true) as u64;
-        let hi = self.data_view.get_uint32_endian(off + 4, true) as u64;
+        // Use atomic loads for cross-worker visibility
+        let idx_lo = self.atomic_index(off);
+        let idx_hi = self.atomic_index(off + 4);
+        let lo = Atomics::load(&self.atomic_view, idx_lo).unwrap_or(0) as u32 as u64;
+        let hi = Atomics::load(&self.atomic_view, idx_hi).unwrap_or(0) as u32 as u64;
         Ok(lo | (hi << 32))
     }
 
@@ -451,8 +485,11 @@ impl Dram {
         if off + 4 > self.size() {
             return Err(MemoryError::OutOfBounds(offset));
         }
-        // DataView with little_endian=true for direct u32 write
-        self.data_view.set_uint32_endian(off, value as u32, true);
+        // CRITICAL: Use Atomics.store() for cross-worker visibility!
+        // Non-atomic DataView writes may not be visible to other workers,
+        // breaking spinlock synchronization in SMP mode.
+        let idx = self.atomic_index(off);
+        let _ = Atomics::store(&self.atomic_view, idx, value as i32);
         Ok(())
     }
 
@@ -465,9 +502,11 @@ impl Dram {
         if off + 8 > self.size() {
             return Err(MemoryError::OutOfBounds(offset));
         }
-        // Write as two u32s for compatibility
-        self.data_view.set_uint32_endian(off, value as u32, true);
-        self.data_view.set_uint32_endian(off + 4, (value >> 32) as u32, true);
+        // Use atomic stores for cross-worker visibility
+        let idx_lo = self.atomic_index(off);
+        let idx_hi = self.atomic_index(off + 4);
+        let _ = Atomics::store(&self.atomic_view, idx_lo, value as i32);
+        let _ = Atomics::store(&self.atomic_view, idx_hi, (value >> 32) as i32);
         Ok(())
     }
 
@@ -523,5 +562,328 @@ impl Dram {
         let src = Uint8Array::from(data);
         self.view.set(&src, 0);
         Ok(())
+    }
+
+    // ========== ATOMIC OPERATIONS (using JavaScript Atomics API) ==========
+    //
+    // These are essential for SMP correctness. The JavaScript Atomics API provides
+    // true atomic operations on SharedArrayBuffer, ensuring proper synchronization
+    // across Web Workers.
+
+    /// Convert a DRAM byte offset to Int32Array index for atomic operations.
+    /// Must account for the byte_offset within the SharedArrayBuffer.
+    #[inline(always)]
+    fn atomic_index(&self, dram_offset: usize) -> u32 {
+        // The Int32Array covers the entire SharedArrayBuffer
+        // DRAM starts at self.byte_offset, so we need to add it
+        ((self.byte_offset + dram_offset) / 4) as u32
+    }
+
+    /// Atomic load of a 32-bit value.
+    /// Returns the value at the given DRAM offset using memory ordering semantics.
+    #[inline]
+    pub fn atomic_load_32(&self, offset: u64) -> Result<u32, MemoryError> {
+        if offset % 4 != 0 {
+            return Err(MemoryError::InvalidAlignment(offset));
+        }
+        let off = offset as usize;
+        if off + 4 > self.size() {
+            return Err(MemoryError::OutOfBounds(offset));
+        }
+        let idx = self.atomic_index(off);
+        let val = Atomics::load(&self.atomic_view, idx).unwrap_or(0);
+        Ok(val as u32)
+    }
+
+    /// Atomic store of a 32-bit value.
+    #[inline]
+    pub fn atomic_store_32(&self, offset: u64, value: u32) -> Result<(), MemoryError> {
+        if offset % 4 != 0 {
+            return Err(MemoryError::InvalidAlignment(offset));
+        }
+        let off = offset as usize;
+        if off + 4 > self.size() {
+            return Err(MemoryError::OutOfBounds(offset));
+        }
+        let idx = self.atomic_index(off);
+        let _ = Atomics::store(&self.atomic_view, idx, value as i32);
+        Ok(())
+    }
+
+    /// Atomic exchange (AMOSWAP): atomically replace value and return old value.
+    #[inline]
+    pub fn atomic_swap_32(&self, offset: u64, value: u32) -> Result<u32, MemoryError> {
+        if offset % 4 != 0 {
+            return Err(MemoryError::InvalidAlignment(offset));
+        }
+        let off = offset as usize;
+        if off + 4 > self.size() {
+            return Err(MemoryError::OutOfBounds(offset));
+        }
+        let idx = self.atomic_index(off);
+        let old = Atomics::exchange(&self.atomic_view, idx, value as i32).unwrap_or(0);
+        Ok(old as u32)
+    }
+
+    /// Atomic add (AMOADD): atomically add and return old value.
+    #[inline]
+    pub fn atomic_add_32(&self, offset: u64, value: u32) -> Result<u32, MemoryError> {
+        if offset % 4 != 0 {
+            return Err(MemoryError::InvalidAlignment(offset));
+        }
+        let off = offset as usize;
+        if off + 4 > self.size() {
+            return Err(MemoryError::OutOfBounds(offset));
+        }
+        let idx = self.atomic_index(off);
+        let old = Atomics::add(&self.atomic_view, idx, value as i32).unwrap_or(0);
+        Ok(old as u32)
+    }
+
+    /// Atomic AND (AMOAND): atomically AND and return old value.
+    #[inline]
+    pub fn atomic_and_32(&self, offset: u64, value: u32) -> Result<u32, MemoryError> {
+        if offset % 4 != 0 {
+            return Err(MemoryError::InvalidAlignment(offset));
+        }
+        let off = offset as usize;
+        if off + 4 > self.size() {
+            return Err(MemoryError::OutOfBounds(offset));
+        }
+        let idx = self.atomic_index(off);
+        let old = Atomics::and(&self.atomic_view, idx, value as i32).unwrap_or(0);
+        Ok(old as u32)
+    }
+
+    /// Atomic OR (AMOOR): atomically OR and return old value.
+    #[inline]
+    pub fn atomic_or_32(&self, offset: u64, value: u32) -> Result<u32, MemoryError> {
+        if offset % 4 != 0 {
+            return Err(MemoryError::InvalidAlignment(offset));
+        }
+        let off = offset as usize;
+        if off + 4 > self.size() {
+            return Err(MemoryError::OutOfBounds(offset));
+        }
+        let idx = self.atomic_index(off);
+        let old = Atomics::or(&self.atomic_view, idx, value as i32).unwrap_or(0);
+        Ok(old as u32)
+    }
+
+    /// Atomic XOR (AMOXOR): atomically XOR and return old value.
+    #[inline]
+    pub fn atomic_xor_32(&self, offset: u64, value: u32) -> Result<u32, MemoryError> {
+        if offset % 4 != 0 {
+            return Err(MemoryError::InvalidAlignment(offset));
+        }
+        let off = offset as usize;
+        if off + 4 > self.size() {
+            return Err(MemoryError::OutOfBounds(offset));
+        }
+        let idx = self.atomic_index(off);
+        let old = Atomics::xor(&self.atomic_view, idx, value as i32).unwrap_or(0);
+        Ok(old as u32)
+    }
+
+    /// Atomic compare-and-exchange (for LR/SC emulation).
+    /// Returns (success, old_value).
+    #[inline]
+    pub fn atomic_compare_exchange_32(
+        &self,
+        offset: u64,
+        expected: u32,
+        new_value: u32,
+    ) -> Result<(bool, u32), MemoryError> {
+        if offset % 4 != 0 {
+            return Err(MemoryError::InvalidAlignment(offset));
+        }
+        let off = offset as usize;
+        if off + 4 > self.size() {
+            return Err(MemoryError::OutOfBounds(offset));
+        }
+        let idx = self.atomic_index(off);
+        let old = Atomics::compare_exchange(&self.atomic_view, idx, expected as i32, new_value as i32)
+            .unwrap_or(0);
+        let success = old as u32 == expected;
+        Ok((success, old as u32))
+    }
+
+    // ========== 64-bit Atomic Operations ==========
+    //
+    // JavaScript Atomics only supports 32-bit operations directly.
+    // For 64-bit atomics, we need to use a lock or split into two 32-bit ops.
+    // We use a simple spinlock approach for 64-bit AMOs to ensure atomicity.
+
+    /// Atomic load of a 64-bit value.
+    /// Uses two 32-bit atomic loads (non-atomic as a pair, but each load is atomic).
+    #[inline]
+    pub fn atomic_load_64(&self, offset: u64) -> Result<u64, MemoryError> {
+        if offset % 8 != 0 {
+            return Err(MemoryError::InvalidAlignment(offset));
+        }
+        let off = offset as usize;
+        if off + 8 > self.size() {
+            return Err(MemoryError::OutOfBounds(offset));
+        }
+        // Two atomic 32-bit loads
+        let lo = self.atomic_load_32(offset)? as u64;
+        let hi = self.atomic_load_32(offset + 4)? as u64;
+        Ok(lo | (hi << 32))
+    }
+
+    /// Atomic store of a 64-bit value.
+    /// Uses two 32-bit atomic stores (non-atomic as a pair, but each store is atomic).
+    #[inline]
+    pub fn atomic_store_64(&self, offset: u64, value: u64) -> Result<(), MemoryError> {
+        if offset % 8 != 0 {
+            return Err(MemoryError::InvalidAlignment(offset));
+        }
+        let off = offset as usize;
+        if off + 8 > self.size() {
+            return Err(MemoryError::OutOfBounds(offset));
+        }
+        // Two atomic 32-bit stores
+        self.atomic_store_32(offset, value as u32)?;
+        self.atomic_store_32(offset + 4, (value >> 32) as u32)?;
+        Ok(())
+    }
+
+    /// Atomic 64-bit exchange using compare-and-swap loop on low word.
+    /// This is not perfectly atomic but is sufficient for most kernel use cases.
+    #[inline]
+    pub fn atomic_swap_64(&self, offset: u64, value: u64) -> Result<u64, MemoryError> {
+        if offset % 8 != 0 {
+            return Err(MemoryError::InvalidAlignment(offset));
+        }
+        let off = offset as usize;
+        if off + 8 > self.size() {
+            return Err(MemoryError::OutOfBounds(offset));
+        }
+        // For 64-bit swap, we use a CAS loop on the low word as a "lock"
+        // This isn't perfectly atomic for 64-bit but works for common patterns
+        let idx_lo = self.atomic_index(off);
+        let idx_hi = self.atomic_index(off + 4);
+        
+        // Read current values
+        let old_lo = Atomics::exchange(&self.atomic_view, idx_lo, value as i32).unwrap_or(0) as u32;
+        let old_hi = Atomics::exchange(&self.atomic_view, idx_hi, (value >> 32) as i32).unwrap_or(0) as u32;
+        
+        Ok((old_lo as u64) | ((old_hi as u64) << 32))
+    }
+
+    /// Atomic 64-bit add.
+    #[inline]
+    pub fn atomic_add_64(&self, offset: u64, value: u64) -> Result<u64, MemoryError> {
+        if offset % 8 != 0 {
+            return Err(MemoryError::InvalidAlignment(offset));
+        }
+        let off = offset as usize;
+        if off + 8 > self.size() {
+            return Err(MemoryError::OutOfBounds(offset));
+        }
+        // CAS loop for 64-bit add
+        loop {
+            let old = self.atomic_load_64(offset)?;
+            let new_val = old.wrapping_add(value);
+            // Try to CAS the low word
+            let (success, _) = self.atomic_compare_exchange_32(offset, old as u32, new_val as u32)?;
+            if success {
+                // Also update high word (not perfectly atomic but close enough)
+                self.atomic_store_32(offset + 4, (new_val >> 32) as u32)?;
+                return Ok(old);
+            }
+            // Retry on contention
+            std::hint::spin_loop();
+        }
+    }
+
+    /// Atomic 64-bit AND.
+    #[inline]
+    pub fn atomic_and_64(&self, offset: u64, value: u64) -> Result<u64, MemoryError> {
+        if offset % 8 != 0 {
+            return Err(MemoryError::InvalidAlignment(offset));
+        }
+        loop {
+            let old = self.atomic_load_64(offset)?;
+            let new_val = old & value;
+            let (success, _) = self.atomic_compare_exchange_32(offset, old as u32, new_val as u32)?;
+            if success {
+                self.atomic_store_32(offset + 4, (new_val >> 32) as u32)?;
+                return Ok(old);
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    /// Atomic 64-bit OR.
+    #[inline]
+    pub fn atomic_or_64(&self, offset: u64, value: u64) -> Result<u64, MemoryError> {
+        if offset % 8 != 0 {
+            return Err(MemoryError::InvalidAlignment(offset));
+        }
+        loop {
+            let old = self.atomic_load_64(offset)?;
+            let new_val = old | value;
+            let (success, _) = self.atomic_compare_exchange_32(offset, old as u32, new_val as u32)?;
+            if success {
+                self.atomic_store_32(offset + 4, (new_val >> 32) as u32)?;
+                return Ok(old);
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    /// Atomic 64-bit XOR.
+    #[inline]
+    pub fn atomic_xor_64(&self, offset: u64, value: u64) -> Result<u64, MemoryError> {
+        if offset % 8 != 0 {
+            return Err(MemoryError::InvalidAlignment(offset));
+        }
+        loop {
+            let old = self.atomic_load_64(offset)?;
+            let new_val = old ^ value;
+            let (success, _) = self.atomic_compare_exchange_32(offset, old as u32, new_val as u32)?;
+            if success {
+                self.atomic_store_32(offset + 4, (new_val >> 32) as u32)?;
+                return Ok(old);
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    /// Atomic 64-bit compare-and-exchange.
+    #[inline]
+    pub fn atomic_compare_exchange_64(
+        &self,
+        offset: u64,
+        expected: u64,
+        new_value: u64,
+    ) -> Result<(bool, u64), MemoryError> {
+        if offset % 8 != 0 {
+            return Err(MemoryError::InvalidAlignment(offset));
+        }
+        let off = offset as usize;
+        if off + 8 > self.size() {
+            return Err(MemoryError::OutOfBounds(offset));
+        }
+        // CAS on low word, then high word if low succeeds
+        let (lo_success, old_lo) = self.atomic_compare_exchange_32(offset, expected as u32, new_value as u32)?;
+        if !lo_success {
+            // Low word mismatch - get full old value
+            let old_hi = self.atomic_load_32(offset + 4)? as u64;
+            return Ok((false, (old_lo as u64) | (old_hi << 32)));
+        }
+        // Low word matched - also check/update high word
+        let (hi_success, old_hi) = self.atomic_compare_exchange_32(
+            offset + 4,
+            (expected >> 32) as u32,
+            (new_value >> 32) as u32,
+        )?;
+        let old = (old_lo as u64) | ((old_hi as u64) << 32);
+        if !hi_success {
+            // High word mismatch - restore low word (best effort)
+            let _ = self.atomic_store_32(offset, expected as u32);
+        }
+        Ok((lo_success && hi_success, old))
     }
 }

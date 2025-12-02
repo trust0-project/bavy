@@ -1,7 +1,5 @@
-
-
 import createConfig from './';
 export default createConfig({
   format: ['esm'],
-  entry: ['index.ts', 'worker.ts'],  
+  entry: ['index.ts'],  // Worker is built separately
 });
