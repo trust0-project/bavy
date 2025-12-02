@@ -56,10 +56,10 @@ jobs:
         id: before
         run: echo "version=$(node -p "require('./riscv-vm/package.json').version")" >> $GITHUB_OUTPUT
 
-      - name: Run Nx Release (version only, skip publish)
+      - name: Run Nx Release (version + changelog, skip publish)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: npx nx release version && npx nx release changelog
+        run: npx nx release --skip-publish
 
       - name: Get version after release
         id: after
