@@ -439,113 +439,142 @@ fn append_to_log(line: &str) -> bool {
     false
 }
 
-/// Kernel Logger Daemon (klogd)
-/// 
-/// Runs continuously on a secondary hart, periodically writing system status
-/// to /var/log/kernel.log every 5 seconds.
-pub fn klogd_service() {
-    let hart_id = crate::get_hart_id();
-    let mut tick: u64 = 0;
+// ═══════════════════════════════════════════════════════════════════════════════
+// COOPERATIVE DAEMON TICKS
+// These functions do one unit of work and return immediately.
+// Called from the shell loop on hart 0.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+use core::sync::atomic::AtomicI64;
+
+/// State for klogd daemon
+static KLOGD_LAST_RUN: AtomicI64 = AtomicI64::new(0);
+static KLOGD_TICK: AtomicUsize = AtomicUsize::new(0);
+static KLOGD_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+/// State for sysmond daemon  
+static SYSMOND_LAST_RUN: AtomicI64 = AtomicI64::new(0);
+static SYSMOND_TICK: AtomicUsize = AtomicUsize::new(0);
+static SYSMOND_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+/// Run klogd work if 5 seconds have passed since last run
+pub fn klogd_tick() {
+    let now = crate::get_time_ms();
+    let last = KLOGD_LAST_RUN.load(Ordering::Relaxed);
     
-    // Write startup message
-    let startup_msg = format!(
-        "══════════════════════════════════════════════════════════════\n\
-         BAVY OS - Kernel Logger Started\n\
-         ══════════════════════════════════════════════════════════════\n\
-         Time: {}ms | Hart: {} | klogd daemon initialized\n\
-         ──────────────────────────────────────────────────────────────",
-        crate::get_time_ms(),
-        hart_id
-    );
-    append_to_log(&startup_msg);
-    
-    // Main daemon loop
-    loop {
-        tick += 1;
+    // First run: initialize
+    if !KLOGD_INITIALIZED.load(Ordering::Relaxed) {
+        KLOGD_INITIALIZED.store(true, Ordering::Relaxed);
+        KLOGD_LAST_RUN.store(now, Ordering::Relaxed);
         
-        // Wait 5 seconds between log entries
-        spin_delay_ms(5000);
-        
-        let timestamp = crate::get_time_ms();
-        let (heap_used, heap_free) = crate::allocator::heap_stats();
-        let heap_total = crate::allocator::heap_size();
-        let usage_pct = (heap_used * 100) / heap_total.max(1);
-        
-        // Format log entry
-        let log_entry = format!(
-            "[{:>10}ms] klogd #{}: mem={}%({}/{}KB)",
-            timestamp,
-            tick,
-            usage_pct,
-            heap_used / 1024,
-            heap_total / 1024,
+        let startup_msg = format!(
+            "══════════════════════════════════════════════════════════════\n\
+             BAVY OS - Kernel Logger Started\n\
+             ══════════════════════════════════════════════════════════════\n\
+             Time: {}ms | Hart: 0 | klogd daemon initialized\n\
+             ──────────────────────────────────────────────────────────────",
+            now
         );
+        append_to_log(&startup_msg);
+        return;
+    }
+    
+    // Check if 5 seconds have passed
+    if now - last < 5000 {
+        return;
+    }
+    
+    KLOGD_LAST_RUN.store(now, Ordering::Relaxed);
+    let tick = KLOGD_TICK.fetch_add(1, Ordering::Relaxed) + 1;
+    
+    let (heap_used, _heap_free) = crate::allocator::heap_stats();
+    let heap_total = crate::allocator::heap_size();
+    let usage_pct = (heap_used * 100) / heap_total.max(1);
+    
+    let log_entry = format!(
+        "[{:>10}ms] klogd #{}: mem={}%({}/{}KB)",
+        now,
+        tick,
+        usage_pct,
+        heap_used / 1024,
+        heap_total / 1024,
+    );
+    
+    append_to_log(&log_entry);
+}
+
+/// Run sysmond work if 10 seconds have passed since last run
+pub fn sysmond_tick() {
+    let now = crate::get_time_ms();
+    let last = SYSMOND_LAST_RUN.load(Ordering::Relaxed);
+    
+    // First run: initialize (with 2 second delay after klogd)
+    if !SYSMOND_INITIALIZED.load(Ordering::Relaxed) {
+        if now < 2000 {
+            return; // Wait for initial delay
+        }
+        SYSMOND_INITIALIZED.store(true, Ordering::Relaxed);
+        SYSMOND_LAST_RUN.store(now, Ordering::Relaxed);
         
-        append_to_log(&log_entry);
+        let startup_msg = format!(
+            "[{:>10}ms] sysmond started on hart 0",
+            now
+        );
+        append_to_log(&startup_msg);
+        return;
+    }
+    
+    // Check if 10 seconds have passed
+    if now - last < 10000 {
+        return;
+    }
+    
+    SYSMOND_LAST_RUN.store(now, Ordering::Relaxed);
+    let tick = SYSMOND_TICK.fetch_add(1, Ordering::Relaxed) + 1;
+    
+    // Collect system stats
+    let task_count = SCHEDULER.task_count();
+    let queued = SCHEDULER.queued_count();
+    let num_harts = crate::HARTS_ONLINE.load(Ordering::Relaxed);
+    
+    let net_ok = crate::NET_STATE.lock().is_some();
+    let fs_ok = crate::FS_STATE.lock().is_some();
+    
+    let log_entry = format!(
+        "[{:>10}ms] sysmond #{}: harts={} tasks={} queued={} net={} fs={}",
+        now,
+        tick,
+        num_harts,
+        task_count,
+        queued,
+        if net_ok { "UP" } else { "DOWN" },
+        if fs_ok { "OK" } else { "ERR" },
+    );
+    
+    append_to_log(&log_entry);
+    
+    // Reap zombie processes
+    let reaped = SCHEDULER.reap_zombies();
+    if reaped > 0 {
+        let reap_msg = format!(
+            "[{:>10}ms] sysmond: reaped {} zombie process(es)",
+            crate::get_time_ms(),
+            reaped
+        );
+        append_to_log(&reap_msg);
     }
 }
 
-/// System Monitor Daemon (sysmond)  
-/// 
-/// Runs continuously on a secondary hart, monitoring system health
-/// and logging statistics every 10 seconds.
+/// Legacy service entry points (for task scheduler compatibility)
+/// These are no longer used directly but kept for API compatibility
+pub fn klogd_service() {
+    // Single tick - for scheduler-based execution
+    klogd_tick();
+}
+
 pub fn sysmond_service() {
-    let hart_id = crate::get_hart_id();
-    let mut tick: u64 = 0;
-    
-    // Small initial delay to let klogd start first
-    spin_delay_ms(2000);
-    
-    // Write startup message
-    let startup_msg = format!(
-        "[{:>10}ms] sysmond started on hart {}",
-        crate::get_time_ms(),
-        hart_id
-    );
-    append_to_log(&startup_msg);
-    
-    // Main daemon loop
-    loop {
-        tick += 1;
-        
-        // Wait 10 seconds between checks
-        spin_delay_ms(10000);
-        
-        let timestamp = crate::get_time_ms();
-        
-        // Collect system stats (minimize lock hold time)
-        let task_count = SCHEDULER.task_count();
-        let queued = SCHEDULER.queued_count();
-        let num_harts = crate::HARTS_ONLINE.load(Ordering::Relaxed);
-        
-        let net_ok = crate::NET_STATE.lock().is_some();
-        let fs_ok = crate::FS_STATE.lock().is_some();
-        
-        // Format log entry
-        let log_entry = format!(
-            "[{:>10}ms] sysmond #{}: harts={} tasks={} queued={} net={} fs={}",
-            timestamp,
-            tick,
-            num_harts,
-            task_count,
-            queued,
-            if net_ok { "UP" } else { "DOWN" },
-            if fs_ok { "OK" } else { "ERR" },
-        );
-        
-        append_to_log(&log_entry);
-        
-        // Reap zombie processes periodically
-        let reaped = SCHEDULER.reap_zombies();
-        if reaped > 0 {
-            let reap_msg = format!(
-                "[{:>10}ms] sysmond: reaped {} zombie process(es)",
-                crate::get_time_ms(),
-                reaped
-            );
-            append_to_log(&reap_msg);
-        }
-    }
+    // Single tick - for scheduler-based execution  
+    sysmond_tick();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

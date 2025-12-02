@@ -490,6 +490,84 @@ impl ScriptRuntime {
         engine.register_fn("fs_available", || -> bool {
             crate::FS_STATE.lock().is_some()
         });
+        
+        // mkdir(path) -> bool
+        engine.register_fn("mkdir", |path: ImmutableString| -> bool {
+            let mut fs_guard = crate::FS_STATE.lock();
+            let mut blk_guard = crate::BLK_DEV.lock();
+            if let (Some(fs), Some(dev)) = (fs_guard.as_mut(), blk_guard.as_mut()) {
+                return fs.mkdir(dev, path.as_str()).is_ok();
+            }
+            false
+        });
+        
+        // rmdir(path) -> bool
+        engine.register_fn("rmdir", |path: ImmutableString| -> bool {
+            let mut fs_guard = crate::FS_STATE.lock();
+            let mut blk_guard = crate::BLK_DEV.lock();
+            if let (Some(fs), Some(dev)) = (fs_guard.as_mut(), blk_guard.as_mut()) {
+                let dir_path = if path.ends_with('/') {
+                    path.to_string()
+                } else {
+                    format!("{}/", path)
+                };
+                return fs.remove(dev, &dir_path).is_ok();
+            }
+            false
+        });
+        
+        // rm(path) -> bool
+        engine.register_fn("rm", |path: ImmutableString| -> bool {
+            let mut fs_guard = crate::FS_STATE.lock();
+            let mut blk_guard = crate::BLK_DEV.lock();
+            if let (Some(fs), Some(dev)) = (fs_guard.as_mut(), blk_guard.as_mut()) {
+                return fs.remove(dev, path.as_str()).is_ok();
+            }
+            false
+        });
+        
+        // is_dir(path) -> bool
+        engine.register_fn("is_dir", |path: ImmutableString| -> bool {
+            let fs_guard = crate::FS_STATE.lock();
+            let mut blk_guard = crate::BLK_DEV.lock();
+            if let (Some(fs), Some(dev)) = (fs_guard.as_ref(), blk_guard.as_mut()) {
+                return fs.is_dir(dev, path.as_str());
+            }
+            false
+        });
+        
+        // fs_sync() -> i64 (number of blocks synced)
+        engine.register_fn("fs_sync", || -> i64 {
+            let mut fs_guard = crate::FS_STATE.lock();
+            let mut blk_guard = crate::BLK_DEV.lock();
+            if let (Some(fs), Some(dev)) = (fs_guard.as_mut(), blk_guard.as_mut()) {
+                return fs.sync(dev).unwrap_or(0) as i64;
+            }
+            0
+        });
+        
+        // fs_cache_stats() -> {hits, misses, writebacks, cached}
+        engine.register_fn("fs_cache_stats", || -> Map {
+            let fs_guard = crate::FS_STATE.lock();
+            let mut map = Map::new();
+            if let Some(fs) = fs_guard.as_ref() {
+                let (hits, misses, writebacks, cached) = fs.cache_stats();
+                map.insert("hits".into(), Dynamic::from(hits as i64));
+                map.insert("misses".into(), Dynamic::from(misses as i64));
+                map.insert("writebacks".into(), Dynamic::from(writebacks as i64));
+                map.insert("cached".into(), Dynamic::from(cached as i64));
+            }
+            map
+        });
+        
+        // fs_dirty_blocks() -> i64
+        engine.register_fn("fs_dirty_blocks", || -> i64 {
+            let fs_guard = crate::FS_STATE.lock();
+            if let Some(fs) = fs_guard.as_ref() {
+                return fs.dirty_blocks() as i64;
+            }
+            0
+        });
     }
     
     // ═══════════════════════════════════════════════════════════════════════
@@ -696,6 +774,160 @@ impl ScriptRuntime {
                 Some(status) => status.as_str().into(),
                 None => "unknown".into(),
             }
+        });
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════
+    // os:ipc MODULE - Inter-Process Communication functions
+    // ═══════════════════════════════════════════════════════════════════════
+    
+    fn register_ipc_module(engine: &mut Engine) {
+        // create_channel(name) -> channel_id
+        engine.register_fn("create_channel", |name: ImmutableString| -> i64 {
+            let channel = crate::ipc::IPC.create_channel(name.as_str());
+            channel.id as i64
+        });
+        
+        // get_channel(name) -> channel_id or -1
+        engine.register_fn("get_channel", |name: ImmutableString| -> i64 {
+            match crate::ipc::IPC.get_channel_by_name(name.as_str()) {
+                Some(ch) => ch.id as i64,
+                None => -1,
+            }
+        });
+        
+        // channel_send(channel_id, message, msg_type) -> bool
+        engine.register_fn("channel_send", |channel_id: i64, message: ImmutableString, msg_type: i64| -> bool {
+            if channel_id < 0 {
+                return false;
+            }
+            if let Some(channel) = crate::ipc::IPC.get_channel(channel_id as u32) {
+                let msg = crate::ipc::Message::from_str(0, message.as_str(), msg_type as u32);
+                channel.send(msg).is_ok()
+            } else {
+                false
+            }
+        });
+        
+        // channel_recv(channel_id) -> {ok, sender, data, msg_type} or {ok: false}
+        engine.register_fn("channel_recv", |channel_id: i64| -> Map {
+            let mut result = Map::new();
+            if channel_id < 0 {
+                result.insert("ok".into(), Dynamic::from(false));
+                return result;
+            }
+            if let Some(channel) = crate::ipc::IPC.get_channel(channel_id as u32) {
+                if let Some(msg) = channel.try_recv() {
+                    result.insert("ok".into(), Dynamic::from(true));
+                    result.insert("sender".into(), Dynamic::from(msg.sender as i64));
+                    result.insert("data".into(), Dynamic::from(msg.as_str()));
+                    result.insert("msg_type".into(), Dynamic::from(msg.msg_type as i64));
+                } else {
+                    result.insert("ok".into(), Dynamic::from(false));
+                }
+            } else {
+                result.insert("ok".into(), Dynamic::from(false));
+            }
+            result
+        });
+        
+        // channel_has_messages(channel_id) -> bool
+        engine.register_fn("channel_has_messages", |channel_id: i64| -> bool {
+            if channel_id < 0 {
+                return false;
+            }
+            crate::ipc::IPC.get_channel(channel_id as u32)
+                .map(|ch| ch.has_messages())
+                .unwrap_or(false)
+        });
+        
+        // channel_close(channel_id)
+        engine.register_fn("channel_close", |channel_id: i64| {
+            if channel_id >= 0 {
+                crate::ipc::IPC.remove_channel(channel_id as u32);
+            }
+        });
+        
+        // create_pipe() -> pipe_id
+        engine.register_fn("create_pipe", || -> i64 {
+            let pipe = crate::ipc::IPC.create_pipe();
+            pipe.id as i64
+        });
+        
+        // pipe_write(pipe_id, data) -> bytes_written or -1 on error
+        engine.register_fn("pipe_write", |pipe_id: i64, data: ImmutableString| -> i64 {
+            if pipe_id < 0 {
+                return -1;
+            }
+            if let Some(pipe) = crate::ipc::IPC.get_pipe(pipe_id as u32) {
+                match pipe.write(data.as_bytes()) {
+                    Ok(n) => n as i64,
+                    Err(_) => -1,
+                }
+            } else {
+                -1
+            }
+        });
+        
+        // pipe_read(pipe_id, max_bytes) -> string or empty on error/no data
+        engine.register_fn("pipe_read", |pipe_id: i64, max_bytes: i64| -> ImmutableString {
+            if pipe_id < 0 || max_bytes <= 0 {
+                return "".into();
+            }
+            if let Some(pipe) = crate::ipc::IPC.get_pipe(pipe_id as u32) {
+                let mut buf = alloc::vec![0u8; max_bytes.min(8192) as usize];
+                match pipe.read(&mut buf) {
+                    Ok(n) => String::from_utf8_lossy(&buf[..n]).into_owned().into(),
+                    Err(_) => "".into(),
+                }
+            } else {
+                "".into()
+            }
+        });
+        
+        // pipe_available(pipe_id) -> bytes available to read
+        engine.register_fn("pipe_available", |pipe_id: i64| -> i64 {
+            if pipe_id < 0 {
+                return 0;
+            }
+            crate::ipc::IPC.get_pipe(pipe_id as u32)
+                .map(|p| p.available() as i64)
+                .unwrap_or(0)
+        });
+        
+        // pipe_close(pipe_id)
+        engine.register_fn("pipe_close", |pipe_id: i64| {
+            if pipe_id >= 0 {
+                crate::ipc::IPC.remove_pipe(pipe_id as u32);
+            }
+        });
+        
+        // list_channels() -> Array of {id, name, pending}
+        engine.register_fn("list_channels", || -> Array {
+            crate::ipc::IPC.list_channels()
+                .into_iter()
+                .map(|(id, name, pending)| {
+                    let mut map = Map::new();
+                    map.insert("id".into(), Dynamic::from(id as i64));
+                    map.insert("name".into(), Dynamic::from(name));
+                    map.insert("pending".into(), Dynamic::from(pending as i64));
+                    Dynamic::from(map)
+                })
+                .collect()
+        });
+        
+        // list_pipes() -> Array of {id, available, closed}
+        engine.register_fn("list_pipes", || -> Array {
+            crate::ipc::IPC.list_pipes()
+                .into_iter()
+                .map(|(id, available, closed)| {
+                    let mut map = Map::new();
+                    map.insert("id".into(), Dynamic::from(id as i64));
+                    map.insert("available".into(), Dynamic::from(available as i64));
+                    map.insert("closed".into(), Dynamic::from(closed));
+                    Dynamic::from(map)
+                })
+                .collect()
         });
     }
     
@@ -1300,6 +1532,7 @@ impl ScriptRuntime {
         Self::register_mem_module(&mut engine);
         Self::register_http_module(&mut engine);
         Self::register_proc_module(&mut engine);
+        Self::register_ipc_module(&mut engine);
         
         // Register module object constructors for namespace imports
         Self::register_module_objects(&mut engine);

@@ -30,6 +30,7 @@ mod task;
 mod scheduler;
 mod klog;
 mod init;
+mod ipc;
 
 pub use scheduler::SCHEDULER;
 
@@ -750,6 +751,151 @@ pub fn get_time_ms() -> i64 {
     (mtime / 10_000) as i64
 }
 
+/// Run periodic daemon work on hart 0
+/// 
+/// Services like klogd and sysmond need VirtIO access for filesystem writes.
+/// Since VirtIO is only accessible from hart 0 (which runs the shell loop),
+/// we call their tick functions directly from the shell loop.
+fn run_hart0_tasks() {
+    // Run daemon tick functions (they check their own timing internally)
+    init::klogd_tick();
+    init::sysmond_tick();
+}
+
+/// Check for new content in a file being followed by tail -f
+/// Returns the new file size if content was found, None otherwise
+fn check_tail_follow(path: &str, last_size: usize) -> Option<usize> {
+    let mut fs_guard = FS_STATE.lock();
+    let mut blk_guard = BLK_DEV.lock();
+    
+    if let (Some(fs), Some(dev)) = (fs_guard.as_mut(), blk_guard.as_mut()) {
+        if let Some(content) = fs.read_file(dev, path) {
+            let new_size = content.len();
+            
+            if new_size > last_size {
+                // Print new content with green highlighting
+                let new_content = &content[last_size..];
+                if let Ok(text) = core::str::from_utf8(new_content) {
+                    for line in text.lines() {
+                        uart::write_str("\x1b[1;32m");
+                        uart::write_str(line);
+                        uart::write_line("\x1b[0m");
+                    }
+                }
+                return Some(new_size);
+            } else if new_size < last_size {
+                // File was truncated
+                uart::write_line("\x1b[1;33mtail: file truncated\x1b[0m");
+                return Some(new_size);
+            }
+            
+            return Some(last_size); // No change
+        }
+    }
+    None
+}
+
+/// Parse a command to see if it's a tail -f command
+/// Returns Some((filepath, num_lines)) if it's a follow command, None otherwise
+fn parse_tail_follow_command(cmd: &[u8]) -> Option<(String, usize)> {
+    let cmd_str = core::str::from_utf8(cmd).ok()?;
+    let cmd_str = cmd_str.trim();
+    
+    // Must start with "tail"
+    if !cmd_str.starts_with("tail ") && cmd_str != "tail" {
+        return None;
+    }
+    
+    // Parse arguments
+    let parts: Vec<&str> = cmd_str.split_whitespace().collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    
+    let mut has_follow = false;
+    let mut num_lines: usize = 10;
+    let mut filepath: Option<&str> = None;
+    
+    let mut i = 1;
+    while i < parts.len() {
+        let part = parts[i];
+        
+        if part == "-f" || part == "--follow" {
+            has_follow = true;
+        } else if part.starts_with("-f") && part.len() > 2 {
+            // -f is in combined flags like -fn20 or just -f alone
+            has_follow = true;
+        } else if part.starts_with("--follow=") {
+            has_follow = true;
+        } else if part == "-n" {
+            // Next arg is number of lines
+            if i + 1 < parts.len() {
+                i += 1;
+                if let Ok(n) = parts[i].parse::<usize>() {
+                    num_lines = n;
+                }
+            }
+        } else if part.starts_with("-n") {
+            // -nNUM format
+            if let Ok(n) = part[2..].parse::<usize>() {
+                num_lines = n;
+            }
+        } else if part.starts_with("--lines=") {
+            if let Ok(n) = part[8..].parse::<usize>() {
+                num_lines = n;
+            }
+        } else if !part.starts_with("-") {
+            // It's the filepath
+            filepath = Some(part);
+        }
+        
+        i += 1;
+    }
+    
+    // Must have -f flag and a file path
+    if has_follow {
+        if let Some(path) = filepath {
+            return Some((String::from(path), num_lines));
+        }
+    }
+    
+    None
+}
+
+/// Start tail follow mode for a file
+/// Returns (success, initial_size)
+fn start_tail_follow(path: &str, num_lines: usize) -> (bool, usize) {
+    let mut fs_guard = FS_STATE.lock();
+    let mut blk_guard = BLK_DEV.lock();
+    
+    if let (Some(fs), Some(dev)) = (fs_guard.as_mut(), blk_guard.as_mut()) {
+        if let Some(content) = fs.read_file(dev, path) {
+            // Show last N lines
+            if let Ok(text) = core::str::from_utf8(&content) {
+                let lines: Vec<&str> = text.lines().collect();
+                let start = if lines.len() > num_lines { lines.len() - num_lines } else { 0 };
+                
+                for i in start..lines.len() {
+                    uart::write_line(lines[i]);
+                }
+            }
+            
+            uart::write_line("");
+            uart::write_line("\x1b[2m--- Following (Ctrl+C or 'q' to stop) ---\x1b[0m");
+            
+            return (true, content.len());
+        } else {
+            uart::write_str("\x1b[1;31mtail: cannot open '");
+            uart::write_str(path);
+            uart::write_line("': No such file\x1b[0m");
+        }
+    } else {
+        uart::write_line("\x1b[1;31mtail: filesystem not available\x1b[0m");
+    }
+    
+    (false, 0)
+}
+
 /// Print a section header
 fn print_section(title: &str) {
     uart::write_line("");
@@ -916,6 +1062,16 @@ fn main() -> ! {
     // Escape sequence state
     let mut esc_state: u8 = 0; // 0 = normal, 1 = got ESC, 2 = got ESC[
 
+    // Track last time we ran scheduled tasks
+    let mut last_task_run: i64 = get_time_ms();
+    
+    // Tail follow mode state
+    let mut tail_follow_mode = false;
+    let mut tail_follow_path: [u8; 128] = [0u8; 128];
+    let mut tail_follow_path_len: usize = 0;
+    let mut tail_follow_last_size: usize = 0;
+    let mut tail_follow_last_check: i64 = 0;
+    
     loop {
         // Poll network stack
         poll_network();
@@ -924,11 +1080,38 @@ fn main() -> ! {
 
         // 0 means "no input" in our UART model
         if byte == 0 {
+            // While idle, periodically run scheduled tasks on hart 0
+            // Services like klogd/sysmond are pinned to hart 0 for VirtIO access
+            let now = get_time_ms();
+            if now - last_task_run >= 100 {  // Every 100ms
+                last_task_run = now;
+                run_hart0_tasks();
+            }
+            
+            // If in tail follow mode, check for new content
+            if tail_follow_mode && now - tail_follow_last_check >= 200 {
+                tail_follow_last_check = now;
+                
+                let path_str = core::str::from_utf8(&tail_follow_path[..tail_follow_path_len]).unwrap_or("");
+                if let Some(new_size) = check_tail_follow(path_str, tail_follow_last_size) {
+                    tail_follow_last_size = new_size;
+                }
+            }
+            
             continue;
         }
         
-        // Check for Ctrl+C (0x03) to cancel running commands
+        // Check for Ctrl+C (0x03) to cancel running commands or exit follow mode
         if byte == 0x03 {
+            if tail_follow_mode {
+                // Exit tail follow mode
+                tail_follow_mode = false;
+                uart::write_line("");
+                uart::write_line("\x1b[2m--- tail -f stopped ---\x1b[0m");
+                print_prompt();
+                len = 0;
+                continue;
+            }
             if cancel_running_command() {
                 // Command was cancelled, print new prompt
                 print_prompt();
@@ -936,6 +1119,21 @@ fn main() -> ! {
                 browsing_history = false;
                 history_pos = 0;
             }
+            continue;
+        }
+        
+        // In follow mode, 'q' also exits
+        if tail_follow_mode && (byte == b'q' || byte == b'Q') {
+            tail_follow_mode = false;
+            uart::write_line("");
+            uart::write_line("\x1b[2m--- tail -f stopped ---\x1b[0m");
+            print_prompt();
+            len = 0;
+            continue;
+        }
+        
+        // Ignore other input while in follow mode
+        if tail_follow_mode {
             continue;
         }
         
@@ -1042,8 +1240,28 @@ fn main() -> ! {
                     history_count += 1;
                 }
                 
-                handle_line(&buffer, len, &mut count);
-                print_prompt();
+                // Check for tail -f command (handle specially for real-time following)
+                if let Some((path, num_lines)) = parse_tail_follow_command(&buffer[..len]) {
+                    // Resolve the path
+                    let resolved = resolve_path(&path);
+                    let resolved_bytes = resolved.as_bytes();
+                    
+                    // Start follow mode
+                    let (success, initial_size) = start_tail_follow(&resolved, num_lines);
+                    if success {
+                        tail_follow_mode = true;
+                        tail_follow_path_len = resolved_bytes.len().min(128);
+                        tail_follow_path[..tail_follow_path_len].copy_from_slice(&resolved_bytes[..tail_follow_path_len]);
+                        tail_follow_last_size = initial_size;
+                        tail_follow_last_check = get_time_ms();
+                        // Don't print prompt - we're in follow mode
+                    } else {
+                        print_prompt();
+                    }
+                } else {
+                    handle_line(&buffer, len, &mut count);
+                    print_prompt();
+                }
                 len = 0;
                 browsing_history = false;
                 history_pos = 0;

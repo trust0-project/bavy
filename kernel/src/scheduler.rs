@@ -317,10 +317,25 @@ impl Scheduler {
     
     /// Kill a task by PID
     pub fn kill(&self, pid: Pid) -> bool {
-        if let Some(task) = self.tasks.lock().get(&pid) {
+        let mut tasks = self.tasks.lock();
+        if let Some(task) = tasks.get(&pid) {
+            // Don't allow killing daemons with restart_on_exit unless stopped first
+            if task.is_daemon && task.restart_on_exit {
+                task.mark_finished(137);
+                crate::klog::klog_info("sched", &alloc::format!(
+                    "Killed daemon '{}' (PID {}) - will respawn", task.name, pid
+                ));
+                return true;
+            }
+            
+            let name = task.name.clone();
             task.mark_finished(137); // SIGKILL-like
+            
+            // Immediately remove from task list (don't leave as zombie)
+            tasks.remove(&pid);
+            
             crate::klog::klog_info("sched", &alloc::format!(
-                "Killed task '{}' (PID {})", task.name, pid
+                "Killed and removed task '{}' (PID {})", name, pid
             ));
             true
         } else {
