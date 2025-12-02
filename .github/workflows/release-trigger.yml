@@ -59,7 +59,7 @@ jobs:
       - name: Run Nx Release (version only, skip publish)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: npx nx release version --yes && npx nx release changelog --yes
+        run: npx nx release version && npx nx release changelog
 
       - name: Get version after release
         id: after
