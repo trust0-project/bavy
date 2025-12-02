@@ -29,9 +29,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: "yarn"
           registry-url: "https://registry.npmjs.org"
           always-auth: true
+
+      - name: Enable Corepack
+        run: corepack enable
 
       - name: Configure npm authentication
         run: |
@@ -43,7 +45,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install dependencies
-        run: corepack enable && yarn install
+        run: yarn install
 
       - name: Configure Git
         run: |
