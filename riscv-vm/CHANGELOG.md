@@ -1,3 +1,13 @@
+## 0.1.2 (2025-12-03)
+
+### 🩹 Fixes
+
+- improve VM processing and performance Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([302d18d](https://github.com/elribonazo/riscv-vm/commit/302d18d))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.1.1 (2025-12-03)
 
 ### 🩹 Fixes
