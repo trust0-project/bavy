@@ -7,7 +7,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread::{self, JoinHandle};
 
 /// Non-blocking console input handler.
-/// 
+///
 /// Spawns a background thread that reads from stdin
 /// and makes bytes available via `try_read()`.
 pub struct Console {
@@ -25,11 +25,11 @@ impl Console {
             .spawn(move || {
                 let stdin = io::stdin();
                 let mut buffer = [0u8; 1];
-                
+
                 // Set terminal to raw mode
                 #[cfg(unix)]
                 let _raw_guard = RawModeGuard::new();
-                
+
                 loop {
                     match stdin.lock().read(&mut buffer) {
                         Ok(1) => {
@@ -53,11 +53,14 @@ impl Console {
             })
             .expect("Failed to spawn console thread");
 
-        Self { rx, _handle: Some(handle) }
+        Self {
+            rx,
+            _handle: Some(handle),
+        }
     }
 
     /// Try to read a byte from stdin (non-blocking).
-    /// 
+    ///
     /// Returns `Some(byte)` if input is available, `None` otherwise.
     pub fn try_read(&self) -> Option<u8> {
         match self.rx.try_recv() {
@@ -104,25 +107,25 @@ struct RawModeGuard {
 #[cfg(unix)]
 impl RawModeGuard {
     fn new() -> Self {
-        use std::os::unix::io::AsRawFd;
         use std::mem::MaybeUninit;
-        
+        use std::os::unix::io::AsRawFd;
+
         let fd = io::stdin().as_raw_fd();
         let mut original = MaybeUninit::<libc::termios>::uninit();
-        
+
         unsafe {
             libc::tcgetattr(fd, original.as_mut_ptr());
             let original = original.assume_init();
-            
+
             let mut raw = original;
             // Disable canonical mode and echo
             raw.c_lflag &= !(libc::ICANON | libc::ECHO);
             // Read returns after 1 byte
             raw.c_cc[libc::VMIN] = 1;
             raw.c_cc[libc::VTIME] = 0;
-            
+
             libc::tcsetattr(fd, libc::TCSANOW, &raw);
-            
+
             Self { original }
         }
     }

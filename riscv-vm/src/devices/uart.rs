@@ -33,22 +33,24 @@ struct TxState {
 
 /// Control registers (shared, less frequent access)
 struct UartRegs {
-    ier: u8,      // Interrupt Enable Register
-    iir: u8,      // Interrupt Identification Register (read-only computed)
-    fcr: u8,      // FIFO Control Register
-    lcr: u8,      // Line Control Register
-    mcr: u8,      // Modem Control Register
-    lsr: u8,      // Line Status Register
-    msr: u8,      // Modem Status Register
-    scr: u8,      // Scratch Register
-    dll: u8,      // Divisor Latch Low
-    dlm: u8,      // Divisor Latch High
+    ier: u8, // Interrupt Enable Register
+    iir: u8, // Interrupt Identification Register (read-only computed)
+    fcr: u8, // FIFO Control Register
+    lcr: u8, // Line Control Register
+    mcr: u8, // Modem Control Register
+    lsr: u8, // Line Status Register
+    msr: u8, // Modem Status Register
+    scr: u8, // Scratch Register
+    dll: u8, // Divisor Latch Low
+    dlm: u8, // Divisor Latch High
     interrupting: bool,
 }
 
 impl RxState {
     fn new() -> Self {
-        Self { fifo: VecDeque::new() }
+        Self {
+            fifo: VecDeque::new(),
+        }
     }
 }
 
@@ -82,10 +84,10 @@ impl UartRegs {
 pub struct Uart {
     /// RX path: input from host to guest
     rx: Mutex<RxState>,
-    
+
     /// TX path: output from guest to host
     tx: Mutex<TxState>,
-    
+
     /// Control registers (shared, accessed for config)
     regs: Mutex<UartRegs>,
 }
@@ -146,15 +148,17 @@ impl Uart {
     /// Get all register values for snapshot
     pub fn get_registers(&self) -> (u8, u8, u8, u8, u8, u8, u8, u8, u8, u8) {
         let regs = self.regs.lock().unwrap();
-        (regs.ier, regs.iir, regs.fcr, regs.lcr, regs.mcr,
-         regs.lsr, regs.msr, regs.scr, regs.dll, regs.dlm)
+        (
+            regs.ier, regs.iir, regs.fcr, regs.lcr, regs.mcr, regs.lsr, regs.msr, regs.scr,
+            regs.dll, regs.dlm,
+        )
     }
 
     /// Restore input FIFO from snapshot
     pub fn set_input(&self, values: &[u8]) {
         let mut regs = self.regs.lock().unwrap();
         let mut rx = self.rx.lock().unwrap();
-        
+
         rx.fifo.clear();
         for &v in values {
             rx.fifo.push_back(v);
@@ -177,12 +181,23 @@ impl Uart {
     }
 
     /// Restore register values from snapshot
-    pub fn set_registers(&self, ier: u8, iir: u8, fcr: u8, lcr: u8, mcr: u8,
-                         lsr: u8, msr: u8, scr: u8, dll: u8, dlm: u8) {
+    pub fn set_registers(
+        &self,
+        ier: u8,
+        iir: u8,
+        fcr: u8,
+        lcr: u8,
+        mcr: u8,
+        lsr: u8,
+        msr: u8,
+        scr: u8,
+        dll: u8,
+        dlm: u8,
+    ) {
         let mut regs = self.regs.lock().unwrap();
         let rx = self.rx.lock().unwrap();
         let tx = self.tx.lock().unwrap();
-        
+
         regs.ier = ier;
         regs.iir = iir;
         regs.fcr = fcr;
@@ -387,11 +402,11 @@ mod tests {
     #[test]
     fn test_basic_io() {
         let uart = Uart::new();
-        
+
         // Push input
         uart.push_input(b'A');
         assert!(uart.get_input().contains(&b'A'));
-        
+
         // Push output
         uart.push_output(b'B');
         assert_eq!(uart.pop_output(), Some(b'B'));
@@ -464,15 +479,15 @@ mod tests {
     #[test]
     fn test_output_operations_independent() {
         let uart = Arc::new(Uart::new());
-        
+
         // Fill with some output
         for i in 0..10 {
             uart.push_output(i);
         }
-        
+
         let uart1 = Arc::clone(&uart);
         let uart2 = Arc::clone(&uart);
-        
+
         // Two threads doing output operations should not deadlock
         let h1 = thread::spawn(move || {
             for _ in 0..100 {
@@ -480,13 +495,13 @@ mod tests {
                 uart1.pop_output();
             }
         });
-        
+
         let h2 = thread::spawn(move || {
             for i in 0..100 {
                 uart2.push_output(i as u8);
             }
         });
-        
+
         h1.join().unwrap();
         h2.join().unwrap();
     }
@@ -494,11 +509,11 @@ mod tests {
     #[test]
     fn test_register_access() {
         let uart = Uart::new();
-        
+
         // Write to SCR (scratch register)
         uart.store(SCR, 1, 0x42).unwrap();
         assert_eq!(uart.load(SCR, 1).unwrap(), 0x42);
-        
+
         // Test LCR
         uart.store(LCR, 1, 0x03).unwrap();
         assert_eq!(uart.load(LCR, 1).unwrap(), 0x03);
@@ -507,18 +522,18 @@ mod tests {
     #[test]
     fn test_dlab_mode() {
         let uart = Uart::new();
-        
+
         // Enable DLAB
         uart.store(LCR, 1, 0x80).unwrap();
-        
+
         // Write divisor latch
         uart.store(THR, 1, 0x12).unwrap(); // DLL
         uart.store(IER, 1, 0x34).unwrap(); // DLM
-        
+
         // Read back
         assert_eq!(uart.load(RBR, 1).unwrap(), 0x12);
         assert_eq!(uart.load(IER, 1).unwrap(), 0x34);
-        
+
         // Disable DLAB
         uart.store(LCR, 1, 0x00).unwrap();
     }
@@ -526,22 +541,22 @@ mod tests {
     #[test]
     fn test_fifo_clear() {
         let uart = Uart::new();
-        
+
         // Add some input
         uart.push_input(b'A');
         uart.push_input(b'B');
-        
+
         // Add some output
         uart.push_output(b'X');
         uart.push_output(b'Y');
-        
+
         // Clear RX FIFO (bit 1)
         uart.store(FCR, 1, 0x02).unwrap();
         assert!(uart.get_input().is_empty());
-        
+
         // Output should still be there
         assert_eq!(uart.get_output().len(), 2);
-        
+
         // Clear TX FIFO (bit 2)
         uart.store(FCR, 1, 0x04).unwrap();
         assert!(uart.get_output().is_empty());
@@ -550,24 +565,25 @@ mod tests {
     #[test]
     fn test_snapshot_restore() {
         let uart = Uart::new();
-        
+
         // Set up some state
         uart.push_input(b'A');
         uart.push_output(b'B');
         uart.store(SCR, 1, 0x55).unwrap();
-        
+
         // Get snapshot
         let input = uart.get_input();
         let output = uart.get_output();
         let regs = uart.get_registers();
-        
+
         // Create new UART and restore
         let uart2 = Uart::new();
         uart2.set_input(&input);
         uart2.set_output(&output);
-        uart2.set_registers(regs.0, regs.1, regs.2, regs.3, regs.4,
-                           regs.5, regs.6, regs.7, regs.8, regs.9);
-        
+        uart2.set_registers(
+            regs.0, regs.1, regs.2, regs.3, regs.4, regs.5, regs.6, regs.7, regs.8, regs.9,
+        );
+
         // Verify
         assert_eq!(uart2.get_input(), vec![b'A']);
         assert_eq!(uart2.get_output(), vec![b'B']);

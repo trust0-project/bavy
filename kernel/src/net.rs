@@ -3,9 +3,9 @@
 //! This module provides the TCP/IP stack for the kernel using the smoltcp crate.
 
 use crate::virtio_net::VirtioNet;
+use alloc::collections::VecDeque;
 use alloc::vec;
 use alloc::vec::Vec;
-use alloc::collections::VecDeque;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::{icmp, tcp, udp};
@@ -93,14 +93,14 @@ impl NetState {
     pub fn new(mut device: VirtioNet) -> Result<Self, &'static str> {
         // Initialize the VirtIO device (phase 1 - configures queues but doesn't populate RX)
         device.init()?;
-        
+
         // --- IP ADDRESS DISCOVERY ---
         // Wait for an IP assignment from the host/relay
         // In WASM, async tasks need the JS event loop to run, so we use many
         // short iterations to give the browser more chances to process events
         let mut my_ip = DEFAULT_IP_ADDR; // Fallback default
         let mut got_ip = false;
-        
+
         crate::uart::write_str("    \x1b[0;90m├─\x1b[0m Waiting for IP assignment");
         // 200 iterations with shorter delays = more chances for async tasks in WASM
         // Total wait time is roughly 2-3 seconds
@@ -116,75 +116,80 @@ impl NetState {
                 crate::uart::write_str(".");
             }
             // Shorter delay to allow more frequent checks and JS event loop to run in WASM
-            for _ in 0..200_000 { core::hint::spin_loop(); } 
+            for _ in 0..200_000 {
+                core::hint::spin_loop();
+            }
         }
-        
+
         // If we didn't get an IP, network is unavailable - return error
         if !got_ip {
             crate::uart::write_line(" \x1b[1;31m[FAILED]\x1b[0m");
             crate::uart::write_line("    \x1b[1;31m[✗]\x1b[0m No IP address assigned by relay");
-            crate::uart::write_line("    \x1b[0;90m    └─ Check relay connection and certificate hash\x1b[0m");
+            crate::uart::write_line(
+                "    \x1b[0;90m    └─ Check relay connection and certificate hash\x1b[0m",
+            );
             return Err("No IP address assigned - networking disabled");
         }
-        
+
         // Save to global for other modules to use
-        unsafe { MY_IP_ADDR = my_ip; }
-        
+        unsafe {
+            MY_IP_ADDR = my_ip;
+        }
+
         let mac = device.mac;
         let hw_addr = HardwareAddress::Ethernet(EthernetAddress(mac));
-        
+
         // Create interface config
         let config = Config::new(hw_addr);
-        
+
         // Create the interface
-        let mut iface = Interface::new(config, &mut DeviceWrapper(&mut device), Instant::from_millis(0));
-        
+        let mut iface = Interface::new(
+            config,
+            &mut DeviceWrapper(&mut device),
+            Instant::from_millis(0),
+        );
+
         // Configure IP address using the dynamic IP
         iface.update_ip_addrs(|addrs| {
-            addrs.push(IpCidr::new(IpAddress::v4(my_ip.0[0], my_ip.0[1], my_ip.0[2], my_ip.0[3]), PREFIX_LEN)).ok();
+            addrs
+                .push(IpCidr::new(
+                    IpAddress::v4(my_ip.0[0], my_ip.0[1], my_ip.0[2], my_ip.0[3]),
+                    PREFIX_LEN,
+                ))
+                .ok();
         });
-        
+
         // Set default gateway
         iface.routes_mut().add_default_ipv4_route(GATEWAY).ok();
-        
+
         // Create socket set with static storage
-        let sockets = unsafe {
-            SocketSet::new(&mut SOCKET_STORAGE[..])
-        };
-        
+        let sockets = unsafe { SocketSet::new(&mut SOCKET_STORAGE[..]) };
+
         // Create ICMP socket for ping
-        let icmp_rx_buffer = unsafe {
-            icmp::PacketBuffer::new(&mut ICMP_RX_META[..], &mut ICMP_RX_DATA[..])
-        };
-        let icmp_tx_buffer = unsafe {
-            icmp::PacketBuffer::new(&mut ICMP_TX_META[..], &mut ICMP_TX_DATA[..])
-        };
+        let icmp_rx_buffer =
+            unsafe { icmp::PacketBuffer::new(&mut ICMP_RX_META[..], &mut ICMP_RX_DATA[..]) };
+        let icmp_tx_buffer =
+            unsafe { icmp::PacketBuffer::new(&mut ICMP_TX_META[..], &mut ICMP_TX_DATA[..]) };
         let mut icmp_socket = icmp::Socket::new(icmp_rx_buffer, icmp_tx_buffer);
-        
+
         // Bind the ICMP socket to receive echo replies for our identifier
         icmp_socket.bind(icmp::Endpoint::Ident(ICMP_IDENT)).ok();
-        
+
         // Create UDP socket for DNS queries
-        let udp_rx_buffer = unsafe {
-            udp::PacketBuffer::new(&mut UDP_RX_META[..], &mut UDP_RX_DATA[..])
-        };
-        let udp_tx_buffer = unsafe {
-            udp::PacketBuffer::new(&mut UDP_TX_META[..], &mut UDP_TX_DATA[..])
-        };
+        let udp_rx_buffer =
+            unsafe { udp::PacketBuffer::new(&mut UDP_RX_META[..], &mut UDP_RX_DATA[..]) };
+        let udp_tx_buffer =
+            unsafe { udp::PacketBuffer::new(&mut UDP_TX_META[..], &mut UDP_TX_DATA[..]) };
         let mut udp_socket = udp::Socket::new(udp_rx_buffer, udp_tx_buffer);
-        
+
         // Bind UDP socket to local port for DNS
         udp_socket.bind(DNS_LOCAL_PORT).ok();
-        
+
         // Create TCP socket for HTTP connections
-        let tcp_rx_buffer = unsafe {
-            tcp::SocketBuffer::new(&mut TCP_RX_DATA[..])
-        };
-        let tcp_tx_buffer = unsafe {
-            tcp::SocketBuffer::new(&mut TCP_TX_DATA[..])
-        };
+        let tcp_rx_buffer = unsafe { tcp::SocketBuffer::new(&mut TCP_RX_DATA[..]) };
+        let tcp_tx_buffer = unsafe { tcp::SocketBuffer::new(&mut TCP_TX_DATA[..]) };
         let tcp_socket = tcp::Socket::new(tcp_rx_buffer, tcp_tx_buffer);
-        
+
         let mut state = NetState {
             device,
             iface,
@@ -195,40 +200,44 @@ impl NetState {
             arp_cache: None,
             loopback_replies: VecDeque::new(),
         };
-        
+
         state.icmp_handle = state.sockets.add(icmp_socket);
         state.udp_handle = state.sockets.add(udp_socket);
         state.tcp_handle = state.sockets.add(tcp_socket);
-        
+
         Ok(state)
     }
-    
+
     /// Finalize initialization (must be called AFTER the NetState is in its final memory location)
     pub fn finalize(&mut self) {
         self.device.finalize_init();
     }
-    
+
     /// Poll the network stack (call frequently)
     pub fn poll(&mut self, timestamp_ms: i64) {
         let timestamp = Instant::from_millis(timestamp_ms);
-        
+
         // Poll the device
         self.device.poll();
-        
+
         // Poll the interface
-        self.iface.poll(timestamp, &mut DeviceWrapper(&mut self.device), &mut self.sockets);
+        self.iface.poll(
+            timestamp,
+            &mut DeviceWrapper(&mut self.device),
+            &mut self.sockets,
+        );
     }
-    
+
     /// Send a raw ARP request
     fn send_arp_request(&mut self, target_ip: [u8; 4]) -> Result<(), &'static str> {
         let my_ip = get_my_ip();
         let mut frame = [0u8; 42]; // 14 (eth) + 28 (arp)
-        
+
         // Ethernet header
         frame[0..6].copy_from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff]); // dst = broadcast
         frame[6..12].copy_from_slice(&self.device.mac); // src = our MAC
         frame[12..14].copy_from_slice(&[0x08, 0x06]); // ethertype = ARP
-        
+
         // ARP header
         frame[14..16].copy_from_slice(&[0x00, 0x01]); // hardware type = ethernet
         frame[16..18].copy_from_slice(&[0x08, 0x00]); // protocol type = IPv4
@@ -239,10 +248,10 @@ impl NetState {
         frame[28..32].copy_from_slice(&my_ip.0); // sender protocol addr
         frame[32..38].copy_from_slice(&[0x00; 6]); // target hardware addr (unknown)
         frame[38..42].copy_from_slice(&target_ip); // target protocol addr
-        
+
         self.device.send(&frame)
     }
-    
+
     /// Compute ICMP checksum
     fn icmp_checksum(data: &[u8]) -> u16 {
         let mut sum: u32 = 0;
@@ -259,7 +268,7 @@ impl NetState {
         }
         !(sum as u16)
     }
-    
+
     /// Resolve MAC address for an IP via ARP (with caching)
     fn resolve_mac(&mut self, target_ip: [u8; 4]) -> Option<[u8; 6]> {
         // Check cache first
@@ -268,7 +277,7 @@ impl NetState {
                 return Some(cache.mac);
             }
         }
-        
+
         // Try multiple times with increasing waits
         for attempt in 0..5 {
             // Send ARP request
@@ -278,58 +287,61 @@ impl NetState {
                     continue;
                 }
             }
-            
+
             // Wait with increasing delay (100k, 200k, 400k, 800k, 1600k spins)
             let wait_cycles = 100_000 << attempt;
-            for _ in 0..wait_cycles { 
-                core::hint::spin_loop(); 
+            for _ in 0..wait_cycles {
+                core::hint::spin_loop();
             }
             self.device.poll();
-            
+
             // Check for ARP reply
             if let Some((desc_idx, data)) = self.device.recv_with_desc() {
                 if data.len() >= 42 && data[12] == 0x08 && data[13] == 0x06 {
                     // ARP packet - extract sender MAC
                     let mut mac = [0u8; 6];
                     mac.copy_from_slice(&data[22..28]);
-                    
+
                     // Recycle the buffer
                     self.device.recycle_rx(desc_idx);
-                    
+
                     // Cache the result
                     self.arp_cache = Some(ArpCache { ip: target_ip, mac });
-                    
+
                     return Some(mac);
                 }
                 // Not an ARP reply, recycle and keep trying
                 self.device.recycle_rx(desc_idx);
             }
         }
-        
+
         None
     }
-    
+
     /// Check if an address is a loopback address (127.x.x.x)
     fn is_loopback(addr: &Ipv4Address) -> bool {
         addr.0[0] == 127
     }
-    
+
     /// Check if an address is our own IP
     fn is_self(addr: &Ipv4Address) -> bool {
         let my_ip = get_my_ip();
         addr.0 == my_ip.0
     }
-    
+
     /// Check if an address is on the local subnet (10.0.2.x/24)
     fn is_on_local_subnet(addr: &Ipv4Address) -> bool {
         let my_ip = get_my_ip();
-        addr.0[0] == my_ip.0[0] && 
-        addr.0[1] == my_ip.0[1] && 
-        addr.0[2] == my_ip.0[2]
+        addr.0[0] == my_ip.0[0] && addr.0[1] == my_ip.0[1] && addr.0[2] == my_ip.0[2]
     }
-    
+
     /// Send an ICMP echo request (ping) - directly via VirtIO or loopback
-    pub fn send_ping(&mut self, target: Ipv4Address, seq: u16, _timestamp_ms: i64) -> Result<(), &'static str> {
+    pub fn send_ping(
+        &mut self,
+        target: Ipv4Address,
+        seq: u16,
+        _timestamp_ms: i64,
+    ) -> Result<(), &'static str> {
         // Handle loopback addresses (127.x.x.x) and self-ping locally
         if Self::is_loopback(&target) || Self::is_self(&target) {
             // Queue an immediate reply for loopback
@@ -340,33 +352,34 @@ impl NetState {
             });
             return Ok(());
         }
-        
+
         let target_bytes = target.0;
-        
+
         // For external IPs (not on local subnet), route through gateway
         let next_hop = if Self::is_on_local_subnet(&target) {
             target_bytes
         } else {
-            GATEWAY.0  // Use gateway for external destinations
+            GATEWAY.0 // Use gateway for external destinations
         };
-        
+
         // Resolve MAC address for the next hop (gateway or direct target)
-        let dst_mac = self.resolve_mac(next_hop)
+        let dst_mac = self
+            .resolve_mac(next_hop)
             .ok_or("Failed to resolve MAC address")?;
-        
+
         // Build Ethernet + IP + ICMP packet
         let icmp_data = b"RISCV_PING";
         let icmp_len = 8 + icmp_data.len(); // ICMP header (8) + data
         let ip_len = 20 + icmp_len; // IP header (20) + ICMP
         let frame_len = 14 + ip_len; // Ethernet header (14) + IP
-        
+
         let mut frame = vec![0u8; frame_len];
-        
+
         // Ethernet header
         frame[0..6].copy_from_slice(&dst_mac); // dst MAC
         frame[6..12].copy_from_slice(&self.device.mac); // src MAC
         frame[12..14].copy_from_slice(&[0x08, 0x00]); // ethertype = IPv4
-        
+
         // IP header
         let my_ip = get_my_ip();
         frame[14] = 0x45; // version + IHL
@@ -379,7 +392,7 @@ impl NetState {
         frame[24..26].copy_from_slice(&[0x00, 0x00]); // checksum (fill later)
         frame[26..30].copy_from_slice(&my_ip.0); // src IP
         frame[30..34].copy_from_slice(&target_bytes); // dst IP
-        
+
         // IP checksum
         let ip_header = &frame[14..34];
         let mut sum: u32 = 0;
@@ -391,7 +404,7 @@ impl NetState {
         }
         let ip_cksum = !(sum as u16);
         frame[24..26].copy_from_slice(&ip_cksum.to_be_bytes());
-        
+
         // ICMP header
         frame[34] = 8; // type = echo request
         frame[35] = 0; // code
@@ -399,28 +412,28 @@ impl NetState {
         frame[38..40].copy_from_slice(&ICMP_IDENT.to_be_bytes()); // identifier
         frame[40..42].copy_from_slice(&seq.to_be_bytes()); // sequence
         frame[42..].copy_from_slice(icmp_data); // data
-        
+
         // ICMP checksum
         let icmp_cksum = Self::icmp_checksum(&frame[34..]);
         frame[36..38].copy_from_slice(&icmp_cksum.to_be_bytes());
-        
+
         // Send the ICMP request
         self.device.send(&frame)?;
-        
+
         Ok(())
     }
-    
+
     /// Get MAC address
     #[allow(dead_code)]
     pub fn mac(&self) -> [u8; 6] {
         self.device.mac
     }
-    
+
     /// Get MAC address as string
     pub fn mac_str(&self) -> [u8; 17] {
         self.device.mac_str()
     }
-    
+
     /// Check for ICMP echo reply by directly examining received packets
     /// Also handles loopback replies
     pub fn check_ping_reply(&mut self) -> Option<(Ipv4Address, u16, u16)> {
@@ -428,10 +441,10 @@ impl NetState {
         if let Some(reply) = self.loopback_replies.pop_front() {
             return Some((reply.from, reply.ident, reply.seq));
         }
-        
+
         // Poll the VirtIO device for incoming packets
         self.device.poll();
-        
+
         // Check for received packet
         if let Some((desc_idx, data)) = self.device.recv_with_desc() {
             // Must be at least: eth(14) + ip(20) + icmp(8) = 42 bytes
@@ -446,10 +459,10 @@ impl NetState {
                             let ident = u16::from_be_bytes([data[38], data[39]]);
                             let seq = u16::from_be_bytes([data[40], data[41]]);
                             let src_ip = Ipv4Address::new(data[26], data[27], data[28], data[29]);
-                            
+
                             // Recycle the buffer
                             self.device.recycle_rx(desc_idx);
-                            
+
                             // Check if this is for our identifier
                             if ident == ICMP_IDENT {
                                 return Some((src_ip, ident, seq));
@@ -458,54 +471,73 @@ impl NetState {
                     }
                 }
             }
-            
+
             // Recycle buffer if we didn't return earlier
             self.device.recycle_rx(desc_idx);
         }
         None
     }
-    
+
     /// Send a UDP packet to the specified destination
-    pub fn udp_send(&mut self, dest_ip: Ipv4Address, dest_port: u16, data: &[u8], timestamp_ms: i64) -> Result<(), &'static str> {
+    pub fn udp_send(
+        &mut self,
+        dest_ip: Ipv4Address,
+        dest_port: u16,
+        data: &[u8],
+        timestamp_ms: i64,
+    ) -> Result<(), &'static str> {
         let timestamp = Instant::from_millis(timestamp_ms);
-        
+
         // Get the UDP socket
         let socket = self.sockets.get_mut::<udp::Socket>(self.udp_handle);
-        
+
         // Create destination endpoint
         let endpoint = IpEndpoint::new(IpAddress::Ipv4(dest_ip), dest_port);
-        
+
         // Check if socket can send
         if !socket.can_send() {
             return Err("UDP socket cannot send");
         }
-        
+
         // Send the data
-        socket.send_slice(data, endpoint)
+        socket
+            .send_slice(data, endpoint)
             .map_err(|_| "Failed to send UDP packet")?;
-        
+
         // Poll to actually transmit
-        self.iface.poll(timestamp, &mut DeviceWrapper(&mut self.device), &mut self.sockets);
-        
+        self.iface.poll(
+            timestamp,
+            &mut DeviceWrapper(&mut self.device),
+            &mut self.sockets,
+        );
+
         Ok(())
     }
-    
+
     /// Receive a UDP packet (non-blocking)
     /// Returns (source_ip, source_port, data) if a packet is available
-    pub fn udp_recv(&mut self, buf: &mut [u8], timestamp_ms: i64) -> Option<(Ipv4Address, u16, usize)> {
+    pub fn udp_recv(
+        &mut self,
+        buf: &mut [u8],
+        timestamp_ms: i64,
+    ) -> Option<(Ipv4Address, u16, usize)> {
         let timestamp = Instant::from_millis(timestamp_ms);
-        
+
         // Poll to receive any pending packets
-        self.iface.poll(timestamp, &mut DeviceWrapper(&mut self.device), &mut self.sockets);
-        
+        self.iface.poll(
+            timestamp,
+            &mut DeviceWrapper(&mut self.device),
+            &mut self.sockets,
+        );
+
         // Get the UDP socket
         let socket = self.sockets.get_mut::<udp::Socket>(self.udp_handle);
-        
+
         // Check if we can receive
         if !socket.can_recv() {
             return None;
         }
-        
+
         // Try to receive
         match socket.recv_slice(buf) {
             Ok((len, meta)) => {
@@ -515,131 +547,157 @@ impl NetState {
             Err(_) => None,
         }
     }
-    
+
     /// Check if UDP socket can receive data
     pub fn udp_can_recv(&mut self) -> bool {
         let socket = self.sockets.get_mut::<udp::Socket>(self.udp_handle);
         socket.can_recv()
     }
-    
+
     // ═══════════════════════════════════════════════════════════════════════════
     // TCP METHODS (for HTTP connections)
     // ═══════════════════════════════════════════════════════════════════════════
-    
+
     /// Connect TCP socket to a remote host
-    pub fn tcp_connect(&mut self, dest_ip: Ipv4Address, dest_port: u16, timestamp_ms: i64) -> Result<(), &'static str> {
+    pub fn tcp_connect(
+        &mut self,
+        dest_ip: Ipv4Address,
+        dest_port: u16,
+        timestamp_ms: i64,
+    ) -> Result<(), &'static str> {
         let timestamp = Instant::from_millis(timestamp_ms);
-        
+
         // Get the TCP socket
         let socket = self.sockets.get_mut::<tcp::Socket>(self.tcp_handle);
-        
+
         // Close any existing connection
         if socket.state() != tcp::State::Closed {
             socket.abort();
             // Poll to process the abort
-            self.iface.poll(timestamp, &mut DeviceWrapper(&mut self.device), &mut self.sockets);
+            self.iface.poll(
+                timestamp,
+                &mut DeviceWrapper(&mut self.device),
+                &mut self.sockets,
+            );
         }
-        
+
         // Use a random-ish local port based on timestamp
         let local_port = 49152 + ((timestamp_ms as u16) % 16383);
-        
+
         // Create destination endpoint
         let remote = IpEndpoint::new(IpAddress::Ipv4(dest_ip), dest_port);
-        
+
         // Get the socket again after the iface poll
         let socket = self.sockets.get_mut::<tcp::Socket>(self.tcp_handle);
-        
+
         // Connect to remote
-        socket.connect(self.iface.context(), remote, local_port)
+        socket
+            .connect(self.iface.context(), remote, local_port)
             .map_err(|_| "Failed to initiate TCP connection")?;
-        
+
         Ok(())
     }
-    
+
     /// Check if TCP socket is connected
     pub fn tcp_is_connected(&mut self) -> bool {
         let socket = self.sockets.get_mut::<tcp::Socket>(self.tcp_handle);
         socket.state() == tcp::State::Established
     }
-    
+
     /// Check if TCP socket is connecting (SYN sent)
     pub fn tcp_is_connecting(&mut self) -> bool {
         let socket = self.sockets.get_mut::<tcp::Socket>(self.tcp_handle);
-        matches!(socket.state(), tcp::State::SynSent | tcp::State::SynReceived)
+        matches!(
+            socket.state(),
+            tcp::State::SynSent | tcp::State::SynReceived
+        )
     }
-    
+
     /// Check if TCP connection failed
     pub fn tcp_connection_failed(&mut self) -> bool {
         let socket = self.sockets.get_mut::<tcp::Socket>(self.tcp_handle);
         matches!(socket.state(), tcp::State::Closed | tcp::State::TimeWait)
     }
-    
+
     /// Send data over TCP connection
     pub fn tcp_send(&mut self, data: &[u8], timestamp_ms: i64) -> Result<usize, &'static str> {
         let timestamp = Instant::from_millis(timestamp_ms);
-        
+
         // Get the TCP socket
         let socket = self.sockets.get_mut::<tcp::Socket>(self.tcp_handle);
-        
+
         if !socket.may_send() {
             return Err("TCP socket cannot send");
         }
-        
-        let sent = socket.send_slice(data)
+
+        let sent = socket
+            .send_slice(data)
             .map_err(|_| "Failed to send TCP data")?;
-        
+
         // Poll to transmit
-        self.iface.poll(timestamp, &mut DeviceWrapper(&mut self.device), &mut self.sockets);
-        
+        self.iface.poll(
+            timestamp,
+            &mut DeviceWrapper(&mut self.device),
+            &mut self.sockets,
+        );
+
         Ok(sent)
     }
-    
+
     /// Receive data from TCP connection (non-blocking)
     pub fn tcp_recv(&mut self, buf: &mut [u8], timestamp_ms: i64) -> Result<usize, &'static str> {
         let timestamp = Instant::from_millis(timestamp_ms);
-        
+
         // Poll to receive any pending packets
-        self.iface.poll(timestamp, &mut DeviceWrapper(&mut self.device), &mut self.sockets);
-        
+        self.iface.poll(
+            timestamp,
+            &mut DeviceWrapper(&mut self.device),
+            &mut self.sockets,
+        );
+
         // Get the TCP socket
         let socket = self.sockets.get_mut::<tcp::Socket>(self.tcp_handle);
-        
+
         if !socket.may_recv() {
             if socket.state() == tcp::State::CloseWait || socket.state() == tcp::State::Closed {
                 return Err("Connection closed by peer");
             }
             return Ok(0);
         }
-        
+
         match socket.recv_slice(buf) {
             Ok(len) => Ok(len),
             Err(_) => Ok(0),
         }
     }
-    
+
     /// Check if TCP socket can receive data
     pub fn tcp_can_recv(&mut self) -> bool {
         let socket = self.sockets.get_mut::<tcp::Socket>(self.tcp_handle);
         socket.may_recv() && socket.recv_queue() > 0
     }
-    
+
     /// Close TCP connection gracefully
     pub fn tcp_close(&mut self, timestamp_ms: i64) {
         let timestamp = Instant::from_millis(timestamp_ms);
-        
+
         let socket = self.sockets.get_mut::<tcp::Socket>(self.tcp_handle);
         socket.close();
-        
+
         // Poll to process the close
-        self.iface.poll(timestamp, &mut DeviceWrapper(&mut self.device), &mut self.sockets);
+        self.iface.poll(
+            timestamp,
+            &mut DeviceWrapper(&mut self.device),
+            &mut self.sockets,
+        );
     }
-    
+
     /// Abort TCP connection immediately
     pub fn tcp_abort(&mut self) {
         let socket = self.sockets.get_mut::<tcp::Socket>(self.tcp_handle);
         socket.abort();
     }
-    
+
     /// Get TCP socket state (for debugging)
     pub fn tcp_state(&mut self) -> &'static str {
         let socket = self.sockets.get_mut::<tcp::Socket>(self.tcp_handle);
@@ -663,9 +721,15 @@ impl NetState {
 struct DeviceWrapper<'a>(&'a mut VirtioNet);
 
 impl Device for DeviceWrapper<'_> {
-    type RxToken<'a> = VirtioRxToken where Self: 'a;
-    type TxToken<'a> = VirtioTxToken<'a> where Self: 'a;
-    
+    type RxToken<'a>
+        = VirtioRxToken
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = VirtioTxToken<'a>
+    where
+        Self: 'a;
+
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ethernet;
@@ -673,17 +737,17 @@ impl Device for DeviceWrapper<'_> {
         caps.max_burst_size = Some(1);
         caps
     }
-    
+
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         // Check if there's a received packet
         if let Some((desc_idx, data)) = self.0.recv_with_desc() {
             // Copy data since we need to recycle the buffer
             let mut buf = vec![0u8; data.len()];
             buf.copy_from_slice(data);
-            
+
             // Recycle the RX buffer immediately
             self.0.recycle_rx(desc_idx);
-            
+
             Some((
                 VirtioRxToken { buffer: buf },
                 VirtioTxToken { device: self.0 },
@@ -692,7 +756,7 @@ impl Device for DeviceWrapper<'_> {
             None
         }
     }
-    
+
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
         // Always allow transmit (the device will handle buffer exhaustion)
         Some(VirtioTxToken { device: self.0 })
@@ -726,14 +790,14 @@ impl TxToken for VirtioTxToken<'_> {
     {
         let mut buffer = vec![0u8; len];
         let result = f(&mut buffer);
-        
+
         // Send the packet
         if let Err(e) = self.device.send(&buffer) {
             // Log error but don't fail (network errors are recoverable)
             crate::uart::write_str("TX error: ");
             crate::uart::write_line(e);
         }
-        
+
         result
     }
 }
@@ -744,7 +808,7 @@ pub fn parse_ipv4(s: &[u8]) -> Option<Ipv4Address> {
     let mut octet_idx = 0;
     let mut current = 0u16;
     let mut has_digit = false;
-    
+
     for &b in s {
         if b >= b'0' && b <= b'9' {
             current = current * 10 + (b - b'0') as u16;
@@ -764,12 +828,12 @@ pub fn parse_ipv4(s: &[u8]) -> Option<Ipv4Address> {
             return None;
         }
     }
-    
+
     if !has_digit || octet_idx != 3 {
         return None;
     }
     octets[3] = current as u8;
-    
+
     Some(Ipv4Address::new(octets[0], octets[1], octets[2], octets[3]))
 }
 
@@ -777,7 +841,7 @@ pub fn parse_ipv4(s: &[u8]) -> Option<Ipv4Address> {
 pub fn format_ipv4(addr: Ipv4Address, buf: &mut [u8]) -> usize {
     let octets = addr.0;
     let mut pos = 0;
-    
+
     for (i, &octet) in octets.iter().enumerate() {
         // Write octet
         if octet >= 100 {
@@ -790,13 +854,13 @@ pub fn format_ipv4(addr: Ipv4Address, buf: &mut [u8]) -> usize {
         }
         buf[pos] = b'0' + (octet % 10);
         pos += 1;
-        
+
         // Write dot (except after last octet)
         if i < 3 {
             buf[pos] = b'.';
             pos += 1;
         }
     }
-    
+
     pos
 }

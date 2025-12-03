@@ -10,9 +10,9 @@
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
+use core::sync::atomic::{fence, AtomicBool, AtomicUsize, Ordering};
 
-use crate::task::{Task, TaskEntry, TaskInfo, TaskState, Pid, Priority};
+use crate::task::{Pid, Priority, Task, TaskEntry, TaskInfo, TaskState};
 use crate::Spinlock;
 use crate::MAX_HARTS;
 
@@ -31,7 +31,7 @@ impl RunQueue {
             current: None,
         }
     }
-    
+
     /// Add a task to the queue (maintains priority order)
     pub fn enqueue(&mut self, task: Arc<Task>) {
         // Insert based on priority (higher priority = earlier in queue)
@@ -45,7 +45,7 @@ impl RunQueue {
         }
         self.tasks.insert(insert_pos, task);
     }
-    
+
     /// Get next task to run
     pub fn dequeue(&mut self) -> Option<Arc<Task>> {
         // Find first runnable task
@@ -56,17 +56,17 @@ impl RunQueue {
         }
         None
     }
-    
+
     /// Number of tasks in queue
     pub fn len(&self) -> usize {
         self.tasks.len()
     }
-    
+
     /// Check if queue is empty
     pub fn is_empty(&self) -> bool {
         self.tasks.is_empty()
     }
-    
+
     /// Steal a task from this queue (for work stealing)
     pub fn steal(&mut self) -> Option<Arc<Task>> {
         // Steal lowest priority task from back of queue
@@ -116,20 +116,23 @@ impl Scheduler {
         self.num_harts.store(num_harts, Ordering::Release);
         self.running.store(true, Ordering::Release);
         fence(Ordering::SeqCst);
-        
-        crate::klog::klog_info("sched", &alloc::format!("Scheduler initialized with {} harts", num_harts));
+
+        crate::klog::klog_info(
+            "sched",
+            &alloc::format!("Scheduler initialized with {} harts", num_harts),
+        );
     }
-    
+
     /// Check if scheduler is running
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::Acquire)
     }
-    
+
     /// Spawn a new task
     pub fn spawn(&self, name: &str, entry: TaskEntry, priority: Priority) -> Pid {
         self.spawn_on_hart(name, entry, priority, None)
     }
-    
+
     /// Spawn a task with hart affinity
     pub fn spawn_on_hart(
         &self,
@@ -141,35 +144,41 @@ impl Scheduler {
         let pid = self.next_pid.fetch_add(1, Ordering::SeqCst) as Pid;
         let mut task = Task::new(pid, name, entry, priority);
         task.hart_affinity = hart_affinity;
-        
+
         let task = Arc::new(task);
-        
+
         // Register in global task table
         self.tasks.lock().insert(pid, task.clone());
-        
+
         // Determine target hart
         let target_hart = hart_affinity.unwrap_or_else(|| self.find_least_loaded_hart());
-        
+
         // Enqueue the task
         self.queues[target_hart].lock().enqueue(task);
-        
-        crate::klog::klog_debug("sched", &alloc::format!(
-            "Spawned task '{}' (PID {}) on hart {}", name, pid, target_hart
-        ));
-        
+
+        crate::klog::klog_debug(
+            "sched",
+            &alloc::format!(
+                "Spawned task '{}' (PID {}) on hart {}",
+                name,
+                pid,
+                target_hart
+            ),
+        );
+
         // Wake the target hart if not primary
         if target_hart != 0 {
             crate::send_ipi(target_hart);
         }
-        
+
         pid
     }
-    
+
     /// Spawn a daemon task (long-running service)
     pub fn spawn_daemon(&self, name: &str, entry: TaskEntry, priority: Priority) -> Pid {
         self.spawn_daemon_on_hart(name, entry, priority, None)
     }
-    
+
     /// Spawn a daemon task on a specific hart
     pub fn spawn_daemon_on_hart(
         &self,
@@ -181,27 +190,33 @@ impl Scheduler {
         let pid = self.next_pid.fetch_add(1, Ordering::SeqCst) as Pid;
         let mut task = Task::new_daemon(pid, name, entry, priority);
         task.hart_affinity = hart_affinity;
-        
+
         let task = Arc::new(task);
-        
+
         self.tasks.lock().insert(pid, task.clone());
-        
+
         let target_hart = hart_affinity.unwrap_or_else(|| self.find_least_loaded_hart());
         self.queues[target_hart].lock().enqueue(task);
-        
-        crate::klog::klog_debug("sched", &alloc::format!(
-            "Spawned daemon '{}' (PID {}) on hart {}", name, pid, target_hart
-        ));
-        
+
+        crate::klog::klog_debug(
+            "sched",
+            &alloc::format!(
+                "Spawned daemon '{}' (PID {}) on hart {}",
+                name,
+                pid,
+                target_hart
+            ),
+        );
+
         pid
     }
-    
+
     /// Find the hart with the fewest queued tasks
     fn find_least_loaded_hart(&self) -> usize {
         let num_harts = self.num_harts.load(Ordering::Relaxed);
         let mut min_load = usize::MAX;
         let mut target = 0;
-        
+
         for hart in 0..num_harts {
             let load = self.queues[hart].lock().len();
             if load < min_load {
@@ -209,65 +224,74 @@ impl Scheduler {
                 target = hart;
             }
         }
-        
+
         target
     }
-    
+
     /// Pick the next task for a hart to run
     pub fn pick_next(&self, hart_id: usize) -> Option<Arc<Task>> {
         // First try our own queue
         if let Some(task) = self.queues[hart_id].lock().dequeue() {
             return Some(task);
         }
-        
+
         // Try work stealing from other harts
         let num_harts = self.num_harts.load(Ordering::Relaxed);
         for other in 0..num_harts {
             if other != hart_id {
                 if let Some(task) = self.queues[other].lock().steal() {
-                    crate::klog::klog_trace("sched", &alloc::format!(
-                        "Hart {} stole task '{}' from hart {}", 
-                        hart_id, task.name, other
-                    ));
+                    crate::klog::klog_trace(
+                        "sched",
+                        &alloc::format!(
+                            "Hart {} stole task '{}' from hart {}",
+                            hart_id,
+                            task.name,
+                            other
+                        ),
+                    );
                     return Some(task);
                 }
             }
         }
-        
+
         None
     }
-    
+
     /// Requeue a task (e.g., after time slice expires)
     pub fn requeue(&self, task: Arc<Task>, hart_id: usize) {
         task.set_state(TaskState::Ready);
         self.queues[hart_id].lock().enqueue(task);
     }
-    
+
     /// Mark a task as finished
     pub fn finish_task(&self, pid: Pid, exit_code: usize) {
         if let Some(task) = self.tasks.lock().get(&pid) {
             task.mark_finished(exit_code);
-            
-            crate::klog::klog_info("sched", &alloc::format!(
-                "Task '{}' (PID {}) exited with code {}", task.name, pid, exit_code
-            ));
-            
+
+            crate::klog::klog_info(
+                "sched",
+                &alloc::format!(
+                    "Task '{}' (PID {}) exited with code {}",
+                    task.name,
+                    pid,
+                    exit_code
+                ),
+            );
+
             // If daemon with restart_on_exit, respawn it
             if task.is_daemon && task.restart_on_exit {
                 let name = task.name.clone();
                 let entry = task.entry;
                 let priority = task.priority;
                 let affinity = task.hart_affinity;
-                
+
                 // Schedule respawn
-                crate::klog::klog_info("sched", &alloc::format!(
-                    "Respawning daemon '{}'", name
-                ));
+                crate::klog::klog_info("sched", &alloc::format!("Respawning daemon '{}'", name));
                 self.spawn_on_hart(&name, entry, priority, affinity);
             }
         }
     }
-    
+
     /// Clean up zombie tasks
     pub fn reap_zombies(&self) -> usize {
         let mut tasks = self.tasks.lock();
@@ -276,20 +300,20 @@ impl Scheduler {
             .filter(|(_, t)| t.get_state() == TaskState::Zombie && !t.restart_on_exit)
             .map(|(pid, _)| *pid)
             .collect();
-        
+
         let count = zombies.len();
         for pid in zombies {
             tasks.remove(&pid);
         }
-        
+
         count
     }
-    
+
     /// Get task by PID
     pub fn get_task(&self, pid: Pid) -> Option<Arc<Task>> {
         self.tasks.lock().get(&pid).cloned()
     }
-    
+
     /// List all tasks
     pub fn list_tasks(&self) -> Vec<TaskInfo> {
         let current_time = crate::get_time_ms() as u64;
@@ -299,12 +323,12 @@ impl Scheduler {
             .map(|t| t.info(current_time))
             .collect()
     }
-    
+
     /// Get number of active tasks
     pub fn task_count(&self) -> usize {
         self.tasks.lock().len()
     }
-    
+
     /// Get total tasks in all queues
     pub fn queued_count(&self) -> usize {
         let num_harts = self.num_harts.load(Ordering::Relaxed);
@@ -314,7 +338,7 @@ impl Scheduler {
         }
         total
     }
-    
+
     /// Kill a task by PID
     pub fn kill(&self, pid: Pid) -> bool {
         let mut tasks = self.tasks.lock();
@@ -322,25 +346,26 @@ impl Scheduler {
             // Don't allow killing daemons with restart_on_exit unless stopped first
             if task.is_daemon && task.restart_on_exit {
                 task.mark_finished(137);
-                crate::klog::klog_info("sched", &alloc::format!(
-                    "Killed daemon '{}' (PID {}) - will respawn", task.name, pid
-                ));
+                crate::klog::klog_info(
+                    "sched",
+                    &alloc::format!("Killed daemon '{}' (PID {}) - will respawn", task.name, pid),
+                );
                 return true;
             }
-            
+
             let name = task.name.clone();
             task.mark_finished(137); // SIGKILL-like
-            
+
             // Immediately remove from task list (don't leave as zombie)
             tasks.remove(&pid);
-            
-            crate::klog::klog_info("sched", &alloc::format!(
-                "Killed and removed task '{}' (PID {})", name, pid
-            ));
+
+            crate::klog::klog_info(
+                "sched",
+                &alloc::format!("Killed and removed task '{}' (PID {})", name, pid),
+            );
             true
         } else {
             false
         }
     }
 }
-

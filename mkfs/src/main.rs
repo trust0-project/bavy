@@ -38,9 +38,12 @@ struct DirEntry {
 
 fn main() -> std::io::Result<()> {
     let args = Args::parse();
-    
+
     let total_sectors = (args.size * 1024 * 1024) / SECTOR_SIZE;
-    println!("Creating SFS image: {:?} ({} MB, {} sectors)", args.output, args.size, total_sectors);
+    println!(
+        "Creating SFS image: {:?} ({} MB, {} sectors)",
+        args.output, args.size, total_sectors
+    );
 
     let mut file = File::create(&args.output)?;
     file.set_len(args.size * 1024 * 1024)?;
@@ -60,16 +63,16 @@ fn main() -> std::io::Result<()> {
             bitmap[byte_idx] |= 1 << bit_idx;
         }
     }
-    
+
     let mut dir_idx = 0u64;
-    
+
     // 3. Import Files from root directory (non-recursive, just files in root)
     if let Some(ref src_dir) = args.dir {
         if src_dir.exists() {
             dir_idx = import_directory(&mut file, &mut bitmap, src_dir, dir_idx, "")?;
         }
     }
-    
+
     // 4. Import files from usr/bin/ subdirectory (scripts with /usr/bin/ prefix)
     if let Some(ref src_dir) = args.dir {
         let usr_bin_dir = src_dir.join("usr").join("bin");
@@ -78,7 +81,7 @@ fn main() -> std::io::Result<()> {
             dir_idx = import_directory(&mut file, &mut bitmap, &usr_bin_dir, dir_idx, "/usr/bin/")?;
         }
     }
-    
+
     // 5. Import files from home/ subdirectory (with /home/ prefix)
     if let Some(ref src_dir) = args.dir {
         let home_dir = src_dir.join("home");
@@ -87,7 +90,7 @@ fn main() -> std::io::Result<()> {
             dir_idx = import_directory(&mut file, &mut bitmap, &home_dir, dir_idx, "/home/")?;
         }
     }
-    
+
     // 6. Import files from var/log/ subdirectory (with /var/log/ prefix)
     if let Some(ref src_dir) = args.dir {
         let var_log_dir = src_dir.join("var").join("log");
@@ -96,13 +99,19 @@ fn main() -> std::io::Result<()> {
             dir_idx = import_directory(&mut file, &mut bitmap, &var_log_dir, dir_idx, "/var/log/")?;
         }
     }
-    
+
     // 7. Import files from etc/init.d/ subdirectory (with /etc/init.d/ prefix)
     if let Some(ref src_dir) = args.dir {
         let etc_init_dir = src_dir.join("etc").join("init.d");
         if etc_init_dir.exists() {
             println!("\n⚙️  Importing files from etc/init.d/...");
-            dir_idx = import_directory(&mut file, &mut bitmap, &etc_init_dir, dir_idx, "/etc/init.d/")?;
+            dir_idx = import_directory(
+                &mut file,
+                &mut bitmap,
+                &etc_init_dir,
+                dir_idx,
+                "/etc/init.d/",
+            )?;
         }
     }
 
@@ -125,12 +134,12 @@ fn import_directory(
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        
+
         // Skip subdirectories (except bin/ which is handled separately)
         if path.is_dir() {
             continue;
         }
-        
+
         if path.is_file() {
             let base_name = path.file_name().unwrap().to_str().unwrap();
             let filename = if prefix.is_empty() {
@@ -138,16 +147,20 @@ fn import_directory(
             } else {
                 format!("{}{}", prefix, base_name)
             };
-            
+
             if filename.len() > 23 {
                 println!("⚠️  Skipping {}: Name too long (max 23 chars)", filename);
                 continue;
             }
-            
+
             // Show different icon for scripts
-            let icon = if filename.ends_with(".rhai") { "📜" } else { "📄" };
+            let icon = if filename.ends_with(".rhai") {
+                "📜"
+            } else {
+                "📄"
+            };
             println!("  {} Importing {}", icon, filename);
-            
+
             let data = fs::read(&path)?;
             let head_sector = write_data(file, bitmap, &data)?;
             write_dir_entry(file, dir_idx, &filename, data.len() as u32, head_sector)?;
@@ -172,7 +185,9 @@ fn find_free_sector(bitmap: &mut [u8]) -> Option<u32> {
 }
 
 fn write_data(file: &mut File, bitmap: &mut [u8], data: &[u8]) -> std::io::Result<u32> {
-    if data.is_empty() { return Ok(0); }
+    if data.is_empty() {
+        return Ok(0);
+    }
 
     let mut remaining = data;
     let head = find_free_sector(bitmap).expect("Disk full");
@@ -183,7 +198,11 @@ fn write_data(file: &mut File, bitmap: &mut [u8], data: &[u8]) -> std::io::Resul
         let chunk = &remaining[..chunk_len];
         remaining = &remaining[chunk_len..];
 
-        let next = if remaining.is_empty() { 0 } else { find_free_sector(bitmap).expect("Disk full") };
+        let next = if remaining.is_empty() {
+            0
+        } else {
+            find_free_sector(bitmap).expect("Disk full")
+        };
 
         file.seek(SeekFrom::Start(current as u64 * SECTOR_SIZE))?;
         file.write_all(&next.to_le_bytes())?;
@@ -198,7 +217,13 @@ fn write_data(file: &mut File, bitmap: &mut [u8], data: &[u8]) -> std::io::Resul
     Ok(head)
 }
 
-fn write_dir_entry(file: &mut File, idx: u64, name: &str, size: u32, head: u32) -> std::io::Result<()> {
+fn write_dir_entry(
+    file: &mut File,
+    idx: u64,
+    name: &str,
+    size: u32,
+    head: u32,
+) -> std::io::Result<()> {
     let offset = (SEC_DIR_START * SECTOR_SIZE) + (idx * 32);
     file.seek(SeekFrom::Start(offset))?;
 

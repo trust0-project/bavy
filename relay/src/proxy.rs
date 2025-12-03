@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 
 use crate::protocol::GATEWAY_MAC;
 
@@ -109,7 +109,10 @@ impl ExternalProxy {
     /// Initialize the proxy (bind UDP socket)
     pub async fn init(&self) -> anyhow::Result<()> {
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
-        tracing::info!("External proxy UDP socket bound to {}", socket.local_addr()?);
+        tracing::info!(
+            "External proxy UDP socket bound to {}",
+            socket.local_addr()?
+        );
         *self.udp_socket.lock().await = Some(Arc::new(socket));
         Ok(())
     }
@@ -134,9 +137,9 @@ impl ExternalProxy {
         let protocol = frame[23];
 
         match protocol {
-            1 => self.handle_icmp(frame).await,   // ICMP
-            6 => self.handle_tcp(frame).await,    // TCP
-            17 => self.handle_udp(frame).await,   // UDP
+            1 => self.handle_icmp(frame).await, // ICMP
+            6 => self.handle_tcp(frame).await,  // TCP
+            17 => self.handle_udp(frame).await, // UDP
             _ => {
                 tracing::trace!("Unsupported protocol: {}", protocol);
                 None
@@ -182,7 +185,10 @@ impl ExternalProxy {
                 Some(self.generate_icmp_reply(&src_mac, &src_ip, &dst_ip, ident, seq))
             }
             Ok(_) => {
-                tracing::debug!("ICMP proxy: ping {} failed (timeout or unreachable)", dst_addr);
+                tracing::debug!(
+                    "ICMP proxy: ping {} failed (timeout or unreachable)",
+                    dst_addr
+                );
                 None
             }
             Err(e) => {
@@ -220,7 +226,7 @@ impl ExternalProxy {
         frame[18..20].copy_from_slice(&ident.to_be_bytes());
         frame[20..22].copy_from_slice(&[0x00, 0x00]);
         frame[22] = 64; // TTL
-        frame[23] = 1;  // ICMP
+        frame[23] = 1; // ICMP
         frame[24..26].copy_from_slice(&[0x00, 0x00]); // checksum placeholder
         frame[26..30].copy_from_slice(src_ip);
         frame[30..34].copy_from_slice(dst_ip);
@@ -297,8 +303,12 @@ impl ExternalProxy {
         // Calculate payload size
         let tcp_header_len = ((frame[tcp_start + 12] >> 4) * 4) as usize;
         let payload_start = tcp_start + tcp_header_len;
-        let payload_len = if frame.len() > payload_start { frame.len() - payload_start } else { 0 };
-        
+        let payload_len = if frame.len() > payload_start {
+            frame.len() - payload_start
+        } else {
+            0
+        };
+
         tracing::info!(
             "TCP: {}:{} -> {}:{} flags=[{}{}{}{}] seq={} ack={} payload={}",
             Ipv4Addr::from(src_ip),
@@ -336,8 +346,10 @@ impl ExternalProxy {
                 return Some(synack);
             }
             drop(sessions);
-            
-            return self.handle_tcp_syn(key, src_mac, src_ip, src_port, dst_ip, dst_port, seq_num).await;
+
+            return self
+                .handle_tcp_syn(key, src_mac, src_ip, src_port, dst_ip, dst_port, seq_num)
+                .await;
         }
 
         // Handle RST - connection reset
@@ -362,7 +374,7 @@ impl ExternalProxy {
                 session.state = TcpState::FinWait;
                 // Send FIN to server via the channel
                 let _ = session.tx.try_send(vec![]);
-                
+
                 // Send FIN-ACK back to VM
                 let fin_ack = Self::build_tcp_packet(
                     &session.src_mac,
@@ -382,24 +394,29 @@ impl ExternalProxy {
             // Extract TCP payload (payload_start and payload_len already calculated above)
             if payload_len > 0 {
                 let packet_end = seq_num.wrapping_add(payload_len as u32);
-                
+
                 // Check if this packet contains any new data
                 // A packet can be:
                 // 1. Pure retransmission: packet_end <= server_ack
                 // 2. Partial overlap: seq_num < server_ack < packet_end (has some new data)
                 // 3. New data: seq_num >= server_ack
-                
+
                 let diff_start = session.server_ack.wrapping_sub(seq_num) as i32;
                 let diff_end = packet_end.wrapping_sub(session.server_ack) as i32;
-                
+
                 // Pure retransmission: starts before server_ack AND ends at or before server_ack
-                let is_pure_retransmission = diff_start > 0 && diff_start < (1 << 30) && 
-                                             (diff_end <= 0 || diff_end >= (1 << 30));
-                
+                let is_pure_retransmission = diff_start > 0
+                    && diff_start < (1 << 30)
+                    && (diff_end <= 0 || diff_end >= (1 << 30));
+
                 if is_pure_retransmission {
-                    tracing::debug!("TCP proxy: pure retransmission detected (seq={}, end={}, already_acked={}), sending ACK only", 
-                        seq_num, packet_end, session.server_ack);
-                    
+                    tracing::debug!(
+                        "TCP proxy: pure retransmission detected (seq={}, end={}, already_acked={}), sending ACK only",
+                        seq_num,
+                        packet_end,
+                        session.server_ack
+                    );
+
                     // Just re-send ACK, don't forward to server
                     let our_seq = session.server_seq.wrapping_add(1);
                     let ack_packet = Self::build_tcp_packet(
@@ -409,43 +426,54 @@ impl ExternalProxy {
                         &session.dst_ip,
                         session.dst_port,
                         our_seq,
-                        session.server_ack,  // Use already-acknowledged value
-                        0x10, // ACK
+                        session.server_ack, // Use already-acknowledged value
+                        0x10,               // ACK
                         &[],
                     );
                     drop(sessions);
                     return Some(ack_packet);
                 }
-                
+
                 // Extract only the new data (skip bytes we've already ACKed)
                 let payload = if diff_start > 0 && diff_start < (1 << 30) {
                     // Partial retransmission - extract only new portion
                     let skip_bytes = diff_start as usize;
-                    tracing::info!("TCP proxy: partial retransmission - skipping {} already-acked bytes, forwarding {} new bytes",
-                        skip_bytes, payload_len - skip_bytes);
+                    tracing::info!(
+                        "TCP proxy: partial retransmission - skipping {} already-acked bytes, forwarding {} new bytes",
+                        skip_bytes,
+                        payload_len - skip_bytes
+                    );
                     frame[payload_start + skip_bytes..].to_vec()
                 } else {
                     // All new data
                     frame[payload_start..].to_vec()
                 };
-                
+
                 // Calculate the expected ACK based on actual packet end
                 let expected_ack = packet_end;
-                
-                tracing::info!("TCP proxy: queueing {} bytes for server task (seq={})", payload_len, seq_num);
-                
+
+                tracing::info!(
+                    "TCP proxy: queueing {} bytes for server task (seq={})",
+                    payload_len,
+                    seq_num
+                );
+
                 // Forward data to the server task
                 match session.tx.try_send(payload) {
                     Ok(()) => tracing::info!("TCP proxy: data queued successfully"),
                     Err(e) => tracing::error!("TCP proxy: failed to queue data: {}", e),
                 }
-                
+
                 // Send immediate ACK back to VM so it doesn't timeout
                 // Need to use server_seq + 1 (since SYN-ACK consumed one seq number)
                 let our_seq = session.server_seq.wrapping_add(1);
-                
-                tracing::info!("TCP proxy: sending ACK to VM (our_seq={}, acking={})", our_seq, expected_ack);
-                
+
+                tracing::info!(
+                    "TCP proxy: sending ACK to VM (our_seq={}, acking={})",
+                    our_seq,
+                    expected_ack
+                );
+
                 let ack_packet = Self::build_tcp_packet(
                     &session.src_mac,
                     &session.src_ip,
@@ -457,10 +485,10 @@ impl ExternalProxy {
                     0x10, // ACK
                     &[],
                 );
-                
+
                 // Update our tracking of what we've acked
                 session.server_ack = expected_ack;
-                
+
                 drop(sessions);
                 return Some(ack_packet);
             }
@@ -483,26 +511,30 @@ impl ExternalProxy {
         seq_num: u32,
     ) -> Option<Vec<u8>> {
         let dst_addr = Ipv4Addr::from(dst_ip);
-        
+
         tracing::info!("TCP proxy: new connection to {}:{}", dst_addr, dst_port);
 
         // Try to connect to the external server
         let server_addr = SocketAddrV4::new(dst_addr, dst_port);
-        
-        let stream = match tokio::time::timeout(
-            Duration::from_secs(10),
-            TcpStream::connect(server_addr)
-        ).await {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(e)) => {
-                tracing::warn!("TCP proxy: connection failed: {}", e);
-                return Some(self.generate_tcp_rst(&src_mac, &src_ip, src_port, &dst_ip, dst_port, seq_num));
-            }
-            Err(_) => {
-                tracing::warn!("TCP proxy: connection timeout");
-                return Some(self.generate_tcp_rst(&src_mac, &src_ip, src_port, &dst_ip, dst_port, seq_num));
-            }
-        };
+
+        let stream =
+            match tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(server_addr))
+                .await
+            {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(e)) => {
+                    tracing::warn!("TCP proxy: connection failed: {}", e);
+                    return Some(self.generate_tcp_rst(
+                        &src_mac, &src_ip, src_port, &dst_ip, dst_port, seq_num,
+                    ));
+                }
+                Err(_) => {
+                    tracing::warn!("TCP proxy: connection timeout");
+                    return Some(self.generate_tcp_rst(
+                        &src_mac, &src_ip, src_port, &dst_ip, dst_port, seq_num,
+                    ));
+                }
+            };
 
         tracing::info!("TCP proxy: connected to {}:{}", dst_addr, dst_port);
 
@@ -547,7 +579,8 @@ impl ExternalProxy {
                 dst_port,
                 server_seq.wrapping_add(1), // Start data seq after SYN
                 seq_num.wrapping_add(1),
-            ).await;
+            )
+            .await;
         });
 
         // Send SYN-ACK back to VM
@@ -576,7 +609,7 @@ impl ExternalProxy {
         mut ack: u32,
     ) {
         let mut buf = vec![0u8; 4096];
-        
+
         tracing::debug!("TCP proxy task: started with seq={}, ack={}", seq, ack);
 
         loop {
@@ -596,36 +629,36 @@ impl ExternalProxy {
                         }
                         Ok(n) => {
                             tracing::info!("TCP proxy task: received {} bytes from server, building packet with seq={}, ack={}", n, seq, ack);
-                            
+
                             // Fragment large data to fit in WebTransport datagrams
                             // Max safe payload size is ~1200 bytes, we use 1000 to be safe
                             const MAX_TCP_PAYLOAD: usize = 1000;
                             let data = &buf[..n];
                             let mut offset = 0;
-                            
+
                             while offset < data.len() {
                                 let chunk_end = (offset + MAX_TCP_PAYLOAD).min(data.len());
                                 let chunk = &data[offset..chunk_end];
                                 let is_last = chunk_end == data.len();
-                                
+
                                 // PSH only on last fragment, ACK on all
                                 let flags = if is_last { 0x18 } else { 0x10 }; // PSH+ACK or just ACK
-                                
-                                tracing::info!("TCP proxy task: sending chunk len={} with seq={} to {}:{}", 
-                                    chunk.len(), seq, 
+
+                                tracing::info!("TCP proxy task: sending chunk len={} with seq={} to {}:{}",
+                                    chunk.len(), seq,
                                     std::net::Ipv4Addr::from(src_ip), src_port);
-                                
+
                                 let packet = Self::build_tcp_packet(
                                     &src_mac, &src_ip, src_port, &dst_ip, dst_port,
                                     seq, ack, flags, chunk,
                                 );
                                 seq = seq.wrapping_add(chunk.len() as u32);
-                                
+
                                 if let Err(e) = response_tx.send(packet).await {
                                     tracing::error!("TCP proxy task: failed to send to response channel: {}", e);
                                     break;
                                 }
-                                
+
                                 offset = chunk_end;
                             }
                         }
@@ -643,11 +676,11 @@ impl ExternalProxy {
                         tracing::info!("TCP proxy task: VM requested close");
                         break;
                     }
-                    
+
                     let old_ack = ack;
                     ack = ack.wrapping_add(data.len() as u32);
                     tracing::info!("TCP proxy task: forwarding {} bytes to server (ack {} -> {})", data.len(), old_ack, ack);
-                    
+
                     if let Err(e) = stream.write_all(&data).await {
                         tracing::warn!("TCP proxy task: write error: {}", e);
                         break;
@@ -691,7 +724,7 @@ impl ExternalProxy {
         frame[18..20].copy_from_slice(&[0x00, 0x00]); // identification
         frame[20..22].copy_from_slice(&[0x40, 0x00]); // DF flag
         frame[22] = 64; // TTL
-        frame[23] = 6;  // TCP
+        frame[23] = 6; // TCP
         frame[24..26].copy_from_slice(&[0x00, 0x00]); // checksum placeholder
         frame[26..30].copy_from_slice(src_ip);
         frame[30..34].copy_from_slice(dst_ip);
@@ -737,7 +770,17 @@ impl ExternalProxy {
         seq: u32,
         ack: u32,
     ) -> Vec<u8> {
-        Self::build_tcp_packet(dst_mac, dst_ip, dst_port, src_ip, src_port, seq, ack, 0x12, &[])
+        Self::build_tcp_packet(
+            dst_mac,
+            dst_ip,
+            dst_port,
+            src_ip,
+            src_port,
+            seq,
+            ack,
+            0x12,
+            &[],
+        )
     }
 
     /// Generate TCP RST packet
@@ -750,7 +793,17 @@ impl ExternalProxy {
         src_port: u16,
         ack: u32,
     ) -> Vec<u8> {
-        Self::build_tcp_packet(dst_mac, dst_ip, dst_port, src_ip, src_port, 0, ack.wrapping_add(1), 0x14, &[])
+        Self::build_tcp_packet(
+            dst_mac,
+            dst_ip,
+            dst_port,
+            src_ip,
+            src_port,
+            0,
+            ack.wrapping_add(1),
+            0x14,
+            &[],
+        )
     }
 
     /// Handle outbound UDP packet

@@ -5,12 +5,12 @@
 //! 2. Control leaves only at the last instruction
 //! 3. No branches/jumps in the middle (except the terminator)
 
+use super::decoder::{self, Op};
+use super::microop::MicroOp;
+use crate::Trap;
 use crate::bus::Bus;
 use crate::csr::Mode;
-use crate::decoder::{self, Op};
-use crate::microop::MicroOp;
 use crate::mmu::{self, AccessType, Tlb};
-use crate::Trap;
 
 /// Maximum number of micro-ops in a single block.
 pub const MAX_BLOCK_SIZE: usize = 64;
@@ -267,12 +267,48 @@ impl<'a> BlockCompiler<'a> {
                 let rs1 = rs1.to_usize() as u8;
                 let rs2 = rs2.to_usize() as u8;
                 match funct3 {
-                    0 => MicroOp::Beq { rs1, rs2, imm, pc_offset, insn_len },
-                    1 => MicroOp::Bne { rs1, rs2, imm, pc_offset, insn_len },
-                    4 => MicroOp::Blt { rs1, rs2, imm, pc_offset, insn_len },
-                    5 => MicroOp::Bge { rs1, rs2, imm, pc_offset, insn_len },
-                    6 => MicroOp::Bltu { rs1, rs2, imm, pc_offset, insn_len },
-                    7 => MicroOp::Bgeu { rs1, rs2, imm, pc_offset, insn_len },
+                    0 => MicroOp::Beq {
+                        rs1,
+                        rs2,
+                        imm,
+                        pc_offset,
+                        insn_len,
+                    },
+                    1 => MicroOp::Bne {
+                        rs1,
+                        rs2,
+                        imm,
+                        pc_offset,
+                        insn_len,
+                    },
+                    4 => MicroOp::Blt {
+                        rs1,
+                        rs2,
+                        imm,
+                        pc_offset,
+                        insn_len,
+                    },
+                    5 => MicroOp::Bge {
+                        rs1,
+                        rs2,
+                        imm,
+                        pc_offset,
+                        insn_len,
+                    },
+                    6 => MicroOp::Bltu {
+                        rs1,
+                        rs2,
+                        imm,
+                        pc_offset,
+                        insn_len,
+                    },
+                    7 => MicroOp::Bgeu {
+                        rs1,
+                        rs2,
+                        imm,
+                        pc_offset,
+                        insn_len,
+                    },
                     _ => MicroOp::Fence, // Should not happen
                 }
             }
@@ -286,13 +322,48 @@ impl<'a> BlockCompiler<'a> {
                 let rd = rd.to_usize() as u8;
                 let rs1 = rs1.to_usize() as u8;
                 match funct3 {
-                    0 => MicroOp::Lb { rd, rs1, imm, pc_offset },
-                    1 => MicroOp::Lh { rd, rs1, imm, pc_offset },
-                    2 => MicroOp::Lw { rd, rs1, imm, pc_offset },
-                    3 => MicroOp::Ld { rd, rs1, imm, pc_offset },
-                    4 => MicroOp::Lbu { rd, rs1, imm, pc_offset },
-                    5 => MicroOp::Lhu { rd, rs1, imm, pc_offset },
-                    6 => MicroOp::Lwu { rd, rs1, imm, pc_offset },
+                    0 => MicroOp::Lb {
+                        rd,
+                        rs1,
+                        imm,
+                        pc_offset,
+                    },
+                    1 => MicroOp::Lh {
+                        rd,
+                        rs1,
+                        imm,
+                        pc_offset,
+                    },
+                    2 => MicroOp::Lw {
+                        rd,
+                        rs1,
+                        imm,
+                        pc_offset,
+                    },
+                    3 => MicroOp::Ld {
+                        rd,
+                        rs1,
+                        imm,
+                        pc_offset,
+                    },
+                    4 => MicroOp::Lbu {
+                        rd,
+                        rs1,
+                        imm,
+                        pc_offset,
+                    },
+                    5 => MicroOp::Lhu {
+                        rd,
+                        rs1,
+                        imm,
+                        pc_offset,
+                    },
+                    6 => MicroOp::Lwu {
+                        rd,
+                        rs1,
+                        imm,
+                        pc_offset,
+                    },
                     _ => MicroOp::Fence,
                 }
             }
@@ -306,10 +377,30 @@ impl<'a> BlockCompiler<'a> {
                 let rs1 = rs1.to_usize() as u8;
                 let rs2 = rs2.to_usize() as u8;
                 match funct3 {
-                    0 => MicroOp::Sb { rs1, rs2, imm, pc_offset },
-                    1 => MicroOp::Sh { rs1, rs2, imm, pc_offset },
-                    2 => MicroOp::Sw { rs1, rs2, imm, pc_offset },
-                    3 => MicroOp::Sd { rs1, rs2, imm, pc_offset },
+                    0 => MicroOp::Sb {
+                        rs1,
+                        rs2,
+                        imm,
+                        pc_offset,
+                    },
+                    1 => MicroOp::Sh {
+                        rs1,
+                        rs2,
+                        imm,
+                        pc_offset,
+                    },
+                    2 => MicroOp::Sw {
+                        rs1,
+                        rs2,
+                        imm,
+                        pc_offset,
+                    },
+                    3 => MicroOp::Sd {
+                        rs1,
+                        rs2,
+                        imm,
+                        pc_offset,
+                    },
                     _ => MicroOp::Fence,
                 }
             }
@@ -531,20 +622,84 @@ impl<'a> BlockCompiler<'a> {
                     0b00011 => {
                         // SC
                         if is_word {
-                            MicroOp::ScW { rd, rs1, rs2, pc_offset }
+                            MicroOp::ScW {
+                                rd,
+                                rs1,
+                                rs2,
+                                pc_offset,
+                            }
                         } else {
-                            MicroOp::ScD { rd, rs1, rs2, pc_offset }
+                            MicroOp::ScD {
+                                rd,
+                                rs1,
+                                rs2,
+                                pc_offset,
+                            }
                         }
                     }
-                    0b00001 => MicroOp::AmoSwap { rd, rs1, rs2, is_word, pc_offset },
-                    0b00000 => MicroOp::AmoAdd { rd, rs1, rs2, is_word, pc_offset },
-                    0b00100 => MicroOp::AmoXor { rd, rs1, rs2, is_word, pc_offset },
-                    0b01100 => MicroOp::AmoAnd { rd, rs1, rs2, is_word, pc_offset },
-                    0b01000 => MicroOp::AmoOr { rd, rs1, rs2, is_word, pc_offset },
-                    0b10000 => MicroOp::AmoMin { rd, rs1, rs2, is_word, pc_offset },
-                    0b10100 => MicroOp::AmoMax { rd, rs1, rs2, is_word, pc_offset },
-                    0b11000 => MicroOp::AmoMinu { rd, rs1, rs2, is_word, pc_offset },
-                    0b11100 => MicroOp::AmoMaxu { rd, rs1, rs2, is_word, pc_offset },
+                    0b00001 => MicroOp::AmoSwap {
+                        rd,
+                        rs1,
+                        rs2,
+                        is_word,
+                        pc_offset,
+                    },
+                    0b00000 => MicroOp::AmoAdd {
+                        rd,
+                        rs1,
+                        rs2,
+                        is_word,
+                        pc_offset,
+                    },
+                    0b00100 => MicroOp::AmoXor {
+                        rd,
+                        rs1,
+                        rs2,
+                        is_word,
+                        pc_offset,
+                    },
+                    0b01100 => MicroOp::AmoAnd {
+                        rd,
+                        rs1,
+                        rs2,
+                        is_word,
+                        pc_offset,
+                    },
+                    0b01000 => MicroOp::AmoOr {
+                        rd,
+                        rs1,
+                        rs2,
+                        is_word,
+                        pc_offset,
+                    },
+                    0b10000 => MicroOp::AmoMin {
+                        rd,
+                        rs1,
+                        rs2,
+                        is_word,
+                        pc_offset,
+                    },
+                    0b10100 => MicroOp::AmoMax {
+                        rd,
+                        rs1,
+                        rs2,
+                        is_word,
+                        pc_offset,
+                    },
+                    0b11000 => MicroOp::AmoMinu {
+                        rd,
+                        rs1,
+                        rs2,
+                        is_word,
+                        pc_offset,
+                    },
+                    0b11100 => MicroOp::AmoMaxu {
+                        rd,
+                        rs1,
+                        rs2,
+                        is_word,
+                        pc_offset,
+                    },
                     _ => MicroOp::Fence,
                 }
             }
@@ -564,11 +719,25 @@ mod tests {
         assert_eq!(block.len, 0);
         assert!(!block.is_full());
 
-        assert!(block.push(MicroOp::Addi { rd: 1, rs1: 0, imm: 5 }, 4));
+        assert!(block.push(
+            MicroOp::Addi {
+                rd: 1,
+                rs1: 0,
+                imm: 5
+            },
+            4
+        ));
         assert_eq!(block.len, 1);
         assert_eq!(block.byte_len, 4);
 
-        assert!(block.push(MicroOp::Add { rd: 2, rs1: 1, rs2: 1 }, 4));
+        assert!(block.push(
+            MicroOp::Add {
+                rd: 2,
+                rs1: 1,
+                rs2: 1
+            },
+            4
+        ));
         assert_eq!(block.len, 2);
         assert_eq!(block.byte_len, 8);
     }
@@ -577,10 +746,23 @@ mod tests {
     fn test_block_max_size() {
         let mut block = Block::new(0x8000_0000, 0x8000_0000, 0);
         for i in 0..MAX_BLOCK_SIZE {
-            assert!(block.push(MicroOp::Addi { rd: 1, rs1: 0, imm: i as i64 }, 4));
+            assert!(block.push(
+                MicroOp::Addi {
+                    rd: 1,
+                    rs1: 0,
+                    imm: i as i64
+                },
+                4
+            ));
         }
         assert!(block.is_full());
-        assert!(!block.push(MicroOp::Addi { rd: 1, rs1: 0, imm: 0 }, 4));
+        assert!(!block.push(
+            MicroOp::Addi {
+                rd: 1,
+                rs1: 0,
+                imm: 0
+            },
+            4
+        ));
     }
 }
-

@@ -33,7 +33,7 @@ const QUIC_MAX_IDLE_TIMEOUT_SECS: u64 = 180;
 
 use crate::hub::{Hub, PeerMessage};
 use crate::peer::PeerId;
-use crate::protocol::{encode_data_frame, ControlMessage, MSG_TYPE_CONTROL};
+use crate::protocol::{ControlMessage, MSG_TYPE_CONTROL, encode_data_frame};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -165,7 +165,7 @@ async fn main() -> Result<()> {
         .build();
 
     let endpoint = Endpoint::server(config)?;
-    
+
     info!(
         "QUIC keep-alive: {}s, max idle timeout: {}s",
         QUIC_KEEP_ALIVE_SECS, QUIC_MAX_IDLE_TIMEOUT_SECS
@@ -345,11 +345,14 @@ async fn run_tcp_proxy_receiver(hub: Arc<Hub>) {
     loop {
         // Poll for TCP responses from active connections
         while let Some(response_frame) = hub.proxy().poll_tcp_response().await {
-            info!("TCP receiver: got {} byte frame from proxy, routing to peer", response_frame.len());
+            info!(
+                "TCP receiver: got {} byte frame from proxy, routing to peer",
+                response_frame.len()
+            );
             // Route the response frame to the appropriate peer
             broadcast_response(&hub, &response_frame).await;
         }
-        
+
         // Small delay to avoid busy-waiting
         tokio::time::sleep(Duration::from_millis(10)).await;
     }

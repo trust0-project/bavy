@@ -9,14 +9,14 @@ use napi_rs::bindgen_prelude::*;
 // Re-export napi for the macro to find
 use napi_rs as napi;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use tokio::runtime::Runtime;
-use wtransport::tls::Sha256Digest;
 use wtransport::ClientConfig;
 use wtransport::Endpoint;
+use wtransport::tls::Sha256Digest;
 
 /// Message type prefix for control messages
 const MSG_TYPE_CONTROL: u8 = 0x00;
@@ -125,7 +125,7 @@ pub enum ConnectionStatus {
 }
 
 /// WebTransport client for Node.js.
-/// 
+///
 /// This class provides WebTransport connectivity using the same implementation
 /// as the native Rust VM. It maintains a persistent connection with automatic
 /// reconnection and heartbeat handling.
@@ -525,4 +525,3 @@ impl WebTransportClient {
         log::info!("[WebTransport] Shutdown signaled");
     }
 }
-

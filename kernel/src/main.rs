@@ -4,12 +4,10 @@
 // Override riscv-rt's _max_hart_id to allow multiple harts to boot
 // This MUST be defined before riscv-rt's startup code runs
 // Set to 127 to support up to 128 harts (matching MAX_HARTS)
-core::arch::global_asm!(
-    ".global _max_hart_id",
-    "_max_hart_id = 127"
-);
+core::arch::global_asm!(".global _max_hart_id", "_max_hart_id = 127");
 
 mod allocator;
+mod cmd;
 mod dns;
 mod lock;
 
@@ -26,11 +24,11 @@ mod virtio_blk;
 mod virtio_net;
 
 // Process management modules
-mod task;
-mod scheduler;
-mod klog;
 mod init;
 mod ipc;
+mod klog;
+mod scheduler;
+mod task;
 
 pub use scheduler::SCHEDULER;
 
@@ -58,7 +56,11 @@ const CLINT_HART_COUNT: usize = 0x0200_0F00;
 fn get_expected_harts() -> usize {
     let count = unsafe { core::ptr::read_volatile(CLINT_HART_COUNT as *const u32) } as usize;
     // Clamp to valid range [1, MAX_HARTS]
-    if count == 0 { 1 } else { count.min(MAX_HARTS) }
+    if count == 0 {
+        1
+    } else {
+        count.min(MAX_HARTS)
+    }
 }
 
 /// Maximum number of harts supported.
@@ -105,7 +107,7 @@ impl BenchmarkState {
             results: [ZERO; MAX_HARTS],
         }
     }
-    
+
     /// Start a new benchmark
     fn start(&self, mode: BenchmarkMode, start: u64, end: u64, num_harts: usize) {
         // Reset results
@@ -120,40 +122,41 @@ impl BenchmarkState {
         // Set mode last to signal start
         self.mode.store(mode as usize, Ordering::Release);
     }
-    
+
     /// Clear benchmark (return to idle)
     fn clear(&self) {
-        self.mode.store(BenchmarkMode::Idle as usize, Ordering::Release);
+        self.mode
+            .store(BenchmarkMode::Idle as usize, Ordering::Release);
     }
-    
+
     /// Check if benchmark is active
     fn is_active(&self) -> bool {
         self.mode.load(Ordering::Acquire) != BenchmarkMode::Idle as usize
     }
-    
+
     /// Get work range for a specific hart
     fn get_work_range(&self, hart_id: usize) -> (u64, u64) {
         let start = self.range_start.load(Ordering::Relaxed);
         let end = self.range_end.load(Ordering::Relaxed);
         let num_harts = self.num_harts.load(Ordering::Relaxed);
-        
+
         if num_harts == 0 || hart_id >= num_harts {
             return (0, 0);
         }
-        
+
         let total_range = end - start;
         let chunk_size = total_range / num_harts as u64;
-        
+
         let my_start = start + (hart_id as u64 * chunk_size);
         let my_end = if hart_id == num_harts - 1 {
             end // Last hart takes remainder
         } else {
             my_start + chunk_size
         };
-        
+
         (my_start, my_end)
     }
-    
+
     /// Report result from a hart
     fn report_result(&self, hart_id: usize, count: u64) {
         if hart_id < MAX_HARTS {
@@ -162,7 +165,7 @@ impl BenchmarkState {
         fence(Ordering::SeqCst);
         self.completed.fetch_add(1, Ordering::SeqCst);
     }
-    
+
     /// Get total result from all harts
     fn total_result(&self) -> u64 {
         let mut total = 0u64;
@@ -172,7 +175,7 @@ impl BenchmarkState {
         }
         total
     }
-    
+
     /// Check if all harts have completed
     fn all_completed(&self) -> bool {
         let num_harts = self.num_harts.load(Ordering::Relaxed);
@@ -206,7 +209,7 @@ fn is_prime(n: u64) -> bool {
     if n % 3 == 0 {
         return false;
     }
-    
+
     // Check divisors of form 6k±1 up to sqrt(n)
     let mut i = 5u64;
     while i * i <= n {
@@ -234,7 +237,7 @@ fn count_primes_in_range(start: u64, end: u64) -> u64 {
 ///
 /// - Hart 0: Returns true to continue to main()
 /// - Other harts: Enter parking loop, call secondary_hart_entry when woken
-/// 
+///
 /// # Safety
 /// This is called very early in boot, before Rust runtime is fully initialized.
 /// Only use assembly and no allocations.
@@ -262,7 +265,7 @@ pub unsafe extern "C" fn mp_hook() -> bool {
 /// Secondary hart parking loop.
 ///
 /// Waits for IPI, then transfers to secondary_hart_entry.
-/// 
+///
 /// # Safety
 /// Called very early in boot, before Rust runtime is fully initialized.
 #[inline(never)]
@@ -270,7 +273,7 @@ unsafe fn secondary_hart_park(hart_id: usize) -> ! {
     // Wait for IPI to wake us
     loop {
         asm!("wfi", options(nomem, nostack));
-        
+
         // Check if this was our wake-up call
         if is_msip_pending(hart_id) {
             // Clear the interrupt
@@ -279,7 +282,7 @@ unsafe fn secondary_hart_park(hart_id: usize) -> ! {
         }
         // Spurious wakeup - go back to sleep
     }
-    
+
     // Transfer to secondary entry point
     secondary_hart_entry(hart_id);
 }
@@ -295,11 +298,11 @@ pub fn get_hart_id() -> usize {
 }
 
 /// Entry point for secondary harts (called after waking from WFI).
-/// 
+///
 /// This function is called after the secondary hart has:
 /// 1. Been woken by an IPI from the primary hart
 /// 2. Checked that BOOT_READY is true
-/// 
+///
 /// # Arguments
 /// * `hart_id` - This hart's ID (1, 2, 3, ...)
 fn secondary_hart_entry(hart_id: usize) -> ! {
@@ -307,21 +310,19 @@ fn secondary_hart_entry(hart_id: usize) -> ! {
     while !BOOT_READY.load(Ordering::Acquire) {
         core::hint::spin_loop();
     }
-    
+
     // Memory fence ensures we see all init writes from primary hart
     fence(Ordering::SeqCst);
-    
+
     // Register this hart as online
     HARTS_ONLINE.fetch_add(1, Ordering::SeqCst);
-    
-   
-    
+
     // Enter the secondary hart idle loop
     secondary_hart_idle(hart_id);
 }
 
 /// Secondary hart idle loop.
-/// 
+///
 /// Secondary harts wait for work (IPI wakeup), then check for:
 /// 1. Benchmark tasks (high priority, checked first)
 /// 2. Scheduler tasks (including long-running daemons)
@@ -331,16 +332,16 @@ fn secondary_hart_idle(hart_id: usize) -> ! {
         unsafe {
             core::arch::asm!("wfi", options(nomem, nostack));
         }
-        
+
         // Check if we were woken by an IPI
         if !is_my_msip_pending() {
             // Spurious wakeup - go back to sleep
             continue;
         }
-        
+
         // Clear the IPI
         clear_my_msip();
-        
+
         // Check for benchmark work first (high priority)
         if BENCHMARK.is_active() {
             let mode = BENCHMARK.mode.load(Ordering::Acquire);
@@ -359,23 +360,23 @@ fn secondary_hart_idle(hart_id: usize) -> ! {
                 continue;
             }
         }
-        
+
         // Check for scheduler tasks
         if SCHEDULER.is_running() {
             if let Some(task) = SCHEDULER.pick_next(hart_id) {
                 // Mark task as running on this hart
                 task.mark_running(hart_id);
-                
+
                 let start_time = get_time_ms() as u64;
-                
+
                 // Execute the task's entry point
                 // Note: Daemon tasks have infinite loops and won't return
                 (task.entry)();
-                
+
                 // If we get here, the task returned (non-daemon or daemon that exited)
                 let elapsed = (get_time_ms() as u64).saturating_sub(start_time);
                 task.add_cpu_time(elapsed);
-                
+
                 // Mark task as finished
                 SCHEDULER.finish_task(task.pid, 0);
             }
@@ -485,10 +486,10 @@ static BLK_DEV: Spinlock<Option<virtio_blk::VirtioBlock>> = Spinlock::new(None);
 struct PingState {
     target: smoltcp::wire::Ipv4Address,
     seq: u16,
-    sent_time: i64,           // Time when current ping was sent
-    last_send_time: i64,      // Time when we last sent a ping (for 1s interval)
-    waiting: bool,            // Waiting for reply to current ping
-    continuous: bool,         // Whether running in continuous mode
+    sent_time: i64,      // Time when current ping was sent
+    last_send_time: i64, // Time when we last sent a ping (for 1s interval)
+    waiting: bool,       // Waiting for reply to current ping
+    continuous: bool,    // Whether running in continuous mode
     // Statistics
     packets_sent: u32,
     packets_received: u32,
@@ -513,7 +514,7 @@ impl PingState {
             total_rtt: 0,
         }
     }
-    
+
     fn record_reply(&mut self, rtt: i64) {
         self.packets_received += 1;
         self.total_rtt += rtt;
@@ -524,7 +525,7 @@ impl PingState {
             self.max_rtt = rtt;
         }
     }
-    
+
     fn avg_rtt(&self) -> i64 {
         if self.packets_received > 0 {
             self.total_rtt / self.packets_received as i64
@@ -532,7 +533,7 @@ impl PingState {
             0
         }
     }
-    
+
     fn packet_loss_percent(&self) -> u32 {
         if self.packets_sent > 0 {
             ((self.packets_sent - self.packets_received) * 100) / self.packets_sent
@@ -752,7 +753,7 @@ pub fn get_time_ms() -> i64 {
 }
 
 /// Run periodic daemon work on hart 0
-/// 
+///
 /// Services like klogd and sysmond need VirtIO access for filesystem writes.
 /// Since VirtIO is only accessible from hart 0 (which runs the shell loop),
 /// we call their tick functions directly from the shell loop.
@@ -767,11 +768,11 @@ fn run_hart0_tasks() {
 fn check_tail_follow(path: &str, last_size: usize) -> Option<usize> {
     let mut fs_guard = FS_STATE.lock();
     let mut blk_guard = BLK_DEV.lock();
-    
+
     if let (Some(fs), Some(dev)) = (fs_guard.as_mut(), blk_guard.as_mut()) {
         if let Some(content) = fs.read_file(dev, path) {
             let new_size = content.len();
-            
+
             if new_size > last_size {
                 // Print new content with green highlighting
                 let new_content = &content[last_size..];
@@ -788,7 +789,7 @@ fn check_tail_follow(path: &str, last_size: usize) -> Option<usize> {
                 uart::write_line("\x1b[1;33mtail: file truncated\x1b[0m");
                 return Some(new_size);
             }
-            
+
             return Some(last_size); // No change
         }
     }
@@ -800,26 +801,26 @@ fn check_tail_follow(path: &str, last_size: usize) -> Option<usize> {
 fn parse_tail_follow_command(cmd: &[u8]) -> Option<(String, usize)> {
     let cmd_str = core::str::from_utf8(cmd).ok()?;
     let cmd_str = cmd_str.trim();
-    
+
     // Must start with "tail"
     if !cmd_str.starts_with("tail ") && cmd_str != "tail" {
         return None;
     }
-    
+
     // Parse arguments
     let parts: Vec<&str> = cmd_str.split_whitespace().collect();
     if parts.len() < 2 {
         return None;
     }
-    
+
     let mut has_follow = false;
     let mut num_lines: usize = 10;
     let mut filepath: Option<&str> = None;
-    
+
     let mut i = 1;
     while i < parts.len() {
         let part = parts[i];
-        
+
         if part == "-f" || part == "--follow" {
             has_follow = true;
         } else if part.starts_with("-f") && part.len() > 2 {
@@ -848,17 +849,17 @@ fn parse_tail_follow_command(cmd: &[u8]) -> Option<(String, usize)> {
             // It's the filepath
             filepath = Some(part);
         }
-        
+
         i += 1;
     }
-    
+
     // Must have -f flag and a file path
     if has_follow {
         if let Some(path) = filepath {
             return Some((String::from(path), num_lines));
         }
     }
-    
+
     None
 }
 
@@ -867,22 +868,26 @@ fn parse_tail_follow_command(cmd: &[u8]) -> Option<(String, usize)> {
 fn start_tail_follow(path: &str, num_lines: usize) -> (bool, usize) {
     let mut fs_guard = FS_STATE.lock();
     let mut blk_guard = BLK_DEV.lock();
-    
+
     if let (Some(fs), Some(dev)) = (fs_guard.as_mut(), blk_guard.as_mut()) {
         if let Some(content) = fs.read_file(dev, path) {
             // Show last N lines
             if let Ok(text) = core::str::from_utf8(&content) {
                 let lines: Vec<&str> = text.lines().collect();
-                let start = if lines.len() > num_lines { lines.len() - num_lines } else { 0 };
-                
+                let start = if lines.len() > num_lines {
+                    lines.len() - num_lines
+                } else {
+                    0
+                };
+
                 for i in start..lines.len() {
                     uart::write_line(lines[i]);
                 }
             }
-            
+
             uart::write_line("");
             uart::write_line("\x1b[2m--- Following (Ctrl+C or 'q' to stop) ---\x1b[0m");
-            
+
             return (true, content.len());
         } else {
             uart::write_str("\x1b[1;31mtail: cannot open '");
@@ -892,18 +897,22 @@ fn start_tail_follow(path: &str, num_lines: usize) -> (bool, usize) {
     } else {
         uart::write_line("\x1b[1;31mtail: filesystem not available\x1b[0m");
     }
-    
+
     (false, 0)
 }
 
 /// Print a section header
 fn print_section(title: &str) {
     uart::write_line("");
-    uart::write_line("\x1b[1;33m────────────────────────────────────────────────────────────────────────\x1b[0m");
+    uart::write_line(
+        "\x1b[1;33m────────────────────────────────────────────────────────────────────────\x1b[0m",
+    );
     uart::write_str("\x1b[1;33m  ◆ ");
     uart::write_str(title);
     uart::write_line("\x1b[0m");
-    uart::write_line("\x1b[1;33m────────────────────────────────────────────────────────────────────────\x1b[0m");
+    uart::write_line(
+        "\x1b[1;33m────────────────────────────────────────────────────────────────────────\x1b[0m",
+    );
 }
 
 /// Print a boot status line
@@ -930,11 +939,15 @@ fn main() -> ! {
     // ═══════════════════════════════════════════════════════════════════
     // VERIFY WE'RE THE PRIMARY HART
     // ═══════════════════════════════════════════════════════════════════
-    
+
     let hart_id = get_hart_id();
     if hart_id != 0 {
         // Should never happen if _mp_hook works correctly
-        loop { unsafe { asm!("wfi"); } }
+        loop {
+            unsafe {
+                asm!("wfi");
+            }
+        }
     }
 
     // ─── CPU & ARCHITECTURE INFO ──────────────────────────────────────────────
@@ -944,7 +957,7 @@ fn main() -> ! {
     print_boot_info("Mode", "Machine Mode (M-Mode)");
     print_boot_info("Timer Source", "CLINT @ 0x02000000");
     print_boot_status("CPU initialized", true);
-    
+
     // ─── MEMORY SUBSYSTEM ─────────────────────────────────────────────────────
     print_section("MEMORY SUBSYSTEM");
     allocator::init();
@@ -956,38 +969,38 @@ fn main() -> ! {
     uart::write_u64(total_heap as u64 / 1024);
     uart::write_line(" KiB\x1b[0m");
     print_boot_status("Heap allocator ready", true);
-    
+
     // ─── STORAGE SUBSYSTEM ────────────────────────────────────────────────────
     init_storage();
-    
+
     // ─── SCRIPTING ENGINE ──────────────────────────────────────────────────────
     // Preload scripts from /usr/bin/ into AST cache for faster first execution
     scripting::preload_scripts();
-    
+
     // ─── NETWORK SUBSYSTEM ────────────────────────────────────────────────────
     print_section("NETWORK SUBSYSTEM");
     init_network();
-    
+
     // ═══════════════════════════════════════════════════════════════════
     // SMP INITIALIZATION
     // ═══════════════════════════════════════════════════════════════════
-    
+
     print_section("SMP INITIALIZATION");
-    
+
     // Read expected hart count from emulator (CLINT register)
     let expected_harts = get_expected_harts();
     print_boot_info("Expected harts", &format!("{}", expected_harts));
-    
+
     // Memory fence ensures all init writes are visible to other harts
     fence(Ordering::SeqCst);
-    
+
     // Signal that boot is complete
     BOOT_READY.store(true, Ordering::Release);
-    
+
     // Register primary hart as online
     HARTS_ONLINE.fetch_add(1, Ordering::SeqCst);
     print_boot_info("Primary hart", "online");
-    
+
     // Wake secondary harts via IPI
     for hart in 1..expected_harts {
         uart::write_str("    Sending IPI to hart ");
@@ -995,7 +1008,7 @@ fn main() -> ! {
         uart::write_line("");
         send_ipi(hart);
     }
-    
+
     // Wait for all harts to come online (with timeout)
     let timeout = get_time_ms() + 1000; // 1 second timeout
     while HARTS_ONLINE.load(Ordering::Acquire) < expected_harts {
@@ -1009,34 +1022,37 @@ fn main() -> ! {
         }
         core::hint::spin_loop();
     }
-    
+
     let online = HARTS_ONLINE.load(Ordering::Relaxed);
     uart::write_str("    \x1b[1;32m[✓]\x1b[0m Harts online: ");
     uart::write_u64(online as u64);
     uart::write_str("/");
     uart::write_u64(expected_harts as u64);
     uart::write_line("");
-    
+
     // ═══════════════════════════════════════════════════════════════════
     // PROCESS MANAGER INITIALIZATION
     // ═══════════════════════════════════════════════════════════════════
-    
+
     print_section("PROCESS MANAGER");
-    
+
     // Initialize scheduler with number of online harts
     SCHEDULER.init(online);
     print_boot_status("Scheduler initialized", true);
     print_boot_info("Run queues", &format!("{} (one per hart)", online));
-    
+
     // Run init directly on primary hart (spawns daemons to secondary harts)
     // Note: We don't spawn init as a task - it runs synchronously during boot
     print_boot_info("Init process", "running");
     init::init_main();
-    
+
     // Report services started
     let services = init::service_count();
-    print_boot_status(&format!("System services started ({})", services), services > 0);
-    
+    print_boot_status(
+        &format!("System services started ({})", services),
+        services > 0,
+    );
+
     // ─── BOOT COMPLETE ────────────────────────────────────────────────────────
     print_section(&format!("\x1b[1;97mBAVY OS BOOT COMPLETE!\x1b[0m"));
     uart::write_line("");
@@ -1050,32 +1066,32 @@ fn main() -> ! {
     let mut len = 0usize;
     let mut count: usize = 0;
     let mut last_newline: u8 = 0; // Track last newline char to handle \r\n sequences
-    
+
     // Command history
     const HISTORY_SIZE: usize = 16;
     let mut history: [[u8; 128]; HISTORY_SIZE] = [[0u8; 128]; HISTORY_SIZE];
     let mut history_lens: [usize; HISTORY_SIZE] = [0; HISTORY_SIZE];
-    let mut history_count: usize = 0;  // Total commands stored
-    let mut history_pos: usize = 0;    // Current position when navigating (0 = newest)
+    let mut history_count: usize = 0; // Total commands stored
+    let mut history_pos: usize = 0; // Current position when navigating (0 = newest)
     let mut browsing_history: bool = false;
-    
+
     // Escape sequence state
     let mut esc_state: u8 = 0; // 0 = normal, 1 = got ESC, 2 = got ESC[
 
     // Track last time we ran scheduled tasks
     let mut last_task_run: i64 = get_time_ms();
-    
+
     // Tail follow mode state
     let mut tail_follow_mode = false;
     let mut tail_follow_path: [u8; 128] = [0u8; 128];
     let mut tail_follow_path_len: usize = 0;
     let mut tail_follow_last_size: usize = 0;
     let mut tail_follow_last_check: i64 = 0;
-    
+
     loop {
         // Poll network stack
         poll_network();
-        
+
         let byte = console.read_byte();
 
         // 0 means "no input" in our UART model
@@ -1083,24 +1099,26 @@ fn main() -> ! {
             // While idle, periodically run scheduled tasks on hart 0
             // Services like klogd/sysmond are pinned to hart 0 for VirtIO access
             let now = get_time_ms();
-            if now - last_task_run >= 100 {  // Every 100ms
+            if now - last_task_run >= 100 {
+                // Every 100ms
                 last_task_run = now;
                 run_hart0_tasks();
             }
-            
+
             // If in tail follow mode, check for new content
             if tail_follow_mode && now - tail_follow_last_check >= 200 {
                 tail_follow_last_check = now;
-                
-                let path_str = core::str::from_utf8(&tail_follow_path[..tail_follow_path_len]).unwrap_or("");
+
+                let path_str =
+                    core::str::from_utf8(&tail_follow_path[..tail_follow_path_len]).unwrap_or("");
                 if let Some(new_size) = check_tail_follow(path_str, tail_follow_last_size) {
                     tail_follow_last_size = new_size;
                 }
             }
-            
+
             continue;
         }
-        
+
         // Check for Ctrl+C (0x03) to cancel running commands or exit follow mode
         if byte == 0x03 {
             if tail_follow_mode {
@@ -1121,7 +1139,7 @@ fn main() -> ! {
             }
             continue;
         }
-        
+
         // In follow mode, 'q' also exits
         if tail_follow_mode && (byte == b'q' || byte == b'Q') {
             tail_follow_mode = false;
@@ -1131,12 +1149,12 @@ fn main() -> ! {
             len = 0;
             continue;
         }
-        
+
         // Ignore other input while in follow mode
         if tail_follow_mode {
             continue;
         }
-        
+
         // Handle escape sequences for arrow keys
         if esc_state == 1 {
             if byte == b'[' {
@@ -1152,7 +1170,11 @@ fn main() -> ! {
                 b'A' => {
                     // Up arrow - go to older command
                     if history_count > 0 {
-                        let max_pos = if history_count < HISTORY_SIZE { history_count } else { HISTORY_SIZE };
+                        let max_pos = if history_count < HISTORY_SIZE {
+                            history_count
+                        } else {
+                            HISTORY_SIZE
+                        };
                         if history_pos < max_pos {
                             if !browsing_history {
                                 browsing_history = true;
@@ -1161,15 +1183,16 @@ fn main() -> ! {
                             if history_pos < max_pos {
                                 // Clear current line
                                 clear_input_line(len);
-                                
+
                                 // Get command from history (0 = most recent)
-                                let idx = ((history_count - 1 - history_pos) % HISTORY_SIZE) as usize;
+                                let idx =
+                                    ((history_count - 1 - history_pos) % HISTORY_SIZE) as usize;
                                 len = history_lens[idx];
                                 buffer[..len].copy_from_slice(&history[idx][..len]);
-                                
+
                                 // Display the command
                                 uart::write_bytes(&buffer[..len]);
-                                
+
                                 if history_pos + 1 < max_pos {
                                     history_pos += 1;
                                 }
@@ -1182,10 +1205,10 @@ fn main() -> ! {
                     // Down arrow - go to newer command
                     if browsing_history && history_pos > 0 {
                         history_pos -= 1;
-                        
+
                         // Clear current line
                         clear_input_line(len);
-                        
+
                         if history_pos == 0 {
                             // Back to empty line (current input)
                             browsing_history = false;
@@ -1195,7 +1218,7 @@ fn main() -> ! {
                             let idx = ((history_count - history_pos) % HISTORY_SIZE) as usize;
                             len = history_lens[idx];
                             buffer[..len].copy_from_slice(&history[idx][..len]);
-                            
+
                             // Display the command
                             uart::write_bytes(&buffer[..len]);
                         }
@@ -1225,13 +1248,15 @@ fn main() -> ! {
             }
             b'\r' | b'\n' => {
                 // Skip second char of \r\n or \n\r sequence
-                if (last_newline == b'\r' && byte == b'\n') || (last_newline == b'\n' && byte == b'\r') {
+                if (last_newline == b'\r' && byte == b'\n')
+                    || (last_newline == b'\n' && byte == b'\r')
+                {
                     last_newline = 0;
                     continue;
                 }
                 last_newline = byte;
-                uart::write_line("");  // Echo the newline
-                
+                uart::write_line(""); // Echo the newline
+
                 // Save to history if non-empty
                 if len > 0 {
                     let idx = history_count % HISTORY_SIZE;
@@ -1239,19 +1264,20 @@ fn main() -> ! {
                     history_lens[idx] = len;
                     history_count += 1;
                 }
-                
+
                 // Check for tail -f command (handle specially for real-time following)
                 if let Some((path, num_lines)) = parse_tail_follow_command(&buffer[..len]) {
                     // Resolve the path
                     let resolved = resolve_path(&path);
                     let resolved_bytes = resolved.as_bytes();
-                    
+
                     // Start follow mode
                     let (success, initial_size) = start_tail_follow(&resolved, num_lines);
                     if success {
                         tail_follow_mode = true;
                         tail_follow_path_len = resolved_bytes.len().min(128);
-                        tail_follow_path[..tail_follow_path_len].copy_from_slice(&resolved_bytes[..tail_follow_path_len]);
+                        tail_follow_path[..tail_follow_path_len]
+                            .copy_from_slice(&resolved_bytes[..tail_follow_path_len]);
                         tail_follow_last_size = initial_size;
                         tail_follow_last_check = get_time_ms();
                         // Don't print prompt - we're in follow mode
@@ -1306,41 +1332,40 @@ fn clear_input_line(len: usize) {
 fn handle_tab_completion(buffer: &mut [u8], len: usize) -> usize {
     use alloc::string::String;
     use alloc::vec::Vec;
-    
+
     if len == 0 {
         return 0;
     }
-    
+
     let input = match core::str::from_utf8(&buffer[..len]) {
         Ok(s) => s,
         Err(_) => return len,
     };
-    
+
     // Find the word being completed (last space-separated token)
     let last_space = input.rfind(' ');
     let (prefix, word_to_complete) = match last_space {
-        Some(pos) => (&input[..=pos], &input[pos+1..]),
+        Some(pos) => (&input[..=pos], &input[pos + 1..]),
         None => ("", input),
     };
-    
+
     let is_command = prefix.is_empty();
-    
+
     let mut matches: Vec<String> = Vec::new();
-    
+
     if is_command {
         // Complete commands - check built-ins first
         let builtins = [
-            "clear", "shutdown", "cd", "pwd", "ping", "nslookup", "node", "help",
-            "ls", "cat", "echo", "cowsay", "sysinfo", "ip", "netstat", "memstats",
-            "uptime", "write", "wget",
+            "clear", "shutdown", "cd", "pwd", "ping", "nslookup", "node", "help", "ls", "cat",
+            "echo", "cowsay", "sysinfo", "ip", "netstat", "memstats", "uptime", "write", "wget",
         ];
-        
+
         for cmd in builtins.iter() {
             if cmd.starts_with(word_to_complete) {
                 matches.push(String::from(*cmd));
             }
         }
-        
+
         // Also check /usr/bin/ for scripts
         {
             let fs_guard = FS_STATE.lock();
@@ -1367,37 +1392,36 @@ fn handle_tab_completion(buffer: &mut [u8], len: usize) -> usize {
         } else {
             resolve_path(word_to_complete)
         };
-        
+
         // Find the directory part and file prefix
         let (dir_path, file_prefix) = if let Some(last_slash) = path_to_complete.rfind('/') {
             if last_slash == 0 {
                 ("/", &path_to_complete[1..])
             } else {
-                (&path_to_complete[..last_slash], &path_to_complete[last_slash+1..])
+                (
+                    &path_to_complete[..last_slash],
+                    &path_to_complete[last_slash + 1..],
+                )
             }
         } else {
             ("/", path_to_complete.as_str())
         };
-        
+
         {
             let fs_guard = FS_STATE.lock();
             let mut blk_guard = BLK_DEV.lock();
             if let (Some(fs), Some(dev)) = (fs_guard.as_ref(), blk_guard.as_mut()) {
                 let files = fs.list_dir(dev, "/");
                 let mut seen_dirs: Vec<String> = Vec::new();
-                
+
                 for f in files {
                     // Check if file is in the target directory
-                    let check_prefix = if dir_path == "/" {
-                        "/"
-                    } else {
-                        dir_path
-                    };
-                    
+                    let check_prefix = if dir_path == "/" { "/" } else { dir_path };
+
                     if !f.name.starts_with(check_prefix) {
                         continue;
                     }
-                    
+
                     // Get the part after the directory
                     let relative = if dir_path == "/" {
                         &f.name[1..]
@@ -1406,26 +1430,26 @@ fn handle_tab_completion(buffer: &mut [u8], len: usize) -> usize {
                     } else {
                         continue;
                     };
-                    
+
                     // Get just the immediate child (first path component)
                     let child_name = if let Some(slash_pos) = relative.find('/') {
                         &relative[..slash_pos]
                     } else {
                         relative
                     };
-                    
+
                     if child_name.is_empty() {
                         continue;
                     }
-                    
+
                     // Check if it matches the prefix
                     if !child_name.starts_with(file_prefix) {
                         continue;
                     }
-                    
+
                     // Check if this is a directory (has more path after)
                     let is_dir = relative.len() > child_name.len();
-                    
+
                     let completion = if is_dir {
                         let dir_name = String::from(child_name) + "/";
                         if seen_dirs.contains(&dir_name) {
@@ -1436,7 +1460,7 @@ fn handle_tab_completion(buffer: &mut [u8], len: usize) -> usize {
                     } else {
                         String::from(child_name)
                     };
-                    
+
                     if !matches.iter().any(|m| m == &completion) {
                         matches.push(completion);
                     }
@@ -1444,19 +1468,19 @@ fn handle_tab_completion(buffer: &mut [u8], len: usize) -> usize {
             }
         }
     }
-    
+
     matches.sort();
-    
+
     if matches.is_empty() {
         // No matches - beep or do nothing
         return len;
     }
-    
+
     if matches.len() == 1 {
         // Single match - complete it
         let completion = &matches[0];
         let to_add = &completion[word_to_complete.len()..];
-        
+
         // Add completion to buffer
         let new_len = len + to_add.len();
         if new_len <= buffer.len() {
@@ -1464,22 +1488,22 @@ fn handle_tab_completion(buffer: &mut [u8], len: usize) -> usize {
                 buffer[len + i] = b;
             }
             uart::write_str(to_add);
-            
+
             // Add space after command completion (not for paths ending in /)
             if is_command && new_len + 1 <= buffer.len() {
                 buffer[new_len] = b' ';
                 uart::write_str(" ");
                 return new_len + 1;
             }
-            
+
             return new_len;
         }
         return len;
     }
-    
+
     // Multiple matches - find common prefix and show options
     let common = find_common_prefix(&matches);
-    
+
     if common.len() > word_to_complete.len() {
         // Complete up to common prefix
         let to_add = &common[word_to_complete.len()..];
@@ -1493,17 +1517,17 @@ fn handle_tab_completion(buffer: &mut [u8], len: usize) -> usize {
         }
         return len;
     }
-    
+
     // Show all matches
     uart::write_line("");
     let mut col = 0;
     let col_width = 16;
     let num_cols = 4;
-    
+
     for m in &matches {
         let display_len = m.len();
         uart::write_str(m);
-        
+
         col += 1;
         if col >= num_cols {
             uart::write_line("");
@@ -1518,25 +1542,25 @@ fn handle_tab_completion(buffer: &mut [u8], len: usize) -> usize {
     if col > 0 {
         uart::write_line("");
     }
-    
+
     // Redraw prompt and current input
     print_prompt();
     uart::write_bytes(&buffer[..len]);
-    
+
     len
 }
 
 /// Find common prefix among strings
 fn find_common_prefix(strings: &[alloc::string::String]) -> alloc::string::String {
     use alloc::string::String;
-    
+
     if strings.is_empty() {
         return String::new();
     }
-    
+
     let first = &strings[0];
     let mut prefix_len = first.len();
-    
+
     for s in strings.iter().skip(1) {
         let mut common = 0;
         for (a, b) in first.chars().zip(s.chars()) {
@@ -1548,10 +1572,9 @@ fn find_common_prefix(strings: &[alloc::string::String]) -> alloc::string::Strin
         }
         prefix_len = common;
     }
-    
+
     String::from(&first[..prefix_len])
 }
-
 
 fn init_storage() {
     print_section("STORAGE SUBSYSTEM");
@@ -1564,7 +1587,7 @@ fn init_storage() {
     } else {
         print_boot_status("No storage device found", false);
     }
-    
+
     let mut blk_guard = BLK_DEV.lock();
     if let Some(ref mut blk) = *blk_guard {
         if let Some(fs) = fs::FileSystem::init(blk) {
@@ -1578,7 +1601,7 @@ fn init_fs() {
     if let Some(blk) = virtio_blk::VirtioBlock::probe() {
         uart::write_line("    \x1b[1;32m[✓]\x1b[0m VirtIO Block found");
         *BLK_DEV.lock() = Some(blk);
-        
+
         let mut blk_guard = BLK_DEV.lock();
         if let Some(ref mut dev) = *blk_guard {
             if let Some(fs) = fs::FileSystem::init(dev) {
@@ -1592,14 +1615,14 @@ fn init_fs() {
 /// Initialize the network stack
 fn init_network() {
     uart::write_line("    \x1b[0;90m├─\x1b[0m Probing for VirtIO devices...");
-    
+
     // Probe for VirtIO network device
     match virtio_net::VirtioNet::probe() {
         Some(device) => {
             uart::write_str("    \x1b[0;90m├─\x1b[0m VirtIO-Net found at: \x1b[1;97m0x");
             uart::write_hex(device.base_addr() as u64);
             uart::write_line("\x1b[0m");
-            
+
             match net::NetState::new(device) {
                 Ok(state) => {
                     // Store in static FIRST, then finalize
@@ -1608,13 +1631,13 @@ fn init_network() {
                         *net_guard = Some(state);
                         if let Some(ref mut s) = *net_guard {
                             s.finalize();
-                            
+
                             // Print network configuration
                             uart::write_line("");
                             uart::write_str("    \x1b[0m  MAC Address:   \x1b[1;97m");
                             uart::write_bytes(&s.mac_str());
                             uart::write_line("\x1b[0m                    \x1b[0m");
-                            
+
                             let mut ip_buf = [0u8; 16];
                             let my_ip = net::get_my_ip();
                             let ip_len = net::format_ipv4(my_ip, &mut ip_buf);
@@ -1623,12 +1646,12 @@ fn init_network() {
                             uart::write_str("/");
                             uart::write_u64(net::PREFIX_LEN as u64);
                             uart::write_line("\x1b[0m                   \x1b[0m");
-                            
+
                             let gw_len = net::format_ipv4(net::GATEWAY, &mut ip_buf);
                             uart::write_str("    \x1b[0m  Gateway:       \x1b[1;97m");
                             uart::write_bytes(&ip_buf[..gw_len]);
                             uart::write_line("\x1b[0m                       \x1b[0m");
-                            
+
                             let dns_len = net::format_ipv4(net::DNS_SERVER, &mut ip_buf);
                             uart::write_str("    \x1b[0m  DNS Server:    \x1b[1;97m");
                             uart::write_bytes(&ip_buf[..dns_len]);
@@ -1642,7 +1665,9 @@ fn init_network() {
                 Err(_e) => {
                     // Network initialization failed - no IP assigned
                     // Networking is disabled, NET_STATE remains None
-                    uart::write_line("    \x1b[0;90m    └─ Network features will be unavailable\x1b[0m");
+                    uart::write_line(
+                        "    \x1b[0;90m    └─ Network features will be unavailable\x1b[0m",
+                    );
                 }
             }
         }
@@ -1659,7 +1684,7 @@ fn cancel_running_command() -> bool {
     if !running {
         return false;
     }
-    
+
     // Check if ping is running
     let should_print_stats = {
         let ping_guard = PING_STATE.lock();
@@ -1669,7 +1694,7 @@ fn cancel_running_command() -> bool {
             false
         }
     };
-    
+
     if should_print_stats {
         uart::write_line("^C");
         print_ping_statistics();
@@ -1677,7 +1702,7 @@ fn cancel_running_command() -> bool {
         *COMMAND_RUNNING.lock() = false;
         return true;
     }
-    
+
     // Generic command cancellation
     *COMMAND_RUNNING.lock() = false;
     uart::write_line("^C");
@@ -1690,19 +1715,19 @@ fn print_ping_statistics() {
     if let Some(ref ping) = *ping_guard {
         let mut ip_buf = [0u8; 16];
         let ip_len = net::format_ipv4(ping.target, &mut ip_buf);
-        
+
         uart::write_line("");
         uart::write_str("--- ");
         uart::write_bytes(&ip_buf[..ip_len]);
         uart::write_line(" ping statistics ---");
-        
+
         uart::write_u64(ping.packets_sent as u64);
         uart::write_str(" packets transmitted, ");
         uart::write_u64(ping.packets_received as u64);
         uart::write_str(" received, ");
         uart::write_u64(ping.packet_loss_percent() as u64);
         uart::write_line("% packet loss");
-        
+
         if ping.packets_received > 0 {
             uart::write_str("rtt min/avg/max = ");
             uart::write_u64(ping.min_rtt as u64);
@@ -1719,7 +1744,7 @@ fn print_ping_statistics() {
 /// Poll the network stack
 fn poll_network() {
     let timestamp = get_time_ms();
-    
+
     // First, poll the network state
     {
         let mut net_guard = NET_STATE.lock();
@@ -1727,7 +1752,7 @@ fn poll_network() {
             state.poll(timestamp);
         }
     }
-    
+
     // Then handle ping state separately to avoid holding both locks
     let mut ping_guard = PING_STATE.lock();
     if let Some(ref mut ping) = *ping_guard {
@@ -1741,12 +1766,12 @@ fn poll_network() {
                     None
                 }
             };
-            
+
             if let Some((from, _ident, seq)) = reply {
                 if seq == ping.seq {
                     let rtt = timestamp - ping.sent_time;
                     ping.record_reply(rtt);
-                    
+
                     let mut ip_buf = [0u8; 16];
                     let ip_len = net::format_ipv4(from, &mut ip_buf);
                     uart::write_str("64 bytes from ");
@@ -1759,7 +1784,7 @@ fn poll_network() {
                     ping.waiting = false;
                 }
             }
-            
+
             // Timeout after 5 seconds for current ping
             if timestamp - ping.sent_time > 5000 {
                 uart::write_str("Request timeout for icmp_seq ");
@@ -1768,7 +1793,7 @@ fn poll_network() {
                 ping.waiting = false;
             }
         }
-        
+
         // In continuous mode, send next ping after 1 second interval
         if ping.continuous && !ping.waiting {
             if timestamp - ping.last_send_time >= 1000 {
@@ -1776,7 +1801,7 @@ fn poll_network() {
                 ping.sent_time = timestamp;
                 ping.last_send_time = timestamp;
                 ping.packets_sent += 1;
-                
+
                 let send_result = {
                     let mut net_guard = NET_STATE.lock();
                     if let Some(ref mut state) = *net_guard {
@@ -1785,7 +1810,7 @@ fn poll_network() {
                         Err("Network not available")
                     }
                 };
-                
+
                 match send_result {
                     Ok(()) => {
                         ping.waiting = true;
@@ -1806,8 +1831,11 @@ fn print_prompt() {
     } else {
         format!(" {}", cwd)
     };
-    
-    uart::write_str(&format!("\x1b[1;35mBavy\x1b[0m\x1b[1;34m{}\x1b[0m # ", prompt_path));
+
+    uart::write_str(&format!(
+        "\x1b[1;35mBavy\x1b[0m\x1b[1;34m{}\x1b[0m # ",
+        prompt_path
+    ));
 }
 
 /// Parse a command line for redirection operators
@@ -1821,7 +1849,7 @@ fn parse_redirection(line: &[u8]) -> (&[u8], RedirectMode, &[u8]) {
             return (cmd_part, RedirectMode::Append, file_part);
         }
     }
-    
+
     // Look for single >
     for i in 0..line.len() {
         if line[i] == b'>' {
@@ -1830,7 +1858,7 @@ fn parse_redirection(line: &[u8]) -> (&[u8], RedirectMode, &[u8]) {
             return (cmd_part, RedirectMode::Overwrite, file_part);
         }
     }
-    
+
     (line, RedirectMode::None, &[])
 }
 
@@ -1838,14 +1866,14 @@ fn parse_redirection(line: &[u8]) -> (&[u8], RedirectMode, &[u8]) {
 fn trim_bytes(bytes: &[u8]) -> &[u8] {
     let mut start = 0;
     let mut end = bytes.len();
-    
+
     while start < end && (bytes[start] == b' ' || bytes[start] == b'\t') {
         start += 1;
     }
     while end > start && (bytes[end - 1] == b' ' || bytes[end - 1] == b'\t') {
         end -= 1;
     }
-    
+
     &bytes[start..end]
 }
 
@@ -1867,10 +1895,10 @@ fn handle_line(buffer: &[u8], len: usize, _count: &mut usize) {
     }
 
     let full_line = &buffer[start..end];
-    
+
     // Parse for redirection
     let (line, redirect_mode, redirect_file) = parse_redirection(full_line);
-    
+
     // Validate redirection target
     if redirect_mode != RedirectMode::None && redirect_file.is_empty() {
         uart::write_line("");
@@ -1890,7 +1918,7 @@ fn handle_line(buffer: &[u8], len: usize, _count: &mut usize) {
         arg_start += 1;
     }
     let args = &line[arg_start..];
-    
+
     // Start capturing if redirecting
     if redirect_mode != RedirectMode::None {
         output_capture_start();
@@ -1898,16 +1926,16 @@ fn handle_line(buffer: &[u8], len: usize, _count: &mut usize) {
 
     // Execute the command
     execute_command(cmd, args);
-    
+
     // Handle redirection output
     if redirect_mode != RedirectMode::None {
         let output = output_capture_stop();
-        
+
         if let Ok(filename) = core::str::from_utf8(redirect_file) {
             let filename = filename.trim();
             // Resolve path relative to CWD
             let resolved_path = resolve_path(filename);
-            
+
             let mut fs_guard = FS_STATE.lock();
             let mut blk_guard = BLK_DEV.lock();
             if let (Some(fs), Some(dev)) = (fs_guard.as_mut(), blk_guard.as_mut()) {
@@ -1923,7 +1951,7 @@ fn handle_line(buffer: &[u8], len: usize, _count: &mut usize) {
                     // Overwrite mode - just use new output
                     output
                 };
-                
+
                 match fs.write_file(dev, &resolved_path, &final_data) {
                     Ok(()) => {
                         uart::write_line("");
@@ -1948,43 +1976,78 @@ fn handle_line(buffer: &[u8], len: usize, _count: &mut usize) {
 }
 
 /// Execute a command (separated for cleaner redirection handling)
-/// 
+///
 /// Commands are resolved in this order:
 /// 1. Essential built-in commands (that require direct kernel access)
 /// 2. Scripts: searched in root, then /usr/bin/ directory (PATH-like)
 fn execute_command(cmd: &[u8], args: &[u8]) {
     let cmd_str = core::str::from_utf8(cmd).unwrap_or("");
     let args_str = core::str::from_utf8(args).unwrap_or("");
-    
+
     // ═══════════════════════════════════════════════════════════════════════════
     // ESSENTIAL BUILT-IN COMMANDS
     // These require direct kernel access or cannot be implemented in scripts
     // ═══════════════════════════════════════════════════════════════════════════
-    
+
     match cmd_str {
         // System control - requires direct hardware access
-        "shutdown" | "poweroff" => { cmd_shutdown(); return; }
-        "clear" => { for _ in 0..50 { out_line(""); } return; }
-        
+        "shutdown" | "poweroff" => {
+            cmd::shutdown();
+            return;
+        }
+        "clear" => {
+            for _ in 0..50 {
+                out_line("");
+            }
+            return;
+        }
+
         // Directory navigation - requires shell state
-        "cd" => { cmd_cd(args_str); return; }
-        "pwd" => { out_line(&cwd_get()); return; }
-        
+        "cd" => {
+            cmd::cd(args_str);
+            return;
+        }
+        "pwd" => {
+            out_line(&cwd_get());
+            return;
+        }
+
         // Scripting engine control
-        "node" => { cmd_node(args); return; }
-        
+        "node" => {
+            cmd::node(args);
+            return;
+        }
+
         // Async network commands - require event loop integration
-        "ping" => { cmd_ping(args); return; }
-        "nslookup" => { cmd_nslookup(args); return; }
-        
+        "ping" => {
+            cmd::ping(args);
+            return;
+        }
+        "nslookup" => {
+            cmd::nslookup(args);
+            return;
+        }
+
         // Low-level debugging commands
-        "readsec" => { cmd_readsec(args); return; }
-        "alloc" => { cmd_alloc(args); return; }
-        "memtest" => { cmd_memtest(args); return; }
-        
+        "readsec" => {
+            cmd::readsec(args);
+            return;
+        }
+        "alloc" => {
+            cmd::alloc(args);
+            return;
+        }
+        "memtest" => {
+            cmd::memtest(args);
+            return;
+        }
+
         // CPU benchmark
-        "cpuTest" | "cputest" => { cmd_cputest(args); return; }
-        
+        "cpuTest" | "cputest" => {
+            cmd::cputest(args);
+            return;
+        }
+
         // Help - try script first, fall back to built-in
         "help" => {
             // First try to run help script
@@ -1993,27 +2056,27 @@ fn execute_command(cmd: &[u8], args: &[u8]) {
                 return;
             }
             // Fallback to built-in help
-            cmd_help();
+            cmd::help();
             return;
         }
-        
+
         _ => {}
     }
-    
+
     // ═══════════════════════════════════════════════════════════════════════════
     // SCRIPT RESOLUTION (PATH-like)
     // Search: 1) exact path  2) root directory  3) /usr/bin/ directory
     // ═══════════════════════════════════════════════════════════════════════════
-    
+
     if let Some(script_bytes) = scripting::find_script(cmd_str) {
         run_script_bytes(&script_bytes, args_str);
         return;
     }
-    
+
     // ═══════════════════════════════════════════════════════════════════════════
     // COMMAND NOT FOUND
     // ═══════════════════════════════════════════════════════════════════════════
-    
+
     out_str("\x1b[1;31mCommand not found:\x1b[0m ");
     out_line(cmd_str);
     out_line("\x1b[0;90mTry 'help' for available commands, or check /usr/bin/ for scripts\x1b[0m");
@@ -2035,637 +2098,17 @@ fn run_script_bytes(bytes: &[u8], args: &str) {
     }
 }
 
-/// Node scripting engine info and configuration
-fn cmd_node(args: &[u8]) {
-    let args_str = core::str::from_utf8(args).unwrap_or("").trim();
-    
-    if args_str.is_empty() || args_str == "info" {
-        // Show scripting engine info
-        scripting::print_info();
-    } else if args_str.starts_with("log ") {
-        // Set log level: node log <level>
-        let level_str = args_str.strip_prefix("log ").unwrap_or("").trim();
-        let level = match level_str {
-            "off" | "OFF" => scripting::LogLevel::Off,
-            "error" | "ERROR" => scripting::LogLevel::Error,
-            "warn" | "WARN" => scripting::LogLevel::Warn,
-            "info" | "INFO" => scripting::LogLevel::Info,
-            "debug" | "DEBUG" => scripting::LogLevel::Debug,
-            "trace" | "TRACE" => scripting::LogLevel::Trace,
-            _ => {
-                out_line("Usage: node log <level>");
-                out_line("Levels: off, error, warn, info, debug, trace");
-                return;
-            }
-        };
-        scripting::set_log_level(level);
-        out_str("\x1b[1;32m✓\x1b[0m Script log level set to: ");
-        out_line(level_str);
-    } else if args_str == "eval" || args_str.starts_with("eval ") {
-        // Quick eval: node eval <expression>
-        let expr = args_str.strip_prefix("eval").unwrap_or("").trim();
-        if expr.is_empty() {
-            out_line("Usage: node eval <expression>");
-            out_line("Example: node eval 2 + 2 * 3");
-            return;
-        }
-        // Use uncached execution for one-off REPL expressions
-        match scripting::execute_script_uncached(expr, "") {
-            Ok(output) => {
-                if !output.is_empty() {
-                    out_str(&output);
-                }
-            }
-            Err(e) => {
-                out_str("\x1b[1;31mError:\x1b[0m ");
-                out_line(&e);
-            }
-        }
-    } else if !args_str.is_empty() {
-        // node <script> [args...] - run a script file
-        let (script_name, script_args) = match args_str.split_once(' ') {
-            Some((name, rest)) => (name, rest),
-            None => (args_str, ""),
-        };
-        
-        // Resolve the script path relative to CWD
-        let resolved_path = if script_name.starts_with('/') {
-            // Absolute path - use as-is
-            alloc::string::String::from(script_name)
-        } else {
-            // Relative path (including ./, ../, or just "bin/cat")
-            resolve_path(script_name)
-        };
-        
-        // Read script content with lock held, then execute without lock
-        let script_result = {
-            let fs_guard = FS_STATE.lock();
-            let mut blk_guard = BLK_DEV.lock();
-            if let (Some(fs), Some(dev)) = (fs_guard.as_ref(), blk_guard.as_mut()) {
-                fs.read_file(dev, &resolved_path)
-            } else {
-                out_line("\x1b[1;31mError:\x1b[0m Filesystem not available");
-                return;
-            }
-        };
-        
-        match script_result {
-            Some(script_bytes) => {
-                if let Ok(script) = core::str::from_utf8(&script_bytes) {
-                    match scripting::execute_script(script, script_args) {
-                        Ok(output) => {
-                            if !output.is_empty() {
-                                out_str(&output);
-                            }
-                        }
-                        Err(e) => {
-                            out_str("\x1b[1;31mScript error:\x1b[0m ");
-                            out_line(&e);
-                        }
-                    }
-                } else {
-                    out_line("\x1b[1;31mError:\x1b[0m Invalid UTF-8 in script file");
-                }
-            }
-            None => {
-                out_str("\x1b[1;31mError:\x1b[0m Script not found: ");
-                out_line(&resolved_path);
-            }
-        }
-    }
-}
-
-/// Help command - now a script, but we keep a fallback built-in
-fn cmd_help() {
-    out_line("\x1b[1;36m┌─────────────────────────────────────────────────────────────┐\x1b[0m");
-    out_line("\x1b[1;36m│\x1b[0m                   \x1b[1;97mBAVY OS Commands\x1b[0m                        \x1b[1;36m│\x1b[0m");
-    out_line("\x1b[1;36m├─────────────────────────────────────────────────────────────┤\x1b[0m");
-    out_line("\x1b[1;36m│\x1b[0m  \x1b[1;33mBuilt-in:\x1b[0m                                                 \x1b[1;36m│\x1b[0m");
-    out_line("\x1b[1;36m│\x1b[0m    cd <dir>        Change directory                         \x1b[1;36m│\x1b[0m");
-    out_line("\x1b[1;36m│\x1b[0m    pwd             Print working directory                  \x1b[1;36m│\x1b[0m");
-    out_line("\x1b[1;36m│\x1b[0m    clear           Clear the screen                         \x1b[1;36m│\x1b[0m");
-    out_line("\x1b[1;36m│\x1b[0m    shutdown        Power off the system                     \x1b[1;36m│\x1b[0m");
-    out_line("\x1b[1;36m│\x1b[0m    ping <host>     Ping host (Ctrl+C to stop)               \x1b[1;36m│\x1b[0m");
-    out_line("\x1b[1;36m│\x1b[0m    nslookup <host> DNS lookup                               \x1b[1;36m│\x1b[0m");
-    out_line("\x1b[1;36m│\x1b[0m    node [info]     Scripting engine info/control            \x1b[1;36m│\x1b[0m");
-    out_line("\x1b[1;36m│\x1b[0m                                                             \x1b[1;36m│\x1b[0m");
-    out_line("\x1b[1;36m│\x1b[0m  \x1b[1;33mUser Scripts:\x1b[0m  \x1b[0;90m(in /usr/bin/ - Rhai language)\x1b[0m            \x1b[1;36m│\x1b[0m");
-    out_line("\x1b[1;36m│\x1b[0m    help, ls, cat, echo, cowsay, sysinfo, ip, memstats, ...  \x1b[1;36m│\x1b[0m");
-    out_line("\x1b[1;36m│\x1b[0m                                                             \x1b[1;36m│\x1b[0m");
-    out_line("\x1b[1;36m│\x1b[0m  \x1b[1;33mKernel API:\x1b[0m  \x1b[0;90m(available in scripts)\x1b[0m                      \x1b[1;36m│\x1b[0m");
-    out_line("\x1b[1;36m│\x1b[0m    ls(), read_file(), write_file(), file_exists()           \x1b[1;36m│\x1b[0m");
-    out_line("\x1b[1;36m│\x1b[0m    get_ip(), get_mac(), get_gateway(), net_available()      \x1b[1;36m│\x1b[0m");
-    out_line("\x1b[1;36m│\x1b[0m    time_ms(), sleep(ms), kernel_version(), arch()           \x1b[1;36m│\x1b[0m");
-    out_line("\x1b[1;36m│\x1b[0m    heap_total(), heap_used(), heap_free()                   \x1b[1;36m│\x1b[0m");
-    out_line("\x1b[1;36m│\x1b[0m                                                             \x1b[1;36m│\x1b[0m");
-    out_line("\x1b[1;36m│\x1b[0m  \x1b[1;33mRedirection:\x1b[0m  cmd > file | cmd >> file                    \x1b[1;36m│\x1b[0m");
-    out_line("\x1b[1;36m│\x1b[0m                                                             \x1b[1;36m│\x1b[0m");
-    out_line("\x1b[1;36m│\x1b[0m  \x1b[1;32mTip:\x1b[0m  \x1b[1;97mCtrl+C\x1b[0m cancel  |  \x1b[1;97m↑/↓\x1b[0m history  |  \x1b[1;97mnode info\x1b[0m API  \x1b[1;36m│\x1b[0m");
-    out_line("\x1b[1;36m└─────────────────────────────────────────────────────────────┘\x1b[0m");
-}
-
-// Legacy cmd_ls and cmd_cat removed - now implemented as user-space scripts
-// See mkfs/root/usr/bin/ls and mkfs/root/usr/bin/cat
-
-
-fn cmd_alloc(args: &[u8]) {
-    // Parse decimal size from args
-    let n = parse_usize(args);
-    if n > 0 {
-        // Allocate and leak
-        let mut v: Vec<u8> = Vec::with_capacity(n);
-        v.resize(n, 0);
-        core::mem::forget(v);
-        uart::write_str("Allocated ");
-        uart::write_u64(n as u64);
-        uart::write_line(" bytes (leaked).");
-    } else {
-        uart::write_line("Usage: alloc <bytes>");
-    }
-}
-
-fn cmd_readsec(args: &[u8]) {
-    let sector = parse_usize(args) as u64;
-    let mut blk_guard = BLK_DEV.lock();
-    if let Some(ref mut blk) = *blk_guard {
-        let mut buf = [0u8; 512];
-        if blk.read_sector(sector, &mut buf).is_ok() {
-            uart::write_line("Sector contents (first 64 bytes):");
-            for i in 0..64 {
-               uart::write_hex_byte(buf[i]);
-               if (i+1) % 16 == 0 { uart::write_line(""); }
-               else { uart::write_str(" "); }
-            }
-        } else {
-            uart::write_line("Read failed.");
-        }
-    } else {
-        uart::write_line("No block device.");
-    }
-}
-
-fn cmd_memtest(args: &[u8]) {
-    // Parse iteration count, default to 10
-    let iterations = {
-        let n = parse_usize(args);
-        if n == 0 { 10 } else { n }
-    };
-
-    uart::write_str("Running ");
-    uart::write_u64(iterations as u64);
-    uart::write_line(" memory test iterations...");
-
-    let (used_before, free_before) = allocator::heap_stats();
-    uart::write_str("  Before: used=");
-    uart::write_u64(used_before as u64);
-    uart::write_str(" free=");
-    uart::write_u64(free_before as u64);
-    uart::write_line("");
-
-    let mut success_count = 0usize;
-    let mut fail_count = 0usize;
-
-    for i in 0..iterations {
-        // Allocate a Vec, fill it with a pattern, verify, then drop
-        let size = 1024; // 1KB per iteration
-        let pattern = ((i % 256) as u8).wrapping_add(0x42);
-
-        let mut v: Vec<u8> = Vec::with_capacity(size);
-        v.resize(size, pattern);
-
-        // Verify contents
-        let mut ok = true;
-        for &byte in v.iter() {
-            if byte != pattern {
-                ok = false;
-                break;
-            }
-        }
-
-        if ok {
-            success_count += 1;
-        } else {
-            fail_count += 1;
-        }
-
-        // v is dropped here, memory should be freed
-    }
-
-    let (used_after, free_after) = allocator::heap_stats();
-    uart::write_str("  After:  used=");
-    uart::write_u64(used_after as u64);
-    uart::write_str(" free=");
-    uart::write_u64(free_after as u64);
-    uart::write_line("");
-
-    uart::write_str("Results: ");
-    uart::write_u64(success_count as u64);
-    uart::write_str(" passed, ");
-    uart::write_u64(fail_count as u64);
-    uart::write_line(" failed.");
-
-    // Check if memory was properly reclaimed
-    if used_after <= used_before + 64 {
-        // Allow small overhead for fragmentation
-        uart::write_line("Memory deallocation: OK (memory reclaimed)");
-    } else {
-        uart::write_line("WARNING: Memory may not be properly reclaimed!");
-        uart::write_str("  Leaked approximately ");
-        uart::write_u64((used_after - used_before) as u64);
-        uart::write_line(" bytes");
-    }
-}
-
-/// CPU benchmark command - compares serial vs parallel prime counting
-fn cmd_cputest(args: &[u8]) {
-    // Parse the upper limit from args, default to 100000
-    let limit = {
-        let n = parse_usize(args);
-        if n == 0 { 100_000 } else { n }
-    };
-    
-    let num_harts = HARTS_ONLINE.load(Ordering::Relaxed);
-    
-    uart::write_line("");
-    uart::write_line("\x1b[1;36m╔═══════════════════════════════════════════════════════════════════════╗\x1b[0m");
-    uart::write_line("\x1b[1;36m║\x1b[0m                      \x1b[1;97mCPU BENCHMARK - Prime Counting\x1b[0m                  \x1b[1;36m║\x1b[0m");
-    uart::write_line("\x1b[1;36m╚═══════════════════════════════════════════════════════════════════════╝\x1b[0m");
-    uart::write_line("");
-    
-    uart::write_str("  \x1b[1;33mConfiguration:\x1b[0m");
-    uart::write_line("");
-    uart::write_str("    Range: 2 to ");
-    uart::write_u64(limit as u64);
-    uart::write_line("");
-    uart::write_str("    Harts online: ");
-    uart::write_u64(num_harts as u64);
-    uart::write_line("");
-    uart::write_line("");
-    
-    // ═══════════════════════════════════════════════════════════════════
-    // SERIAL BENCHMARK (single hart)
-    // ═══════════════════════════════════════════════════════════════════
-    
-    uart::write_line("  \x1b[1;33m[1/2] Serial Execution\x1b[0m (single hart)");
-    uart::write_str("        Computing primes...");
-    
-    let serial_start = get_time_ms();
-    let serial_count = count_primes_in_range(2, limit as u64);
-    let serial_end = get_time_ms();
-    let serial_time = serial_end - serial_start;
-    
-    uart::write_line(" done!");
-    uart::write_str("        Result: \x1b[1;97m");
-    uart::write_u64(serial_count);
-    uart::write_str("\x1b[0m primes found in \x1b[1;97m");
-    uart::write_u64(serial_time as u64);
-    uart::write_line("\x1b[0m ms");
-    uart::write_line("");
-    
-    // ═══════════════════════════════════════════════════════════════════
-    // PARALLEL BENCHMARK (multiple harts)
-    // ═══════════════════════════════════════════════════════════════════
-    
-    if num_harts > 1 {
-        uart::write_str("  \x1b[1;33m[2/2] Parallel Execution\x1b[0m (");
-        uart::write_u64(num_harts as u64);
-        uart::write_line(" harts)");
-        uart::write_str("        Computing primes...");
-        
-        let parallel_start = get_time_ms();
-        
-        // Start benchmark on secondary harts
-        BENCHMARK.start(BenchmarkMode::PrimeCount, 2, limit as u64, num_harts);
-        
-        // Wake up secondary harts via IPI
-        for hart in 1..num_harts {
-            send_ipi(hart);
-        }
-        
-        // Primary hart (0) does its share of work
-        let (my_start, my_end) = BENCHMARK.get_work_range(0);
-        let my_count = count_primes_in_range(my_start, my_end);
-        BENCHMARK.report_result(0, my_count);
-        
-        // Wait for all harts to complete (with timeout)
-        let timeout = get_time_ms() + 60000; // 60 second timeout
-        while !BENCHMARK.all_completed() {
-            if get_time_ms() > timeout {
-                uart::write_line(" TIMEOUT!");
-                uart::write_line("        \x1b[1;31mError:\x1b[0m Some harts did not complete in time");
-                BENCHMARK.clear();
-                return;
-            }
-            core::hint::spin_loop();
-        }
-        
-        let parallel_end = get_time_ms();
-        let parallel_time = parallel_end - parallel_start;
-        let parallel_count = BENCHMARK.total_result();
-        
-        // Clear benchmark state
-        BENCHMARK.clear();
-        
-        uart::write_line(" done!");
-        uart::write_str("        Result: \x1b[1;97m");
-        uart::write_u64(parallel_count);
-        uart::write_str("\x1b[0m primes found in \x1b[1;97m");
-        uart::write_u64(parallel_time as u64);
-        uart::write_line("\x1b[0m ms");
-        
-        // Show work distribution
-        uart::write_line("");
-        uart::write_line("        \x1b[0;90mWork distribution:\x1b[0m");
-        let chunk = (limit as u64 - 2) / num_harts as u64;
-        for hart in 0..num_harts {
-            let h_start = 2 + hart as u64 * chunk;
-            let h_end = if hart == num_harts - 1 { limit as u64 } else { h_start + chunk };
-            uart::write_str("          Hart ");
-            uart::write_u64(hart as u64);
-            uart::write_str(": [");
-            uart::write_u64(h_start);
-            uart::write_str(", ");
-            uart::write_u64(h_end);
-            uart::write_line(")");
-        }
-        uart::write_line("");
-        
-        // ═══════════════════════════════════════════════════════════════
-        // RESULTS COMPARISON
-        // ═══════════════════════════════════════════════════════════════
-        
-        uart::write_line("\x1b[1;36m────────────────────────────────────────────────────────────────────────\x1b[0m");
-        uart::write_line("  \x1b[1;33mResults Summary:\x1b[0m");
-        uart::write_line("");
-        
-        // Verify results match
-        if serial_count == parallel_count {
-            uart::write_line("    \x1b[1;32m✓\x1b[0m Results match (verified correctness)");
-        } else {
-            uart::write_line("    \x1b[1;31m✗\x1b[0m Results MISMATCH (bug detected!)");
-            uart::write_str("      Serial: ");
-            uart::write_u64(serial_count);
-            uart::write_str(", Parallel: ");
-            uart::write_u64(parallel_count);
-            uart::write_line("");
-        }
-        uart::write_line("");
-        
-        // Calculate speedup
-        if parallel_time > 0 {
-            let speedup_x10 = (serial_time * 10) / parallel_time;
-            let speedup_whole = speedup_x10 / 10;
-            let speedup_frac = speedup_x10 % 10;
-            
-            uart::write_str("    Serial time:   \x1b[1;97m");
-            uart::write_u64(serial_time as u64);
-            uart::write_line(" ms\x1b[0m");
-            uart::write_str("    Parallel time: \x1b[1;97m");
-            uart::write_u64(parallel_time as u64);
-            uart::write_line(" ms\x1b[0m");
-            uart::write_str("    Speedup:       \x1b[1;32m");
-            uart::write_u64(speedup_whole as u64);
-            uart::write_str(".");
-            uart::write_u64(speedup_frac as u64);
-            uart::write_str("x\x1b[0m (with ");
-            uart::write_u64(num_harts as u64);
-            uart::write_line(" harts)");
-            
-            // Efficiency
-            let efficiency = (speedup_x10 * 100) / (num_harts as i64 * 10);
-            uart::write_str("    Efficiency:    \x1b[1;97m");
-            uart::write_u64(efficiency as u64);
-            uart::write_line("%\x1b[0m (speedup / num_harts × 100)");
-        }
-        uart::write_line("");
-        
-    } else {
-        uart::write_line("  \x1b[1;33m[2/2] Parallel Execution\x1b[0m");
-        uart::write_line("        \x1b[0;90mSkipped - only 1 hart online\x1b[0m");
-        uart::write_line("");
-        uart::write_line("\x1b[1;36m────────────────────────────────────────────────────────────────────────\x1b[0m");
-        uart::write_line("  \x1b[1;33mResults Summary:\x1b[0m");
-        uart::write_line("");
-        uart::write_str("    Serial time: \x1b[1;97m");
-        uart::write_u64(serial_time as u64);
-        uart::write_line(" ms\x1b[0m");
-        uart::write_str("    Primes found: \x1b[1;97m");
-        uart::write_u64(serial_count);
-        uart::write_line("\x1b[0m");
-        uart::write_line("");
-        uart::write_line("    \x1b[0;90mNote: Enable more harts to see parallel comparison\x1b[0m");
-        uart::write_line("");
-    }
-    
-    uart::write_line("\x1b[1;36m════════════════════════════════════════════════════════════════════════\x1b[0m");
-    uart::write_line("");
-}
-
-// Legacy cmd_memstats and cmd_ip removed - now implemented as user-space scripts
-// See mkfs/root/usr/bin/memstats and mkfs/root/usr/bin/ip
-
-fn cmd_ping(args: &[u8]) {
-    if args.is_empty() {
-        uart::write_line("Usage: ping <ip|hostname>");
-        uart::write_line("\x1b[0;90mExamples:\x1b[0m");
-        uart::write_line("  ping 10.0.2.2");
-        uart::write_line("  ping google.com");
-        uart::write_line("\x1b[0;90mPress Ctrl+C to stop\x1b[0m");
-        return;
-    }
-    
-    // Trim any trailing whitespace
-    let mut arg_len = args.len();
-    while arg_len > 0 && (args[arg_len - 1] == b' ' || args[arg_len - 1] == b'\t') {
-        arg_len -= 1;
-    }
-    let trimmed_args = &args[..arg_len];
-    
-    // Try to parse as IP address first
-    let target = match net::parse_ipv4(trimmed_args) {
-        Some(ip) => ip,
-        None => {
-            // Not an IP address - try to resolve as hostname
-            uart::write_str("\x1b[0;90m[DNS]\x1b[0m Resolving ");
-            uart::write_bytes(trimmed_args);
-            uart::write_line("...");
-            
-            let resolve_result = {
-                let mut net_guard = NET_STATE.lock();
-                if let Some(ref mut state) = *net_guard {
-                    dns::resolve(state, trimmed_args, net::DNS_SERVER, 5000, get_time_ms)
-                } else {
-                    uart::write_line("\x1b[1;31m✗\x1b[0m Network not initialized");
-                    return;
-                }
-            };
-            
-            match resolve_result {
-                Some(resolved_ip) => {
-                    let mut ip_buf = [0u8; 16];
-                    let ip_len = net::format_ipv4(resolved_ip, &mut ip_buf);
-                    uart::write_str("\x1b[1;32m[DNS]\x1b[0m Resolved to \x1b[1;97m");
-                    uart::write_bytes(&ip_buf[..ip_len]);
-                    uart::write_line("\x1b[0m");
-                    resolved_ip
-                }
-                None => {
-                    uart::write_str("\x1b[1;31m[DNS]\x1b[0m Failed to resolve: ");
-                    uart::write_bytes(trimmed_args);
-                    uart::write_line("");
-                    return;
-                }
-            }
-        }
-    };
-    
-    let timestamp = get_time_ms();
-    
-    let mut ip_buf = [0u8; 16];
-    let ip_len = net::format_ipv4(target, &mut ip_buf);
-    uart::write_str("PING ");
-    uart::write_bytes(&ip_buf[..ip_len]);
-    uart::write_line(" 56(84) bytes of data.");
-    
-    // Set up continuous ping state
-    let mut ping_state = PingState::new(target, timestamp);
-    ping_state.seq = 1;
-    ping_state.sent_time = timestamp;
-    ping_state.last_send_time = timestamp;
-    ping_state.packets_sent = 1;
-    ping_state.waiting = true;
-    
-    // Send the first ICMP echo request immediately
-    let send_result = {
-        let mut net_guard = NET_STATE.lock();
-        if let Some(ref mut state) = *net_guard {
-            state.send_ping(target, ping_state.seq, timestamp)
-        } else {
-            uart::write_line("\x1b[1;31m✗\x1b[0m Network not initialized");
-            return;
-        }
-    };
-    
-    match send_result {
-        Ok(()) => {
-            *PING_STATE.lock() = Some(ping_state);
-            *COMMAND_RUNNING.lock() = true;
-        }
-        Err(e) => {
-            uart::write_str("ping: ");
-            uart::write_line(e);
-        }
-    }
-}
-
-fn cmd_nslookup(args: &[u8]) {
-    if args.is_empty() {
-        uart::write_line("Usage: nslookup <hostname>");
-        uart::write_line("\x1b[0;90mExample: nslookup google.com\x1b[0m");
-        return;
-    }
-    
-    // Trim any trailing whitespace from hostname
-    let mut hostname_len = args.len();
-    while hostname_len > 0 && (args[hostname_len - 1] == b' ' || args[hostname_len - 1] == b'\t') {
-        hostname_len -= 1;
-    }
-    let hostname = &args[..hostname_len];
-    
-    uart::write_line("");
-    uart::write_str("\x1b[1;33mServer:\x1b[0m  ");
-    let mut ip_buf = [0u8; 16];
-    let dns_len = net::format_ipv4(net::DNS_SERVER, &mut ip_buf);
-    uart::write_bytes(&ip_buf[..dns_len]);
-    uart::write_line("");
-    uart::write_line("\x1b[1;33mPort:\x1b[0m    53");
-    uart::write_line("");
-    
-    uart::write_str("\x1b[0;90mQuerying ");
-    uart::write_bytes(hostname);
-    uart::write_line("...\x1b[0m");
-    
-    // Perform DNS lookup with 5 second timeout
-    let resolve_result = {
-        let mut net_guard = NET_STATE.lock();
-        if let Some(ref mut state) = *net_guard {
-            dns::resolve(state, hostname, net::DNS_SERVER, 5000, get_time_ms)
-        } else {
-            uart::write_line("\x1b[1;31m✗\x1b[0m Network not initialized");
-            return;
-        }
-    };
-    
-    match resolve_result {
-        Some(addr) => {
-            uart::write_line("");
-            uart::write_str("\x1b[1;32mName:\x1b[0m    ");
-            uart::write_bytes(hostname);
-            uart::write_line("");
-            let addr_len = net::format_ipv4(addr, &mut ip_buf);
-            uart::write_str("\x1b[1;32mAddress:\x1b[0m \x1b[1;97m");
-            uart::write_bytes(&ip_buf[..addr_len]);
-            uart::write_line("\x1b[0m");
-            uart::write_line("");
-        }
-        None => {
-            uart::write_line("");
-            uart::write_str("\x1b[1;31m*** Can't find ");
-            uart::write_bytes(hostname);
-            uart::write_line(": No response from server\x1b[0m");
-            uart::write_line("");
-        }
-    }
-}
-
-// Legacy cmd_netstat removed - now implemented as user-space script
-// See mkfs/root/usr/bin/netstat
-
-/// Change directory command
-fn cmd_cd(args: &str) {
-    let path = args.trim();
-    
-    // Handle special cases
-    if path.is_empty() || path == "~" {
-        // Go to home directory (or root for now)
-        cwd_set("/");
-        return;
-    }
-    
-    if path == "-" {
-        // TODO: Previous directory (would need to track)
-        out_line("cd: OLDPWD not set");
-        return;
-    }
-    
-    // Resolve the path
-    let new_path = resolve_path(path);
-    
-    // Verify the path exists (has files under it)
-    if path_exists(&new_path) {
-        cwd_set(&new_path);
-    } else {
-        out_str("\x1b[1;31mcd:\x1b[0m ");
-        out_str(path);
-        out_line(": No such directory");
-    }
-}
-
 /// Resolve a path relative to CWD
 pub fn resolve_path(path: &str) -> alloc::string::String {
     use alloc::string::String;
     use alloc::vec::Vec;
-    
+
     let mut result = String::new();
-    
+
     // Start from root or CWD
     let cwd = cwd_get();
-    let base: &str = if path.starts_with('/') {
-        "/"
-    } else {
-        &cwd
-    };
-    
+    let base: &str = if path.starts_with('/') { "/" } else { &cwd };
+
     // Combine base and path, then normalize
     let full = if path.starts_with('/') {
         String::from(path)
@@ -2679,28 +2122,32 @@ pub fn resolve_path(path: &str) -> alloc::string::String {
         s.push_str(path);
         s
     };
-    
+
     // Split and normalize (handle . and ..)
     let mut parts: Vec<&str> = Vec::new();
     for part in full.split('/') {
         match part {
             "" | "." => continue,
-            ".." => { parts.pop(); }
+            ".." => {
+                parts.pop();
+            }
             p => parts.push(p),
         }
     }
-    
+
     // Rebuild path
     result.push('/');
     for (i, part) in parts.iter().enumerate() {
-        if i > 0 { result.push('/'); }
+        if i > 0 {
+            result.push('/');
+        }
         result.push_str(part);
     }
-    
+
     if result.is_empty() {
         result.push('/');
     }
-    
+
     result
 }
 
@@ -2713,7 +2160,7 @@ fn path_exists(path: &str) -> bool {
         if path == "/" {
             return true;
         }
-        
+
         let files = fs.list_dir(dev, "/");
         let path_with_slash = if path.ends_with('/') {
             alloc::string::String::from(path)
@@ -2722,7 +2169,7 @@ fn path_exists(path: &str) -> bool {
             s.push('/');
             s
         };
-        
+
         for file in files {
             // Check if any file starts with this path (it's a directory)
             if file.name.starts_with(&path_with_slash) {
@@ -2739,11 +2186,21 @@ fn path_exists(path: &str) -> bool {
 
 fn cmd_shutdown() {
     uart::write_line("");
-    uart::write_line("\x1b[1;31m╔═══════════════════════════════════════════════════════════════════╗\x1b[0m");
-    uart::write_line("\x1b[1;31m║\x1b[0m                                                                   \x1b[1;31m║\x1b[0m");
-    uart::write_line("\x1b[1;31m║\x1b[0m                    \x1b[1;97mSystem Shutdown Initiated\x1b[0m                       \x1b[1;31m║\x1b[0m");
-    uart::write_line("\x1b[1;31m║\x1b[0m                                                                   \x1b[1;31m║\x1b[0m");
-    uart::write_line("\x1b[1;31m╚═══════════════════════════════════════════════════════════════════╝\x1b[0m");
+    uart::write_line(
+        "\x1b[1;31m╔═══════════════════════════════════════════════════════════════════╗\x1b[0m",
+    );
+    uart::write_line(
+        "\x1b[1;31m║\x1b[0m                                                                   \x1b[1;31m║\x1b[0m",
+    );
+    uart::write_line(
+        "\x1b[1;31m║\x1b[0m                    \x1b[1;97mSystem Shutdown Initiated\x1b[0m                       \x1b[1;31m║\x1b[0m",
+    );
+    uart::write_line(
+        "\x1b[1;31m║\x1b[0m                                                                   \x1b[1;31m║\x1b[0m",
+    );
+    uart::write_line(
+        "\x1b[1;31m╚═══════════════════════════════════════════════════════════════════╝\x1b[0m",
+    );
     uart::write_line("");
     uart::write_line("    \x1b[0;90m[1/3]\x1b[0m Syncing filesystems...");
     uart::write_line("    \x1b[0;90m[2/3]\x1b[0m Stopping network services...");
@@ -2751,7 +2208,7 @@ fn cmd_shutdown() {
     uart::write_line("");
     uart::write_line("    \x1b[1;32m✓ Goodbye!\x1b[0m");
     uart::write_line("");
-    
+
     // Write to the test finisher address to signal the VM to stop
     // Value 0x5555 indicates successful exit (PASS)
     unsafe {
@@ -2759,25 +2216,6 @@ fn cmd_shutdown() {
     }
     // Should not reach here, but loop just in case
     loop {}
-}
-
-fn parse_usize(args: &[u8]) -> usize {
-    let mut n: usize = 0;
-    let mut ok = false;
-    for &b in args {
-        if b >= b'0' && b <= b'9' {
-            ok = true;
-            let d = (b - b'0') as usize;
-            n = n.saturating_mul(10).saturating_add(d);
-        } else if b == b' ' || b == b'\t' {
-            if ok {
-                break;
-            }
-        } else {
-            break;
-        }
-    }
-    if ok { n } else { 0 }
 }
 
 fn eq_cmd(a: &[u8], b: &[u8]) -> bool {

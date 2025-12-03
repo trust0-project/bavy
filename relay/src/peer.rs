@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use crate::protocol::{format_ip, format_mac, IP_POOL_END, IP_POOL_START};
+use crate::protocol::{IP_POOL_END, IP_POOL_START, format_ip, format_mac};
 
 /// Unique identifier for a connected peer
 pub type PeerId = u64;
@@ -242,7 +242,7 @@ mod tests {
     #[test]
     fn test_ip_pool_allocation() {
         let mut pool = IpPool::new();
-        
+
         let ip1 = pool.allocate(1).unwrap();
         assert_eq!(ip1[0..3], [10, 0, 2]);
         assert!(ip1[3] >= IP_POOL_START && ip1[3] <= IP_POOL_END);
@@ -258,7 +258,7 @@ mod tests {
     #[test]
     fn test_peer_lookup() {
         let mut manager = PeerManager::new();
-        
+
         let mac = [0x52, 0x54, 0x00, 0xab, 0xcd, 0xef];
         let (id, ip) = manager.register(mac).unwrap();
 
@@ -266,4 +266,3 @@ mod tests {
         assert_eq!(manager.peer_id_by_ip(&ip), Some(id));
     }
 }
-

@@ -1,6 +1,6 @@
+use crate::Trap;
 use crate::bus::Bus;
 use crate::csr::Mode;
-use crate::Trap;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AccessType {
@@ -236,14 +236,7 @@ impl Tlb {
     /// Insert a translation with explicit parameters.
     /// Overwrites any existing entry at the same index (direct-mapped).
     #[inline]
-    pub fn insert_translation(
-        &mut self,
-        vpn: u64,
-        ppn: u64,
-        perm: u8,
-        level: u8,
-        asid: u16,
-    ) {
+    pub fn insert_translation(&mut self, vpn: u64, ppn: u64, perm: u8, level: u8, asid: u16) {
         let idx = (vpn as usize) & TLB_MASK;
         // SAFETY: idx is always < TLB_SIZE due to the bitmask
         unsafe {
@@ -451,7 +444,12 @@ pub fn translate(
 }
 
 #[inline(always)]
-fn check_permission_tlb(mode: Mode, mstatus: u64, entry: &TlbEntry, access_type: AccessType) -> bool {
+fn check_permission_tlb(
+    mode: Mode,
+    mstatus: u64,
+    entry: &TlbEntry,
+    access_type: AccessType,
+) -> bool {
     let mxr = (mstatus >> 19) & 1;
     let sum = (mstatus >> 18) & 1;
 

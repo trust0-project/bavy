@@ -20,17 +20,15 @@ pub const DNS_SERVER: [u8; 4] = [8, 8, 8, 8];
 
 /// IP pool range for peer assignment
 pub const IP_POOL_START: u8 = 10; // 10.0.2.10
-pub const IP_POOL_END: u8 = 254;  // 10.0.2.254
+pub const IP_POOL_END: u8 = 254; // 10.0.2.254
 
 /// Control messages exchanged between peers and the relay hub.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ControlMessage {
     /// Peer requests registration with its MAC address
-    Register {
-        mac: [u8; 6],
-    },
-    
+    Register { mac: [u8; 6] },
+
     /// Hub assigns IP configuration to peer
     Assigned {
         ip: [u8; 4],
@@ -38,25 +36,21 @@ pub enum ControlMessage {
         netmask: [u8; 4],
         dns: [u8; 4],
     },
-    
+
     /// Heartbeat to keep connection alive
     Heartbeat,
-    
+
     /// Heartbeat acknowledgment
     HeartbeatAck,
-    
+
     /// Peer disconnecting gracefully
     Disconnect,
-    
+
     /// Error message from hub
-    Error {
-        message: String,
-    },
-    
+    Error { message: String },
+
     /// List of connected peers (optional, for discovery)
-    PeerList {
-        peers: Vec<PeerInfo>,
-    },
+    PeerList { peers: Vec<PeerInfo> },
 }
 
 /// Information about a connected peer
@@ -75,7 +69,7 @@ impl ControlMessage {
         frame.extend(json);
         frame
     }
-    
+
     /// Decode a control message from a framed datagram
     pub fn decode(data: &[u8]) -> Result<Self, String> {
         if data.is_empty() {
@@ -121,7 +115,7 @@ mod tests {
         };
         let encoded = msg.encode();
         let decoded = ControlMessage::decode(&encoded).unwrap();
-        
+
         match decoded {
             ControlMessage::Register { mac } => {
                 assert_eq!(mac, [0x52, 0x54, 0x00, 0xab, 0xcd, 0xef]);
@@ -129,6 +123,4 @@ mod tests {
             _ => panic!("Wrong message type"),
         }
     }
-
 }
-

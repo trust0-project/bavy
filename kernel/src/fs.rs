@@ -6,10 +6,10 @@
 //! - Dirty block tracking for efficient sync
 //! - LRU eviction for cache management
 
+use crate::virtio_blk::VirtioBlock;
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
-use alloc::collections::BTreeMap;
-use crate::virtio_blk::VirtioBlock;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 // Must match mkfs constants
@@ -64,7 +64,7 @@ impl CacheEntry {
             last_access: CACHE_ACCESS_COUNTER.fetch_add(1, Ordering::Relaxed),
         }
     }
-    
+
     fn touch(&mut self) {
         self.last_access = CACHE_ACCESS_COUNTER.fetch_add(1, Ordering::Relaxed);
     }
@@ -91,7 +91,7 @@ impl BufferCache {
             writebacks: 0,
         }
     }
-    
+
     /// Read a block, using cache if available
     #[allow(dead_code)]
     pub fn read(&mut self, dev: &mut VirtioBlock, sector: u64) -> Result<&[u8; 512], &'static str> {
@@ -102,51 +102,60 @@ impl BufferCache {
             entry.touch();
             return Ok(&entry.data);
         }
-        
+
         // Cache miss - read from disk
         self.misses += 1;
         let mut data = [0u8; 512];
         dev.read_sector(sector, &mut data)?;
-        
+
         // Evict if cache is full
         if self.blocks.len() >= CACHE_MAX_BLOCKS {
             self.evict_lru(dev)?;
         }
-        
+
         // Insert into cache
         self.blocks.insert(sector, CacheEntry::new(data));
         Ok(&self.blocks.get(&sector).unwrap().data)
     }
-    
+
     /// Read a block into a mutable buffer (for modification)
-    pub fn read_mut(&mut self, dev: &mut VirtioBlock, sector: u64) -> Result<&mut [u8; 512], &'static str> {
+    pub fn read_mut(
+        &mut self,
+        dev: &mut VirtioBlock,
+        sector: u64,
+    ) -> Result<&mut [u8; 512], &'static str> {
         // Ensure block is in cache
         if !self.blocks.contains_key(&sector) {
             self.misses += 1;
             let mut data = [0u8; 512];
             dev.read_sector(sector, &mut data)?;
-            
+
             if self.blocks.len() >= CACHE_MAX_BLOCKS {
                 self.evict_lru(dev)?;
             }
-            
+
             self.blocks.insert(sector, CacheEntry::new(data));
         } else {
             self.hits += 1;
         }
-        
+
         let entry = self.blocks.get_mut(&sector).unwrap();
         entry.touch();
         Ok(&mut entry.data)
     }
-    
+
     /// Write a block (cached, not immediately flushed)
-    pub fn write(&mut self, dev: &mut VirtioBlock, sector: u64, data: &[u8; 512]) -> Result<(), &'static str> {
+    pub fn write(
+        &mut self,
+        dev: &mut VirtioBlock,
+        sector: u64,
+        data: &[u8; 512],
+    ) -> Result<(), &'static str> {
         // Evict if cache is full
         if !self.blocks.contains_key(&sector) && self.blocks.len() >= CACHE_MAX_BLOCKS {
             self.evict_lru(dev)?;
         }
-        
+
         // Insert or update in cache
         if let Some(entry) = self.blocks.get_mut(&sector) {
             entry.data.copy_from_slice(data);
@@ -157,17 +166,17 @@ impl BufferCache {
             entry.dirty = true;
             self.blocks.insert(sector, entry);
         }
-        
+
         Ok(())
     }
-    
+
     /// Mark a cached block as dirty
     pub fn mark_dirty(&mut self, sector: u64) {
         if let Some(entry) = self.blocks.get_mut(&sector) {
             entry.dirty = true;
         }
     }
-    
+
     /// Flush all dirty blocks to disk
     pub fn sync(&mut self, dev: &mut VirtioBlock) -> Result<usize, &'static str> {
         let mut count = 0;
@@ -181,7 +190,7 @@ impl BufferCache {
         }
         Ok(count)
     }
-    
+
     /// Flush a specific block to disk
     #[allow(dead_code)]
     pub fn sync_block(&mut self, dev: &mut VirtioBlock, sector: u64) -> Result<bool, &'static str> {
@@ -195,15 +204,16 @@ impl BufferCache {
         }
         Ok(false)
     }
-    
+
     /// Evict the least recently used block
     fn evict_lru(&mut self, dev: &mut VirtioBlock) -> Result<(), &'static str> {
         // Find LRU entry
-        let lru_sector = self.blocks
+        let lru_sector = self
+            .blocks
             .iter()
             .min_by_key(|(_, e)| e.last_access)
             .map(|(&s, _)| s);
-        
+
         if let Some(sector) = lru_sector {
             // Write back if dirty
             if let Some(entry) = self.blocks.get(&sector) {
@@ -214,16 +224,16 @@ impl BufferCache {
             }
             self.blocks.remove(&sector);
         }
-        
+
         Ok(())
     }
-    
+
     /// Invalidate a cached block (e.g., after external modification)
     #[allow(dead_code)]
     pub fn invalidate(&mut self, sector: u64) {
         self.blocks.remove(&sector);
     }
-    
+
     /// Clear the entire cache (flushes dirty blocks first)
     #[allow(dead_code)]
     pub fn clear(&mut self, dev: &mut VirtioBlock) -> Result<(), &'static str> {
@@ -231,12 +241,12 @@ impl BufferCache {
         self.blocks.clear();
         Ok(())
     }
-    
+
     /// Get cache statistics
     pub fn stats(&self) -> (u64, u64, u64, usize) {
         (self.hits, self.misses, self.writebacks, self.blocks.len())
     }
-    
+
     /// Get number of dirty blocks
     pub fn dirty_count(&self) -> usize {
         self.blocks.values().filter(|e| e.dirty).count()
@@ -255,13 +265,19 @@ pub struct FileSystem {
 impl FileSystem {
     pub fn init(dev: &mut VirtioBlock) -> Option<Self> {
         let mut buf = [0u8; 512];
-        if dev.read_sector(SEC_SUPER, &mut buf).is_err() { return None; }
-        
+        if dev.read_sector(SEC_SUPER, &mut buf).is_err() {
+            return None;
+        }
+
         let magic = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-        if magic != MAGIC { return None; }
+        if magic != MAGIC {
+            return None;
+        }
 
         // Load first sector of bitmap
-        if dev.read_sector(SEC_MAP_START, &mut buf).is_err() { return None; }
+        if dev.read_sector(SEC_MAP_START, &mut buf).is_err() {
+            return None;
+        }
 
         Some(Self {
             bitmap_cache: buf,
@@ -269,7 +285,7 @@ impl FileSystem {
             cache: BufferCache::new(),
         })
     }
-    
+
     /// Sync all cached data to disk
     pub fn sync(&mut self, dev: &mut VirtioBlock) -> Result<usize, &'static str> {
         // Sync bitmap if dirty
@@ -277,16 +293,16 @@ impl FileSystem {
             dev.write_sector(SEC_MAP_START, &self.bitmap_cache)?;
             self.bitmap_dirty = false;
         }
-        
+
         // Sync block cache
         self.cache.sync(dev)
     }
-    
+
     /// Get cache statistics: (hits, misses, writebacks, cached_blocks)
     pub fn cache_stats(&self) -> (u64, u64, u64, usize) {
         self.cache.stats()
     }
-    
+
     /// Get number of dirty blocks waiting to be written
     pub fn dirty_blocks(&self) -> usize {
         self.cache.dirty_count() + if self.bitmap_dirty { 1 } else { 0 }
@@ -300,12 +316,15 @@ impl FileSystem {
 
         for i in 0..SEC_DIR_COUNT {
             if dev.read_sector(SEC_DIR_START + i, &mut buf).is_ok() {
-                for j in 0..16 { // 512 / 32 = 16 entries
+                for j in 0..16 {
+                    // 512 / 32 = 16 entries
                     let offset = j * 32;
-                    if buf[offset] == 0 { continue; }
+                    if buf[offset] == 0 {
+                        continue;
+                    }
 
-                    let entry = unsafe { &*(buf[offset..offset+32].as_ptr() as *const DirEntry) };
-                    
+                    let entry = unsafe { &*(buf[offset..offset + 32].as_ptr() as *const DirEntry) };
+
                     // Decode Name
                     let name_len = entry.name.iter().position(|&c| c == 0).unwrap_or(24);
                     let name = core::str::from_utf8(&entry.name[..name_len])
@@ -331,21 +350,28 @@ impl FileSystem {
 
         for i in 0..SEC_DIR_COUNT {
             dev.read_sector(SEC_DIR_START + i, &mut buf).ok();
-            for j in 0..16 { // 512 / 32 = 16 entries
+            for j in 0..16 {
+                // 512 / 32 = 16 entries
                 let offset = j * 32;
-                if buf[offset] == 0 { continue; }
+                if buf[offset] == 0 {
+                    continue;
+                }
 
-                let entry = unsafe { &*(buf[offset..offset+32].as_ptr() as *const DirEntry) };
-                
+                let entry = unsafe { &*(buf[offset..offset + 32].as_ptr() as *const DirEntry) };
+
                 // Decode Name
                 let name_len = entry.name.iter().position(|&c| c == 0).unwrap_or(24);
                 let name = core::str::from_utf8(&entry.name[..name_len]).unwrap_or("???");
 
                 // Print
                 crate::uart::write_u64(entry.size as u64);
-                if entry.size < 10 { crate::uart::write_str("         "); }
-                else if entry.size < 100 { crate::uart::write_str("        "); }
-                else { crate::uart::write_str("       "); }
+                if entry.size < 10 {
+                    crate::uart::write_str("         ");
+                } else if entry.size < 100 {
+                    crate::uart::write_str("        ");
+                } else {
+                    crate::uart::write_str("       ");
+                }
                 crate::uart::write_line(name);
             }
         }
@@ -360,17 +386,22 @@ impl FileSystem {
         while next != 0 && (data.len() < entry.size as usize) {
             dev.read_sector(next as u64, &mut buf).ok()?;
             let next_ptr = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-            
+
             let remaining = entry.size as usize - data.len();
             let chunk = core::cmp::min(remaining, 508);
-            data.extend_from_slice(&buf[4..4+chunk]);
-            
+            data.extend_from_slice(&buf[4..4 + chunk]);
+
             next = next_ptr;
         }
         Some(data)
     }
 
-    pub fn write_file(&mut self, dev: &mut VirtioBlock, filename: &str, data: &[u8]) -> Result<(), &'static str> {
+    pub fn write_file(
+        &mut self,
+        dev: &mut VirtioBlock,
+        filename: &str,
+        data: &[u8],
+    ) -> Result<(), &'static str> {
         // Simple implementation: Overwrite existing or Create new
         let (sector, index) = match self.find_entry_pos(dev, filename) {
             Some(pos) => pos,
@@ -378,7 +409,7 @@ impl FileSystem {
         };
 
         // Note: This implementation leaks old blocks if overwriting (simplification)
-        
+
         // Write Data (using cache for better performance)
         let mut remaining = data;
         let mut head = 0;
@@ -390,8 +421,10 @@ impl FileSystem {
         } else {
             while !remaining.is_empty() {
                 let current = self.alloc_block(dev).ok_or("Disk full")?;
-                if head == 0 { head = current; }
-                
+                if head == 0 {
+                    head = current;
+                }
+
                 if prev != 0 {
                     // Link previous (using cache)
                     self.link_block_cached(dev, prev, current)?;
@@ -400,8 +433,8 @@ impl FileSystem {
                 let len = core::cmp::min(remaining.len(), 508);
                 let mut buf = [0u8; 512];
                 // Next = 0 (for now)
-                buf[4..4+len].copy_from_slice(&remaining[..len]);
-                
+                buf[4..4 + len].copy_from_slice(&remaining[..len]);
+
                 // Write to cache instead of directly to disk
                 self.cache.write(dev, current as u64, &buf)?;
 
@@ -427,18 +460,25 @@ impl FileSystem {
             let buf = self.cache.read_mut(dev, sector)?;
             let offset = index * 32;
             let ptr = &mut buf[offset] as *mut u8 as *mut DirEntry;
-            unsafe { *ptr = entry; }
+            unsafe {
+                *ptr = entry;
+            }
         }
         self.cache.mark_dirty(sector);
-        
+
         // Sync to ensure data is written (can be made optional for better perf)
         self.cache.sync(dev)?;
 
         Ok(())
     }
-    
+
     /// Link two blocks using cached writes
-    fn link_block_cached(&mut self, dev: &mut VirtioBlock, prev: u32, next: u32) -> Result<(), &'static str> {
+    fn link_block_cached(
+        &mut self,
+        dev: &mut VirtioBlock,
+        prev: u32,
+        next: u32,
+    ) -> Result<(), &'static str> {
         let buf = self.cache.read_mut(dev, prev as u64)?;
         buf[0..4].copy_from_slice(&next.to_le_bytes());
         self.cache.mark_dirty(prev as u64);
@@ -452,7 +492,7 @@ impl FileSystem {
             let mut buf = [0u8; 512];
             dev.read_sector(sec, &mut buf).ok()?;
             let offset = idx * 32;
-            let entry = unsafe { &*(buf[offset..offset+32].as_ptr() as *const DirEntry) };
+            let entry = unsafe { &*(buf[offset..offset + 32].as_ptr() as *const DirEntry) };
             return Some(*entry);
         }
         None
@@ -465,11 +505,15 @@ impl FileSystem {
             dev.read_sector(sector, &mut buf).ok()?;
             for j in 0..16 {
                 let offset = j * 32;
-                if buf[offset] == 0 { continue; }
-                let entry = unsafe { &*(buf[offset..offset+32].as_ptr() as *const DirEntry) };
+                if buf[offset] == 0 {
+                    continue;
+                }
+                let entry = unsafe { &*(buf[offset..offset + 32].as_ptr() as *const DirEntry) };
                 let len = entry.name.iter().position(|&c| c == 0).unwrap_or(24);
                 let entry_name = core::str::from_utf8(&entry.name[..len]).unwrap_or("");
-                if entry_name == name { return Some((sector, j)); }
+                if entry_name == name {
+                    return Some((sector, j));
+                }
             }
         }
         None
@@ -481,7 +525,9 @@ impl FileSystem {
             let sector = SEC_DIR_START + i;
             dev.read_sector(sector, &mut buf).ok()?;
             for j in 0..16 {
-                if buf[j * 32] == 0 { return Some((sector, j)); }
+                if buf[j * 32] == 0 {
+                    return Some((sector, j));
+                }
             }
         }
         None
@@ -495,10 +541,10 @@ impl FileSystem {
                     if (self.bitmap_cache[i] & (1 << bit)) == 0 {
                         self.bitmap_cache[i] |= 1 << bit;
                         self.bitmap_dirty = true;
-                        
+
                         // Sync immediately
                         dev.write_sector(SEC_MAP_START, &self.bitmap_cache).ok()?;
-                        
+
                         let sector = (i * 8 + bit) as u32;
                         // Map offset + offset in map
                         // Actually our logic says sector is absolute index.
@@ -517,7 +563,7 @@ impl FileSystem {
         buf[0..4].copy_from_slice(&next.to_le_bytes());
         dev.write_sector(prev as u64, &buf)
     }
-    
+
     /// Create a directory (creates a placeholder file with trailing /)
     /// In SFS, directories are represented by files with names ending in /
     /// and containing references to their children
@@ -530,24 +576,23 @@ impl FileSystem {
             s.push('/');
             s
         };
-        
+
         // Check if directory already exists
         if self.find_entry_pos(dev, &dir_path).is_some() {
             return Err("Directory already exists");
         }
-        
+
         // Create a placeholder file for the directory
         // The directory "file" contains a simple marker
         self.write_file(dev, &dir_path, b"DIR")?;
-        
+
         Ok(())
     }
-    
+
     /// Remove a file or empty directory
     pub fn remove(&mut self, dev: &mut VirtioBlock, path: &str) -> Result<(), &'static str> {
-        let (sector, index) = self.find_entry_pos(dev, path)
-            .ok_or("File not found")?;
-        
+        let (sector, index) = self.find_entry_pos(dev, path).ok_or("File not found")?;
+
         // Check if it's a directory with children
         if path.ends_with('/') {
             // Check for children
@@ -556,7 +601,7 @@ impl FileSystem {
                 return Err("Directory not empty");
             }
         }
-        
+
         // Zero out the directory entry
         let buf = self.cache.read_mut(dev, sector)?;
         let offset = index * 32;
@@ -564,33 +609,33 @@ impl FileSystem {
             buf[offset + i] = 0;
         }
         self.cache.mark_dirty(sector);
-        
+
         // Note: This doesn't free the data blocks (simplification)
         // A production FS would mark them as free in the bitmap
-        
+
         self.cache.sync(dev)?;
         Ok(())
     }
-    
+
     /// Check if a path exists
     pub fn exists(&self, dev: &mut VirtioBlock, path: &str) -> bool {
         self.find_entry_pos(dev, path).is_some()
     }
-    
+
     /// Check if a path is a directory
     pub fn is_dir(&self, dev: &mut VirtioBlock, path: &str) -> bool {
         // Check if path ends with / or has children
         if path.ends_with('/') {
             return self.find_entry_pos(dev, path).is_some();
         }
-        
+
         // Check if there are files under this path
         let dir_path = {
             let mut s = String::from(path);
             s.push('/');
             s
         };
-        
+
         let files = self.list_dir(dev, "/");
         files.iter().any(|f| f.name.starts_with(&dir_path))
     }

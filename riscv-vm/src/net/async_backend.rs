@@ -10,13 +10,13 @@
 //! - Lower latency: packets are queued by I/O thread while CPU runs
 //! - Better throughput: batched processing of multiple packets
 
-use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::net::NetworkBackend;
+use super::NetworkBackend;
 
 /// Async wrapper around NetworkBackend.
 ///
@@ -66,7 +66,13 @@ impl AsyncNetworkBackend {
         let io_thread = thread::Builder::new()
             .name("virtio-net-io".to_string())
             .spawn(move || {
-                Self::io_loop(backend, rx_from_vm, tx_to_vm, shutdown_clone, assigned_ip_clone);
+                Self::io_loop(
+                    backend,
+                    rx_from_vm,
+                    tx_to_vm,
+                    shutdown_clone,
+                    assigned_ip_clone,
+                );
             })
             .expect("Failed to spawn network I/O thread");
 
@@ -119,7 +125,10 @@ impl AsyncNetworkBackend {
             // Check for incoming packets (with timeout to allow shutdown checks)
             match backend.receive_timeout(Duration::from_millis(10)) {
                 Ok(Some(packet)) => {
-                    log::trace!("[AsyncNetworkBackend] Received {} byte packet", packet.len());
+                    log::trace!(
+                        "[AsyncNetworkBackend] Received {} byte packet",
+                        packet.len()
+                    );
                     if tx_to_vm.send(packet).is_err() {
                         log::debug!("[AsyncNetworkBackend] RX channel disconnected");
                         break;
@@ -139,7 +148,10 @@ impl AsyncNetworkBackend {
                 if guard.is_none() {
                     log::info!(
                         "[AsyncNetworkBackend] IP assigned: {}.{}.{}.{}",
-                        ip[0], ip[1], ip[2], ip[3]
+                        ip[0],
+                        ip[1],
+                        ip[2],
+                        ip[3]
                     );
                     *guard = Some(ip);
                 }
@@ -277,4 +289,3 @@ mod tests {
         // If we get here without hanging, the test passes
     }
 }
-

@@ -4,11 +4,11 @@
 //! Appropriate for kernel code without a scheduler.
 
 use core::cell::UnsafeCell;
+use core::hint::spin_loop;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicU32, Ordering};
 #[cfg(debug_assertions)]
 use core::sync::atomic::AtomicUsize;
-use core::hint::spin_loop;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 // Lock states as u32 for 32-bit atomic operations.
 // On RISC-V, AtomicBool uses byte operations which may not be properly
@@ -57,7 +57,7 @@ impl<T> Spinlock<T> {
     /// Acquire the lock, blocking until available.
     ///
     /// Returns a guard that releases the lock when dropped.
-    /// 
+    ///
     /// NOTE: Uses `swap` (AMOSWAP.W instruction) for acquisition because it's a single
     /// atomic instruction that works correctly for SMP. We use AtomicU32 instead of
     /// AtomicBool to ensure we get 32-bit operations (AMOSWAP.W, LW, SW) which are
@@ -104,7 +104,7 @@ impl<T> Spinlock<T> {
                     }
                     spin_count = 0; // Reset counter
                 }
-                
+
                 // Try to acquire again with swap
                 if self.locked.swap(LOCKED, Ordering::Acquire) == UNLOCKED {
                     // Got it!

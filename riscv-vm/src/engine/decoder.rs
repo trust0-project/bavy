@@ -280,12 +280,7 @@ fn encode_s(imm: i32, rs2: u32, rs1: u32, funct3: u32, opcode: u32) -> u32 {
     let imm12 = (imm as u32) & 0xFFF;
     let imm11_5 = (imm12 >> 5) & 0x7F;
     let imm4_0 = imm12 & 0x1F;
-    (imm11_5 << 25)
-        | (rs2 << 20)
-        | (rs1 << 15)
-        | (funct3 << 12)
-        | (imm4_0 << 7)
-        | opcode
+    (imm11_5 << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (imm4_0 << 7) | opcode
 }
 
 #[inline(always)]
@@ -353,8 +348,9 @@ fn expand_q0(insn: u16, funct3: u16) -> Result<u32, Trap> {
         }
         // C.LW -> LW rd', uimm(rs1')
         0b010 => {
-            let uimm =
-                (((insn_u >> 6) & 0x1) << 2) | (((insn_u >> 10) & 0x7) << 3) | (((insn_u >> 5) & 0x1) << 6);
+            let uimm = (((insn_u >> 6) & 0x1) << 2)
+                | (((insn_u >> 10) & 0x7) << 3)
+                | (((insn_u >> 5) & 0x1) << 6);
             let rd_prime = 8 + ((insn_u >> 2) & 0x7);
             let rs1_prime = 8 + ((insn_u >> 7) & 0x7);
             Ok(encode_i(uimm as i32, rs1_prime, 0x2, rd_prime, 0x03))
@@ -368,8 +364,9 @@ fn expand_q0(insn: u16, funct3: u16) -> Result<u32, Trap> {
         }
         // C.SW -> SW rs2', uimm(rs1')
         0b110 => {
-            let uimm =
-                (((insn_u >> 6) & 0x1) << 2) | (((insn_u >> 10) & 0x7) << 3) | (((insn_u >> 5) & 0x1) << 6);
+            let uimm = (((insn_u >> 6) & 0x1) << 2)
+                | (((insn_u >> 10) & 0x7) << 3)
+                | (((insn_u >> 5) & 0x1) << 6);
             let rs2_prime = 8 + ((insn_u >> 2) & 0x7);
             let rs1_prime = 8 + ((insn_u >> 7) & 0x7);
             Ok(encode_s(uimm as i32, rs2_prime, rs1_prime, 0x2, 0x23))
@@ -467,7 +464,13 @@ fn expand_q1(insn: u16, funct3: u16) -> Result<u32, Trap> {
                     let shamt_bits = ((insn_u >> 2) & 0x1F) | (((insn_u >> 12) & 0x1) << 5);
                     let shamt = shamt_bits & 0x3F;
                     // SRAI encoding: funct7=0b0100000, funct3=101
-                    Ok(encode_i((0x20 << 6) | (shamt as i32), rs1_prime, 0x5, rs1_prime, 0x13))
+                    Ok(encode_i(
+                        (0x20 << 6) | (shamt as i32),
+                        rs1_prime,
+                        0x5,
+                        rs1_prime,
+                        0x13,
+                    ))
                 }
                 // C.ANDI
                 0b10 => {
@@ -479,7 +482,7 @@ fn expand_q1(insn: u16, funct3: u16) -> Result<u32, Trap> {
                 0b11 => {
                     let bit12 = (insn_u >> 12) & 0x1;
                     let funct2 = (insn_u >> 5) & 0x3;
-                    
+
                     if bit12 == 0 {
                         // C.SUB / C.XOR / C.OR / C.AND -> R-type with opcode 0x33
                         let (funct3, funct7) = match funct2 {
@@ -489,14 +492,12 @@ fn expand_q1(insn: u16, funct3: u16) -> Result<u32, Trap> {
                             0b11 => (0x7, 0x00), // AND
                             _ => unreachable!(),
                         };
-                        Ok(
-                            (funct7 << 25)
-                                | (rs2_prime << 20)
-                                | (rs1_prime << 15)
-                                | (funct3 << 12)
-                                | (rs1_prime << 7)
-                                | 0x33,
-                        )
+                        Ok((funct7 << 25)
+                            | (rs2_prime << 20)
+                            | (rs1_prime << 15)
+                            | (funct3 << 12)
+                            | (rs1_prime << 7)
+                            | 0x33)
                     } else {
                         // RV64C: C.SUBW / C.ADDW -> R-type with opcode 0x3B (Op32)
                         match funct2 {
@@ -705,7 +706,13 @@ mod tests {
         // C.ADDI4SPN -> ADDI x8, x2, 16
         let op = decode(expand_compressed(c_addi4spn).unwrap()).unwrap();
         match op {
-            Op::OpImm { rd, rs1, imm, funct3, .. } => {
+            Op::OpImm {
+                rd,
+                rs1,
+                imm,
+                funct3,
+                ..
+            } => {
                 assert_eq!(rd, Register::X8);
                 assert_eq!(rs1, Register::X2);
                 assert_eq!(imm, 16);

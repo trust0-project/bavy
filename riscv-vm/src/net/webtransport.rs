@@ -5,7 +5,7 @@
 //! - 0x00 prefix: Control messages (JSON-encoded)
 //! - 0x01 prefix: Ethernet data frames
 
-use crate::net::NetworkBackend;
+use super::NetworkBackend;
 
 /// Message type prefix for control messages
 const MSG_TYPE_CONTROL: u8 = 0x00;
@@ -53,7 +53,7 @@ fn decode_message(data: &[u8]) -> Option<Vec<u8>> {
     if data.is_empty() {
         return None;
     }
-    
+
     match data[0] {
         MSG_TYPE_DATA => {
             // Return the Ethernet frame without the prefix
@@ -105,15 +105,15 @@ fn parse_ip_from_json(json_str: &str) -> Option<[u8; 4]> {
 mod native {
     use super::*;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-    use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
     use std::thread;
     use std::time::Duration;
     use tokio::runtime::Runtime;
-    use wtransport::tls::Sha256Digest;
     use wtransport::ClientConfig;
     use wtransport::Endpoint;
+    use wtransport::tls::Sha256Digest;
 
     /// Maximum reconnection delay in seconds
     const MAX_RECONNECT_DELAY_SECS: u64 = 30;
@@ -134,7 +134,7 @@ mod native {
     impl WebTransportBackend {
         pub fn new(url: &str, cert_hash: Option<String>) -> Self {
             log::warn!("[WebTransport] Creating backend for URL: {}", url);
-            
+
             // Generate a random MAC address (locally administered, unicast)
             // Use system time + process id for randomness
             let now = std::time::SystemTime::now()
@@ -142,15 +142,15 @@ mod native {
                 .unwrap_or_default();
             let nanos = now.as_nanos() as u64;
             let pid = std::process::id() as u64;
-            
+
             // Mix in URL hash for additional entropy
             let url_hash: u64 = url
                 .bytes()
                 .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
-            
+
             // Combine all sources of entropy
             let seed = nanos ^ (pid << 32) ^ url_hash;
-            
+
             let mut mac = [0x52, 0x54, 0x00, 0x00, 0x00, 0x00];
             // Set locally administered bit (0x02) and clear multicast bit (0x01)
             mac[0] = 0x52; // Already has locally administered bit set
@@ -404,7 +404,7 @@ mod native {
         fn mac_address(&self) -> [u8; 6] {
             self.mac
         }
-        
+
         fn get_assigned_ip(&self) -> Option<[u8; 4]> {
             if let Ok(guard) = self.assigned_ip.lock() {
                 *guard
@@ -422,8 +422,8 @@ mod wasm {
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::rc::Rc;
-    use wasm_bindgen::prelude::*;
     use wasm_bindgen::JsCast;
+    use wasm_bindgen::prelude::*;
     use wasm_bindgen_futures::JsFuture;
     use web_sys::{
         ReadableStreamDefaultReader, WebTransport, WebTransportHash, WebTransportOptions,
@@ -468,7 +468,7 @@ mod wasm {
             // This ensures each browser tab/VM instance gets a unique MAC
             let rand1 = (js_sys::Math::random() * 0xFFFFFFFFu32 as f64) as u32;
             let rand2 = (js_sys::Math::random() * 0xFFFFu32 as f64) as u32;
-            
+
             let mut mac = [0x52, 0x54, 0x00, 0x00, 0x00, 0x00];
             // Set locally administered bit (0x02) and clear multicast bit (0x01)
             mac[0] = 0x52; // Already has locally administered bit set
@@ -501,12 +501,12 @@ mod wasm {
         pub fn is_registered(&self) -> bool {
             self.state.borrow().registered
         }
-        
+
         /// Check if connected
         pub fn is_connected(&self) -> bool {
             self.state.borrow().connection_state == ConnectionState::Connected
         }
-        
+
         /// Start the connection process
         fn start_connection(&self) {
             let url = self.url.clone();
@@ -515,7 +515,7 @@ mod wasm {
             let state = self.state.clone();
             let transport_rc = self.transport.clone();
             let writer_rc = self.writer.clone();
-            
+
             // Increment generation and mark as connecting
             {
                 let mut s = state.borrow_mut();
@@ -528,16 +528,19 @@ mod wasm {
                 }
             }
             let generation = state.borrow().connection_generation;
-            
-            console_log(&format!("[WebTransport] Starting connection (gen={}) to {}", generation, url));
-            
+
+            console_log(&format!(
+                "[WebTransport] Starting connection (gen={}) to {}",
+                generation, url
+            ));
+
             wasm_bindgen_futures::spawn_local(async move {
                 // Check if this connection attempt is still valid
                 if state.borrow().connection_generation != generation {
                     console_log("[WebTransport] Connection attempt superseded, aborting");
                     return;
                 }
-                
+
                 let options = WebTransportOptions::new();
 
                 if let Some(hash_hex) = &cert_hash {
@@ -562,11 +565,21 @@ mod wasm {
                 let transport = match WebTransport::new_with_options(&url, &options) {
                     Ok(t) => t,
                     Err(e) => {
-                        console_error(&format!("[WebTransport] Failed to create transport: {:?}", e));
+                        console_error(&format!(
+                            "[WebTransport] Failed to create transport: {:?}",
+                            e
+                        ));
                         state.borrow_mut().connection_state = ConnectionState::Disconnected;
                         // Schedule reconnection
-                        schedule_reconnect(state.clone(), transport_rc.clone(), writer_rc.clone(), 
-                                         url.clone(), cert_hash.clone(), mac, 5000);
+                        schedule_reconnect(
+                            state.clone(),
+                            transport_rc.clone(),
+                            writer_rc.clone(),
+                            url.clone(),
+                            cert_hash.clone(),
+                            mac,
+                            5000,
+                        );
                         return;
                     }
                 };
@@ -578,14 +591,21 @@ mod wasm {
                     Err(e) => {
                         console_error(&format!("[WebTransport] Failed to get writer: {:?}", e));
                         state.borrow_mut().connection_state = ConnectionState::Disconnected;
-                        schedule_reconnect(state.clone(), transport_rc.clone(), writer_rc.clone(),
-                                         url.clone(), cert_hash.clone(), mac, 5000);
+                        schedule_reconnect(
+                            state.clone(),
+                            transport_rc.clone(),
+                            writer_rc.clone(),
+                            url.clone(),
+                            cert_hash.clone(),
+                            mac,
+                            5000,
+                        );
                         return;
                     }
                 };
 
                 let ready_promise = transport.ready();
-                
+
                 match JsFuture::from(ready_promise).await {
                     Ok(_) => {
                         // Check generation again
@@ -593,34 +613,41 @@ mod wasm {
                             console_log("[WebTransport] Connection superseded during handshake");
                             return;
                         }
-                        
+
                         console_log("[WebTransport] Connected successfully!");
-                        
+
                         // Send registration
                         let register_msg = make_register_message(&mac);
                         let array = Uint8Array::from(&register_msg[..]);
                         if let Err(e) = JsFuture::from(writer.write_with_chunk(&array)).await {
                             console_error(&format!("[WebTransport] Failed to register: {:?}", e));
                             state.borrow_mut().connection_state = ConnectionState::Disconnected;
-                            schedule_reconnect(state.clone(), transport_rc.clone(), writer_rc.clone(),
-                                             url.clone(), cert_hash.clone(), mac, 5000);
+                            schedule_reconnect(
+                                state.clone(),
+                                transport_rc.clone(),
+                                writer_rc.clone(),
+                                url.clone(),
+                                cert_hash.clone(),
+                                mac,
+                                5000,
+                            );
                             return;
                         }
-                        
+
                         console_log(&format!(
                             "[WebTransport] Registration sent, MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
                             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
                         ));
-                        
+
                         // Store transport and writer
                         *transport_rc.borrow_mut() = Some(transport.clone());
                         *writer_rc.borrow_mut() = Some(writer.clone());
-                        
+
                         // Setup heartbeat with visibility-aware interval
                         let writer_hb = writer.clone();
                         let state_hb = state.clone();
                         let generation_hb = generation;
-                        
+
                         let heartbeat_closure = Closure::wrap(Box::new(move || {
                             // Only send if still same generation
                             if state_hb.borrow().connection_generation == generation_hb {
@@ -628,44 +655,54 @@ mod wasm {
                                 let array = Uint8Array::from(&heartbeat[..]);
                                 let _ = writer_hb.write_with_chunk(&array);
                             }
-                        }) as Box<dyn Fn()>);
-                        
-                        let interval_id = set_interval(&heartbeat_closure, (HEARTBEAT_INTERVAL_SECS * 1000) as i32);
+                        })
+                            as Box<dyn Fn()>);
+
+                        let interval_id = set_interval(
+                            &heartbeat_closure,
+                            (HEARTBEAT_INTERVAL_SECS * 1000) as i32,
+                        );
                         heartbeat_closure.forget();
                         state.borrow_mut().heartbeat_interval_id = Some(interval_id);
-                        
+
                         // Setup visibility change handler for immediate heartbeat on tab focus
                         setup_visibility_handler(writer.clone(), state.clone(), generation);
-                        
+
                         // Mark as connected
                         state.borrow_mut().connection_state = ConnectionState::Connected;
-                        
+
                         // Start reader loop
                         let readable = transport.datagrams().readable();
-                        let reader: ReadableStreamDefaultReader = readable.get_reader().unchecked_into();
-                        
+                        let reader: ReadableStreamDefaultReader =
+                            readable.get_reader().unchecked_into();
+
                         loop {
                             // Check if we should stop
                             if state.borrow().connection_generation != generation {
-                                console_log("[WebTransport] Reader loop: generation changed, stopping");
+                                console_log(
+                                    "[WebTransport] Reader loop: generation changed, stopping",
+                                );
                                 break;
                             }
-                            
+
                             match JsFuture::from(reader.read()).await {
                                 Ok(result) => {
-                                    let done = js_sys::Reflect::get(&result, &JsValue::from_str("done"))
-                                        .unwrap()
-                                        .as_bool()
-                                        .unwrap_or(true);
+                                    let done =
+                                        js_sys::Reflect::get(&result, &JsValue::from_str("done"))
+                                            .unwrap()
+                                            .as_bool()
+                                            .unwrap_or(true);
                                     if done {
                                         console_log("[WebTransport] Reader stream ended");
                                         break;
                                     }
-                                    
-                                    let value = js_sys::Reflect::get(&result, &JsValue::from_str("value")).unwrap();
+
+                                    let value =
+                                        js_sys::Reflect::get(&result, &JsValue::from_str("value"))
+                                            .unwrap();
                                     let array = Uint8Array::new(&value);
                                     let data = array.to_vec();
-                                    
+
                                     // Handle control messages
                                     if !data.is_empty() && data[0] == MSG_TYPE_CONTROL {
                                         if let Ok(json_str) = std::str::from_utf8(&data[1..]) {
@@ -681,11 +718,14 @@ mod wasm {
                                                     ));
                                                 }
                                             } else if json_str.contains("\"type\":\"Error\"") {
-                                                console_error(&format!("[WebTransport] Relay error: {}", json_str));
+                                                console_error(&format!(
+                                                    "[WebTransport] Relay error: {}",
+                                                    json_str
+                                                ));
                                             }
                                         }
                                     }
-                                    
+
                                     // Queue Ethernet frames
                                     if let Some(frame) = decode_message(&data) {
                                         state.borrow_mut().rx_queue.push_back(frame);
@@ -697,7 +737,7 @@ mod wasm {
                                 }
                             }
                         }
-                        
+
                         // Connection ended - cleanup and reconnect
                         console_log("[WebTransport] Connection lost, scheduling reconnection...");
                         {
@@ -712,17 +752,32 @@ mod wasm {
                         }
                         *transport_rc.borrow_mut() = None;
                         *writer_rc.borrow_mut() = None;
-                        
+
                         // Only reconnect if this is still the current generation
                         if state.borrow().connection_generation == generation {
-                            schedule_reconnect(state, transport_rc, writer_rc, url, cert_hash, mac, 3000);
+                            schedule_reconnect(
+                                state,
+                                transport_rc,
+                                writer_rc,
+                                url,
+                                cert_hash,
+                                mac,
+                                3000,
+                            );
                         }
                     }
                     Err(e) => {
                         console_error(&format!("[WebTransport] Failed to connect: {:?}", e));
                         state.borrow_mut().connection_state = ConnectionState::Disconnected;
-                        schedule_reconnect(state.clone(), transport_rc.clone(), writer_rc.clone(),
-                                         url.clone(), cert_hash.clone(), mac, 5000);
+                        schedule_reconnect(
+                            state.clone(),
+                            transport_rc.clone(),
+                            writer_rc.clone(),
+                            url.clone(),
+                            cert_hash.clone(),
+                            mac,
+                            5000,
+                        );
                     }
                 }
             });
@@ -733,22 +788,23 @@ mod wasm {
     fn console_log(msg: &str) {
         web_sys::console::log_1(&JsValue::from_str(msg));
     }
-    
+
     fn console_error(msg: &str) {
         web_sys::console::error_1(&JsValue::from_str(msg));
     }
-    
+
     /// Set up a JS interval and return its ID
     fn set_interval(closure: &Closure<dyn Fn()>, ms: i32) -> i32 {
         let global = js_sys::global();
         let set_interval = js_sys::Reflect::get(&global, &JsValue::from_str("setInterval"))
             .expect("setInterval should exist");
         let set_interval_fn: js_sys::Function = set_interval.unchecked_into();
-        let result = set_interval_fn.call2(&JsValue::NULL, closure.as_ref(), &JsValue::from(ms))
+        let result = set_interval_fn
+            .call2(&JsValue::NULL, closure.as_ref(), &JsValue::from(ms))
             .unwrap_or(JsValue::from(0));
         result.as_f64().unwrap_or(0.0) as i32
     }
-    
+
     /// Clear a JS interval
     fn clear_interval(id: i32) {
         let global = js_sys::global();
@@ -757,18 +813,19 @@ mod wasm {
             let _ = clear_fn.call1(&JsValue::NULL, &JsValue::from(id));
         }
     }
-    
+
     /// Set up a JS timeout and return its ID
     fn set_timeout(closure: &Closure<dyn FnMut()>, ms: i32) -> i32 {
         let global = js_sys::global();
         let set_timeout = js_sys::Reflect::get(&global, &JsValue::from_str("setTimeout"))
             .expect("setTimeout should exist");
         let set_timeout_fn: js_sys::Function = set_timeout.unchecked_into();
-        let result = set_timeout_fn.call2(&JsValue::NULL, closure.as_ref(), &JsValue::from(ms))
+        let result = set_timeout_fn
+            .call2(&JsValue::NULL, closure.as_ref(), &JsValue::from(ms))
             .unwrap_or(JsValue::from(0));
         result.as_f64().unwrap_or(0.0) as i32
     }
-    
+
     /// Schedule a reconnection attempt
     fn schedule_reconnect(
         state: Rc<RefCell<SharedState>>,
@@ -779,8 +836,11 @@ mod wasm {
         mac: [u8; 6],
         delay_ms: i32,
     ) {
-        console_log(&format!("[WebTransport] Scheduling reconnect in {}ms...", delay_ms));
-        
+        console_log(&format!(
+            "[WebTransport] Scheduling reconnect in {}ms...",
+            delay_ms
+        ));
+
         let closure = Closure::once(move || {
             // Create a temporary backend to trigger reconnection
             let backend = WebTransportBackend {
@@ -793,11 +853,11 @@ mod wasm {
             };
             backend.start_connection();
         });
-        
+
         set_timeout(&closure, delay_ms);
         closure.forget();
     }
-    
+
     /// Setup visibility change handler to send heartbeat when tab becomes visible
     fn setup_visibility_handler(
         writer: WritableStreamDefaultWriter,
@@ -821,13 +881,19 @@ mod wasm {
                 }
             }
         }) as Box<dyn Fn()>);
-        
+
         // Add event listener
         let global = js_sys::global();
         if let Ok(document) = js_sys::Reflect::get(&global, &JsValue::from_str("document")) {
-            if let Ok(add_listener) = js_sys::Reflect::get(&document, &JsValue::from_str("addEventListener")) {
+            if let Ok(add_listener) =
+                js_sys::Reflect::get(&document, &JsValue::from_str("addEventListener"))
+            {
                 let add_fn: js_sys::Function = add_listener.unchecked_into();
-                let _ = add_fn.call2(&document, &JsValue::from_str("visibilitychange"), closure.as_ref());
+                let _ = add_fn.call2(
+                    &document,
+                    &JsValue::from_str("visibilitychange"),
+                    closure.as_ref(),
+                );
             }
         }
         closure.forget();
@@ -835,7 +901,10 @@ mod wasm {
 
     impl NetworkBackend for WebTransportBackend {
         fn init(&mut self) -> Result<(), String> {
-            console_log(&format!("[WebTransport] Initializing connection to {}", self.url));
+            console_log(&format!(
+                "[WebTransport] Initializing connection to {}",
+                self.url
+            ));
             self.start_connection();
             Ok(())
         }
@@ -859,7 +928,7 @@ mod wasm {
         fn mac_address(&self) -> [u8; 6] {
             self.mac
         }
-        
+
         fn get_assigned_ip(&self) -> Option<[u8; 4]> {
             self.state.borrow().assigned_ip
         }

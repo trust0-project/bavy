@@ -8,12 +8,12 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{RwLock, broadcast, mpsc};
 
 use crate::peer::{PeerId, PeerManager};
 use crate::protocol::{
-    encode_data_frame, format_ip, format_mac, ControlMessage, DNS_SERVER, GATEWAY_IP, GATEWAY_MAC,
-    MSG_TYPE_CONTROL, MSG_TYPE_DATA, NETWORK_MASK,
+    ControlMessage, DNS_SERVER, GATEWAY_IP, GATEWAY_MAC, MSG_TYPE_CONTROL, MSG_TYPE_DATA,
+    NETWORK_MASK, encode_data_frame, format_ip, format_mac,
 };
 use crate::proxy::ExternalProxy;
 
@@ -140,7 +140,11 @@ impl Hub {
                 self.unregister_peer(from_peer).await;
             }
             Ok(msg) => {
-                tracing::debug!("Received control message from peer {}: {:?}", from_peer, msg);
+                tracing::debug!(
+                    "Received control message from peer {}: {:?}",
+                    from_peer,
+                    msg
+                );
             }
             Err(e) => {
                 tracing::warn!("Failed to decode control message: {}", e);
@@ -164,7 +168,8 @@ impl Hub {
         // Handle ARP for gateway
         if ethertype == 0x0806 && self.is_arp_request_for_gateway(ethernet_frame) {
             let reply = self.generate_arp_reply(ethernet_frame);
-            self.send_to_peer(from_peer, encode_data_frame(&reply)).await;
+            self.send_to_peer(from_peer, encode_data_frame(&reply))
+                .await;
             return;
         }
 
@@ -175,7 +180,8 @@ impl Hub {
             // Check if destination is gateway (ping to gateway)
             if dst_ip == GATEWAY_IP {
                 if let Some(reply) = self.handle_gateway_packet(ethernet_frame).await {
-                    self.send_to_peer(from_peer, encode_data_frame(&reply)).await;
+                    self.send_to_peer(from_peer, encode_data_frame(&reply))
+                        .await;
                 }
                 return;
             }
@@ -186,7 +192,8 @@ impl Hub {
                 drop(peers);
                 // Route to external proxy
                 if let Some(reply) = self.proxy.handle_external_packet(ethernet_frame).await {
-                    self.send_to_peer(from_peer, encode_data_frame(&reply)).await;
+                    self.send_to_peer(from_peer, encode_data_frame(&reply))
+                        .await;
                 }
                 return;
             }

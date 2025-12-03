@@ -40,7 +40,8 @@ pub const UART_OUTPUT_REGION_SIZE: usize = 4096;
 pub const UART_INPUT_REGION_SIZE: usize = 4096;
 
 /// Total header size before DRAM starts.
-pub const HEADER_SIZE: usize = CONTROL_REGION_SIZE + CLINT_REGION_SIZE + UART_OUTPUT_REGION_SIZE + UART_INPUT_REGION_SIZE;
+pub const HEADER_SIZE: usize =
+    CONTROL_REGION_SIZE + CLINT_REGION_SIZE + UART_OUTPUT_REGION_SIZE + UART_INPUT_REGION_SIZE;
 
 // ============================================================================
 // Shared UART Output Region Offsets
@@ -63,7 +64,8 @@ pub const UART_BUFFER_CAPACITY: usize = UART_OUTPUT_REGION_SIZE - UART_BUFFER_OF
 // ============================================================================
 
 /// Offset of the shared UART input region from start of SharedArrayBuffer.
-pub const UART_INPUT_REGION_OFFSET: usize = CONTROL_REGION_SIZE + CLINT_REGION_SIZE + UART_OUTPUT_REGION_SIZE;
+pub const UART_INPUT_REGION_OFFSET: usize =
+    CONTROL_REGION_SIZE + CLINT_REGION_SIZE + UART_OUTPUT_REGION_SIZE;
 
 /// UART input: write index (i32 index within UART input region)
 pub const UART_INPUT_WRITE_IDX: u32 = 0;
@@ -164,7 +166,7 @@ pub mod wasm {
         /// CLINT region byte offset
         clint_base: usize,
     }
-    
+
     // SAFETY: SharedClint uses SharedArrayBuffer and JavaScript Atomics for
     // thread-safe access. In WASM, each worker has its own isolated memory space,
     // so the Int32Array view is not actually shared between Rust threads.
@@ -512,7 +514,7 @@ pub mod wasm {
 
             write_idx != read_idx
         }
-        
+
         /// Write multiple bytes to the shared UART output buffer.
         /// This is more efficient than calling write_byte repeatedly as it
         /// reduces atomic operations (only one index read/write per batch).
@@ -521,80 +523,82 @@ pub mod wasm {
             if bytes.is_empty() {
                 return 0;
             }
-            
+
             let write_idx_slot = self.uart_i32_index(UART_WRITE_IDX);
             let read_idx_slot = self.uart_i32_index(UART_READ_IDX);
-            
+
             // Single atomic read of indices at start
             let write_idx = Atomics::load(&self.view, write_idx_slot).unwrap_or(0) as u32;
             let read_idx = Atomics::load(&self.view, read_idx_slot).unwrap_or(0) as u32;
-            
+
             let capacity = UART_BUFFER_CAPACITY as u32;
-            
+
             // Calculate available space (ring buffer)
             let available = if write_idx >= read_idx {
                 capacity - (write_idx - read_idx) - 1
             } else {
                 read_idx - write_idx - 1
             };
-            
+
             // Write as many bytes as we can
             let to_write = (bytes.len() as u32).min(available) as usize;
             if to_write == 0 {
                 return 0;
             }
-            
+
             let mut current_write = write_idx;
             for &byte in &bytes[..to_write] {
-                let byte_offset = UART_OUTPUT_REGION_OFFSET + UART_BUFFER_OFFSET + (current_write as usize);
+                let byte_offset =
+                    UART_OUTPUT_REGION_OFFSET + UART_BUFFER_OFFSET + (current_write as usize);
                 self.byte_view.set_index(byte_offset as u32, byte);
                 current_write = (current_write + 1) % capacity;
             }
-            
+
             // Single atomic write to update the write index
             let _ = Atomics::store(&self.view, write_idx_slot, current_write as i32);
-            
+
             to_write
         }
-        
+
         /// Read multiple bytes from the shared UART output buffer.
         /// This is more efficient than calling read_byte repeatedly.
         /// Returns a vector of bytes read.
         pub fn read_bytes(&self, max_count: usize) -> Vec<u8> {
             let write_idx_slot = self.uart_i32_index(UART_WRITE_IDX);
             let read_idx_slot = self.uart_i32_index(UART_READ_IDX);
-            
+
             // Single atomic read of indices at start
             let write_idx = Atomics::load(&self.view, write_idx_slot).unwrap_or(0) as u32;
             let read_idx = Atomics::load(&self.view, read_idx_slot).unwrap_or(0) as u32;
-            
+
             // Check if buffer is empty
             if write_idx == read_idx {
                 return Vec::new();
             }
-            
+
             let capacity = UART_BUFFER_CAPACITY as u32;
-            
+
             // Calculate available bytes
             let available = if write_idx >= read_idx {
                 write_idx - read_idx
             } else {
                 capacity - read_idx + write_idx
             } as usize;
-            
+
             let to_read = available.min(max_count);
             let mut bytes = Vec::with_capacity(to_read);
-            
+
             let mut current_read = read_idx;
             for _ in 0..to_read {
-                let byte_offset = UART_OUTPUT_REGION_OFFSET + UART_BUFFER_OFFSET + (current_read as usize);
+                let byte_offset =
+                    UART_OUTPUT_REGION_OFFSET + UART_BUFFER_OFFSET + (current_read as usize);
                 bytes.push(self.byte_view.get_index(byte_offset as u32));
                 current_read = (current_read + 1) % capacity;
             }
-            
+
             // Single atomic write to update the read index
             let _ = Atomics::store(&self.view, read_idx_slot, current_read as i32);
-            
+
             bytes
         }
     }
@@ -603,7 +607,7 @@ pub mod wasm {
     ///
     /// This implements a lock-free single-producer-single-consumer ring buffer
     /// using atomics. Main thread (hart 0) writes to it, workers read from it.
-    /// 
+    ///
     /// This allows workers to receive keyboard input that the browser sends
     /// to the main thread.
     pub struct SharedUartInput {
@@ -650,7 +654,8 @@ pub mod wasm {
             }
 
             // Write the byte
-            let byte_offset = UART_INPUT_REGION_OFFSET + UART_INPUT_BUFFER_OFFSET + (write_idx as usize);
+            let byte_offset =
+                UART_INPUT_REGION_OFFSET + UART_INPUT_BUFFER_OFFSET + (write_idx as usize);
             self.byte_view.set_index(byte_offset as u32, byte);
 
             // Update write index atomically
@@ -674,7 +679,8 @@ pub mod wasm {
             }
 
             // Read the byte
-            let byte_offset = UART_INPUT_REGION_OFFSET + UART_INPUT_BUFFER_OFFSET + (read_idx as usize);
+            let byte_offset =
+                UART_INPUT_REGION_OFFSET + UART_INPUT_BUFFER_OFFSET + (read_idx as usize);
             let byte = self.byte_view.get_index(byte_offset as u32);
 
             // Update read index atomically
@@ -695,7 +701,7 @@ pub mod wasm {
 
             write_idx != read_idx
         }
-        
+
         /// Write multiple bytes to the shared UART input buffer.
         /// This is more efficient than calling write_byte repeatedly.
         /// Returns the number of bytes successfully written.
@@ -703,71 +709,73 @@ pub mod wasm {
             if bytes.is_empty() {
                 return 0;
             }
-            
+
             let write_idx_slot = self.uart_i32_index(UART_INPUT_WRITE_IDX);
             let read_idx_slot = self.uart_i32_index(UART_INPUT_READ_IDX);
-            
+
             let write_idx = Atomics::load(&self.view, write_idx_slot).unwrap_or(0) as u32;
             let read_idx = Atomics::load(&self.view, read_idx_slot).unwrap_or(0) as u32;
-            
+
             let capacity = UART_INPUT_BUFFER_CAPACITY as u32;
-            
+
             let available = if write_idx >= read_idx {
                 capacity - (write_idx - read_idx) - 1
             } else {
                 read_idx - write_idx - 1
             };
-            
+
             let to_write = (bytes.len() as u32).min(available) as usize;
             if to_write == 0 {
                 return 0;
             }
-            
+
             let mut current_write = write_idx;
             for &byte in &bytes[..to_write] {
-                let byte_offset = UART_INPUT_REGION_OFFSET + UART_INPUT_BUFFER_OFFSET + (current_write as usize);
+                let byte_offset =
+                    UART_INPUT_REGION_OFFSET + UART_INPUT_BUFFER_OFFSET + (current_write as usize);
                 self.byte_view.set_index(byte_offset as u32, byte);
                 current_write = (current_write + 1) % capacity;
             }
-            
+
             let _ = Atomics::store(&self.view, write_idx_slot, current_write as i32);
-            
+
             to_write
         }
-        
+
         /// Read multiple bytes from the shared UART input buffer.
         /// This is more efficient than calling read_byte repeatedly.
         pub fn read_bytes(&self, max_count: usize) -> Vec<u8> {
             let write_idx_slot = self.uart_i32_index(UART_INPUT_WRITE_IDX);
             let read_idx_slot = self.uart_i32_index(UART_INPUT_READ_IDX);
-            
+
             let write_idx = Atomics::load(&self.view, write_idx_slot).unwrap_or(0) as u32;
             let read_idx = Atomics::load(&self.view, read_idx_slot).unwrap_or(0) as u32;
-            
+
             if write_idx == read_idx {
                 return Vec::new();
             }
-            
+
             let capacity = UART_INPUT_BUFFER_CAPACITY as u32;
-            
+
             let available = if write_idx >= read_idx {
                 write_idx - read_idx
             } else {
                 capacity - read_idx + write_idx
             } as usize;
-            
+
             let to_read = available.min(max_count);
             let mut bytes = Vec::with_capacity(to_read);
-            
+
             let mut current_read = read_idx;
             for _ in 0..to_read {
-                let byte_offset = UART_INPUT_REGION_OFFSET + UART_INPUT_BUFFER_OFFSET + (current_read as usize);
+                let byte_offset =
+                    UART_INPUT_REGION_OFFSET + UART_INPUT_BUFFER_OFFSET + (current_read as usize);
                 bytes.push(self.byte_view.get_index(byte_offset as u32));
                 current_read = (current_read + 1) % capacity;
             }
-            
+
             let _ = Atomics::store(&self.view, read_idx_slot, current_read as i32);
-            
+
             bytes
         }
     }
@@ -831,19 +839,19 @@ mod tests {
     fn test_offsets() {
         // Control region is 4KB
         assert_eq!(CONTROL_REGION_SIZE, 4096);
-        
+
         // CLINT region is 64KB
         assert_eq!(CLINT_REGION_SIZE, 0x10000);
-        
+
         // UART output region is 4KB
         assert_eq!(UART_OUTPUT_REGION_SIZE, 4096);
-        
+
         // UART input region is 4KB
         assert_eq!(UART_INPUT_REGION_SIZE, 4096);
-        
+
         // Header is control + CLINT + UART output + UART input
         assert_eq!(HEADER_SIZE, 4096 + 0x10000 + 4096 + 4096);
-        
+
         // DRAM starts after header
         assert_eq!(dram_offset(), HEADER_SIZE);
     }
@@ -852,13 +860,13 @@ mod tests {
     fn test_clint_offsets() {
         // MSIP for hart 0 is at CLINT base
         assert_eq!(msip_offset(0), CONTROL_REGION_SIZE + 0);
-        
+
         // MSIP for hart 1 is 4 bytes later
         assert_eq!(msip_offset(1), CONTROL_REGION_SIZE + 4);
-        
+
         // MTIMECMP for hart 0
         assert_eq!(mtimecmp_offset(0), CONTROL_REGION_SIZE + 0x4000);
-        
+
         // MTIME
         assert_eq!(mtime_offset(), CONTROL_REGION_SIZE + 0xBFF8);
     }
@@ -870,4 +878,3 @@ mod tests {
         assert_eq!(total, HEADER_SIZE + dram_size);
     }
 }
-

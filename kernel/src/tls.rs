@@ -23,7 +23,7 @@ use alloc::vec::Vec;
 use embedded_io::{ErrorType, Read, Write};
 
 // Re-export embedded-tls types we use
-pub use embedded_tls::blocking::{Aes128GcmSha256, TlsConfig, TlsContext, NoVerify, TlsConnection};
+pub use embedded_tls::blocking::{Aes128GcmSha256, NoVerify, TlsConfig, TlsConnection, TlsContext};
 pub use embedded_tls::TlsError as EmbeddedTlsError;
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -31,7 +31,7 @@ pub use embedded_tls::TlsError as EmbeddedTlsError;
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Simple RNG using CLINT timer as entropy source.
-/// 
+///
 /// Note: This is NOT cryptographically secure in a production sense,
 /// but provides functional randomness for TLS handshakes in our
 /// bare-metal environment. For production use, consider adding
@@ -53,7 +53,7 @@ impl SimpleRng {
         }
         Self { state }
     }
-    
+
     fn next_u64(&mut self) -> u64 {
         // xorshift128+ style PRNG for better quality
         let mut s = self.state;
@@ -75,11 +75,11 @@ impl rand_core::RngCore for SimpleRng {
     fn next_u32(&mut self) -> u32 {
         self.next_u64() as u32
     }
-    
+
     fn next_u64(&mut self) -> u64 {
         SimpleRng::next_u64(self)
     }
-    
+
     fn fill_bytes(&mut self, dest: &mut [u8]) {
         let mut i = 0;
         while i < dest.len() {
@@ -90,7 +90,7 @@ impl rand_core::RngCore for SimpleRng {
             i += to_copy;
         }
     }
-    
+
     fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
         self.fill_bytes(dest);
         Ok(())
@@ -183,11 +183,7 @@ pub struct BlockingTcpSocket<'a> {
 
 impl<'a> BlockingTcpSocket<'a> {
     /// Create a new blocking TCP socket wrapper.
-    pub fn new(
-        net: &'a mut crate::net::NetState,
-        timeout_ms: i64,
-        get_time: fn() -> i64,
-    ) -> Self {
+    pub fn new(net: &'a mut crate::net::NetState, timeout_ms: i64, get_time: fn() -> i64) -> Self {
         let start_time = get_time();
         Self {
             net,
@@ -196,37 +192,38 @@ impl<'a> BlockingTcpSocket<'a> {
             start_time,
         }
     }
-    
+
     /// Reset the timeout timer (call after successful operations).
     pub fn reset_timeout(&mut self) {
         self.start_time = (self.get_time)();
     }
-    
+
     /// Check if we've exceeded the timeout.
     fn check_timeout(&self) -> bool {
         let now = (self.get_time)();
         now - self.start_time > self.timeout_ms
     }
-    
+
     /// Poll the network stack.
     fn poll_network(&mut self) {
         let now = (self.get_time)();
         self.net.poll(now);
     }
-    
+
     /// Small delay to avoid busy-waiting.
     fn small_delay(&self) {
         for _ in 0..1000 {
             core::hint::spin_loop();
         }
     }
-    
+
     /// Connect to a remote host (TCP only, no TLS).
     pub fn connect(&mut self, ip: smoltcp::wire::Ipv4Address, port: u16) -> Result<(), TlsError> {
         let now = (self.get_time)();
-        self.net.tcp_connect(ip, port, now)
+        self.net
+            .tcp_connect(ip, port, now)
             .map_err(|_| TlsError::ConnectionError)?;
-        
+
         // Wait for TCP connection to establish
         self.reset_timeout();
         loop {
@@ -234,28 +231,28 @@ impl<'a> BlockingTcpSocket<'a> {
                 self.net.tcp_abort();
                 return Err(TlsError::Timeout);
             }
-            
+
             self.poll_network();
-            
+
             if self.net.tcp_is_connected() {
                 self.reset_timeout();
                 return Ok(());
             }
-            
+
             if self.net.tcp_connection_failed() {
                 return Err(TlsError::ConnectionError);
             }
-            
+
             self.small_delay();
         }
     }
-    
+
     /// Close the TCP connection.
     pub fn close(&mut self) {
         let now = (self.get_time)();
         self.net.tcp_close(now);
     }
-    
+
     /// Abort the TCP connection immediately.
     pub fn abort(&mut self) {
         self.net.tcp_abort();
@@ -280,10 +277,10 @@ impl Read for BlockingTcpSocket<'_> {
                 crate::uart::write_line(self.net.tcp_state());
                 return Err(TlsError::Timeout);
             }
-            
+
             self.poll_network();
             poll_count += 1;
-            
+
             let now = (self.get_time)();
             match self.net.tcp_recv(buf, now) {
                 Ok(n) if n > 0 => {
@@ -332,7 +329,7 @@ fn format_u32(mut n: u32, buf: &mut [u8]) -> usize {
 impl Write for BlockingTcpSocket<'_> {
     fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
         let mut total_sent = 0;
-        
+
         while total_sent < buf.len() {
             if self.check_timeout() {
                 return if total_sent > 0 {
@@ -341,10 +338,10 @@ impl Write for BlockingTcpSocket<'_> {
                     Err(TlsError::Timeout)
                 };
             }
-            
+
             self.poll_network();
             let now = (self.get_time)();
-            
+
             match self.net.tcp_send(&buf[total_sent..], now) {
                 Ok(n) if n > 0 => {
                     total_sent += n;
@@ -363,10 +360,10 @@ impl Write for BlockingTcpSocket<'_> {
                 }
             }
         }
-        
+
         Ok(total_sent)
     }
-    
+
     fn flush(&mut self) -> Result<(), Self::Error> {
         self.poll_network();
         Ok(())
@@ -416,48 +413,43 @@ pub fn https_request(
     let mut read_buffer = alloc::vec![0u8; TLS_READ_BUFFER_SIZE];
     let mut write_buffer = alloc::vec![0u8; TLS_WRITE_BUFFER_SIZE];
     let mut rng = SimpleRng::new();
-    
+
     // Create blocking TCP socket and connect
     crate::uart::write_str("TLS: Connecting to port ");
     let mut port_buf = [0u8; 8];
     let port_len = format_u16(port, &mut port_buf);
     crate::uart::write_line(core::str::from_utf8(&port_buf[..port_len]).unwrap_or("?"));
-    
+
     let mut socket = BlockingTcpSocket::new(net, timeout_ms, get_time);
     socket.connect(ip, port).map_err(|e| {
         crate::uart::write_line("TLS: TCP connection failed");
         e
     })?;
-    
+
     crate::uart::write_line("TLS: TCP connected");
-    
+
     // Create TLS config with SNI
-    let config: TlsConfig<'_, Aes128GcmSha256> = TlsConfig::new()
-        .with_server_name(hostname);
-    
+    let config: TlsConfig<'_, Aes128GcmSha256> = TlsConfig::new().with_server_name(hostname);
+
     // Create TLS connection wrapping our TCP socket
-    let mut tls: TlsConnection<'_, BlockingTcpSocket<'_>, Aes128GcmSha256> = 
-        TlsConnection::new(
-            socket,
-            &mut read_buffer,
-            &mut write_buffer,
-        );
-    
+    let mut tls: TlsConnection<'_, BlockingTcpSocket<'_>, Aes128GcmSha256> =
+        TlsConnection::new(socket, &mut read_buffer, &mut write_buffer);
+
     // Create context with config and RNG
     let context = TlsContext::new(&config, &mut rng);
-    
+
     // Perform TLS 1.3 handshake
     crate::uart::write_str("TLS: Starting handshake with ");
     crate::uart::write_line(hostname);
-    
+
     tls.open::<_, NoVerify>(context).map_err(|e| {
         crate::uart::write_str("TLS: Handshake failed - ");
         log_tls_error(&e);
         TlsError::from(e)
     })?;
-    
+
     crate::uart::write_line("TLS: Handshake complete");
-    
+
     // Send HTTP request over TLS
     let mut sent = 0;
     while sent < request_bytes.len() {
@@ -470,17 +462,17 @@ pub fn https_request(
             }
         }
     }
-    
+
     // Flush to ensure all data is sent
     if let Err(e) = tls.flush() {
         let _ = tls.close();
         return Err(TlsError::from(e));
     }
-    
+
     // Receive HTTP response over TLS
     let mut response_buf = Vec::with_capacity(8192);
     let mut recv_buf = [0u8; 1024];
-    
+
     loop {
         match tls.read(&mut recv_buf) {
             Ok(0) => {
@@ -489,7 +481,7 @@ pub fn https_request(
             }
             Ok(n) => {
                 response_buf.extend_from_slice(&recv_buf[..n]);
-                
+
                 // Check if we've received a complete HTTP response
                 if is_http_response_complete(&response_buf) {
                     break;
@@ -505,10 +497,10 @@ pub fn https_request(
             }
         }
     }
-    
+
     // Close TLS connection cleanly
     let _ = tls.close();
-    
+
     Ok(response_buf)
 }
 
@@ -519,9 +511,9 @@ fn is_http_response_complete(data: &[u8]) -> bool {
         Some(pos) => pos,
         None => return false,
     };
-    
+
     let body_start = header_end + 4;
-    
+
     // Try to parse Content-Length
     if let Ok(headers_str) = core::str::from_utf8(&data[..header_end]) {
         for line in headers_str.lines() {
@@ -541,7 +533,7 @@ fn is_http_response_complete(data: &[u8]) -> bool {
             }
         }
     }
-    
+
     // No Content-Length header, assume complete if we have headers + some body
     data.len() > body_start
 }
@@ -549,8 +541,8 @@ fn is_http_response_complete(data: &[u8]) -> bool {
 /// Find the end of HTTP headers (double CRLF).
 fn find_header_end(data: &[u8]) -> Option<usize> {
     for i in 0..data.len().saturating_sub(3) {
-        if data[i] == b'\r' && data[i + 1] == b'\n' 
-           && data[i + 2] == b'\r' && data[i + 3] == b'\n' {
+        if data[i] == b'\r' && data[i + 1] == b'\n' && data[i + 2] == b'\r' && data[i + 3] == b'\n'
+        {
             return Some(i);
         }
     }
@@ -573,12 +565,20 @@ fn log_tls_error(e: &EmbeddedTlsError) {
         }
         EmbeddedTlsError::InvalidCertificate => crate::uart::write_line("Invalid certificate"),
         EmbeddedTlsError::InvalidSignature => crate::uart::write_line("Invalid signature"),
-        EmbeddedTlsError::InvalidHandshake => crate::uart::write_line("Invalid handshake (server may not support TLS 1.3)"),
+        EmbeddedTlsError::InvalidHandshake => {
+            crate::uart::write_line("Invalid handshake (server may not support TLS 1.3)")
+        }
         EmbeddedTlsError::InvalidRecord => crate::uart::write_line("Invalid record"),
-        EmbeddedTlsError::InvalidSupportedVersions => crate::uart::write_line("Invalid supported versions (server may not support TLS 1.3)"),
-        EmbeddedTlsError::ConnectionClosed => crate::uart::write_line("Connection closed by server"),
+        EmbeddedTlsError::InvalidSupportedVersions => {
+            crate::uart::write_line("Invalid supported versions (server may not support TLS 1.3)")
+        }
+        EmbeddedTlsError::ConnectionClosed => {
+            crate::uart::write_line("Connection closed by server")
+        }
         EmbeddedTlsError::IoError => crate::uart::write_line("I/O error"),
-        EmbeddedTlsError::DecodeError => crate::uart::write_line("Decode error (incompatible TLS version?)"),
+        EmbeddedTlsError::DecodeError => {
+            crate::uart::write_line("Decode error (incompatible TLS version?)")
+        }
         EmbeddedTlsError::Io(k) => {
             crate::uart::write_str("I/O: ");
             crate::uart::write_line(match k {
@@ -642,10 +642,20 @@ pub fn https_get(
          Accept: */*\r\n\
          Connection: close\r\n\
          \r\n",
-        path, hostname, env!("CARGO_PKG_VERSION")
+        path,
+        hostname,
+        env!("CARGO_PKG_VERSION")
     );
-    
-    https_request(net, ip, port, hostname, request.as_bytes(), timeout_ms, get_time)
+
+    https_request(
+        net,
+        ip,
+        port,
+        hostname,
+        request.as_bytes(),
+        timeout_ms,
+        get_time,
+    )
 }
 
 /// Resolve hostname and perform HTTPS GET request.
@@ -663,16 +673,17 @@ pub fn https_get_url(
     if let Some(ip) = crate::net::parse_ipv4(hostname.as_bytes()) {
         return https_get(net, hostname, ip, port, path, timeout_ms, get_time);
     }
-    
+
     // Resolve via DNS
     let ip = crate::dns::resolve(
-        net, 
-        hostname.as_bytes(), 
-        crate::net::DNS_SERVER, 
-        timeout_ms, 
-        get_time
-    ).ok_or(TlsError::DnsError)?;
-    
+        net,
+        hostname.as_bytes(),
+        crate::net::DNS_SERVER,
+        timeout_ms,
+        get_time,
+    )
+    .ok_or(TlsError::DnsError)?;
+
     https_get(net, hostname, ip, port, path, timeout_ms, get_time)
 }
 
@@ -732,4 +743,3 @@ pub fn format_u16(mut n: u16, buf: &mut [u8]) -> usize {
     }
     i
 }
-

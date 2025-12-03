@@ -1,14 +1,14 @@
-use crate::block::{Block, BlockCompiler, CompileResult, MAX_BLOCK_SIZE};
-use crate::block_cache::BlockCache;
 use crate::bus::Bus;
-use crate::clint::{CLINT_BASE, MTIME_OFFSET};
+use crate::devices::clint::{CLINT_BASE, MTIME_OFFSET};
 use crate::csr::{
     Mode, CSR_MCAUSE, CSR_MEPC, CSR_MISA, CSR_MSTATUS, CSR_MTVEC, CSR_MTVAL, CSR_MIDELEG,
     CSR_MIE, CSR_MIP, CSR_SATP, CSR_MEDELEG, CSR_STVEC, CSR_SEPC, CSR_SCAUSE, CSR_STVAL, CSR_SIE,
     CSR_SSTATUS, CSR_SIP, CSR_TIME, CSR_MENVCFG, CSR_STIMECMP, CSR_MHARTID,
 };
-use crate::decoder::{self, Op, Register};
-use crate::microop::MicroOp;
+use crate::engine::block::{Block, BlockCompiler, CompileResult, MAX_BLOCK_SIZE};
+use crate::engine::cache::BlockCache;
+use crate::engine::decoder::{self, Op, Register};
+use crate::engine::microop::MicroOp;
 use crate::mmu::{self, AccessType as MmuAccessType, Tlb};
 use crate::Trap;
 use std::collections::HashMap;

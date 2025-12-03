@@ -2,11 +2,11 @@
 #[cfg(target_arch = "wasm32")]
 use js_sys::{Atomics, DataView, Int32Array, SharedArrayBuffer, Uint8Array};
 
-use thiserror::Error;
 #[cfg(not(target_arch = "wasm32"))]
 use std::cell::UnsafeCell;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use thiserror::Error;
 
 /// Base physical address of DRAM as seen by devices that work directly with
 /// physical addresses (VirtIO, etc.).
@@ -42,7 +42,7 @@ pub enum MemoryError {
 /// `DRAM_BASE` and subtract it via a helper (see `virtio.rs`).
 ///
 /// # Safety
-/// 
+///
 /// Native: The RISC-V weak memory model permits data races on regular loads/stores.
 /// Only atomic operations (AMO, LR/SC) require synchronization, which is handled
 /// by the CPU emulation. This matches how real hardware works.
@@ -104,7 +104,7 @@ impl Dram {
     }
 
     /// Get direct pointer to memory for maximum performance.
-    /// 
+    ///
     /// # Safety
     /// Caller must ensure proper synchronization for atomic operations.
     #[inline(always)]
@@ -119,11 +119,7 @@ impl Dram {
     pub fn offset(&self, addr: u64) -> Option<usize> {
         // Use wrapping_sub to avoid branch on underflow check
         let off = addr.wrapping_sub(self.base) as usize;
-        if off < self.size {
-            Some(off)
-        } else {
-            None
-        }
+        if off < self.size { Some(off) } else { None }
     }
 
     /// Load data into DRAM at the given offset.
@@ -152,9 +148,7 @@ impl Dram {
             return Err(MemoryError::OutOfBounds(offset));
         }
         // SAFETY: Bounds checked, lock-free read is safe for RISC-V memory model
-        unsafe {
-            Ok(*self.mem_ptr().add(off))
-        }
+        unsafe { Ok(*self.mem_ptr().add(off)) }
     }
 
     #[inline(always)]
@@ -306,9 +300,7 @@ impl Dram {
     /// Get a clone of all DRAM contents (for snapshots).
     pub fn get_data(&self) -> Vec<u8> {
         // SAFETY: Clone is atomic enough for snapshots
-        unsafe {
-            (*self.data.get()).clone()
-        }
+        unsafe { (*self.data.get()).clone() }
     }
 
     /// Replace all DRAM contents (for snapshot restore).
@@ -339,7 +331,15 @@ impl Dram {
         let atomic_view = Int32Array::new(&buffer);
         // Zero-initialize
         view.fill(0, 0, size as u32);
-        Self { base, buffer, view, data_view, atomic_view, byte_offset: 0, dram_size: size }
+        Self {
+            base,
+            buffer,
+            view,
+            data_view,
+            atomic_view,
+            byte_offset: 0,
+            dram_size: size,
+        }
     }
 
     /// Create DRAM from existing SharedArrayBuffer with a byte offset.
@@ -353,21 +353,29 @@ impl Dram {
     pub fn from_shared(base: u64, buffer: SharedArrayBuffer, byte_offset: usize) -> Self {
         let total_size = buffer.byte_length() as usize;
         let dram_size = total_size.saturating_sub(byte_offset);
-        
+
         // Create views with byte offset into the shared buffer
         // This is the key fix: we use the SAME buffer with an offset, not a sliced copy
         let view = Uint8Array::new_with_byte_offset_and_length(
-            &buffer, 
-            byte_offset as u32, 
-            dram_size as u32
+            &buffer,
+            byte_offset as u32,
+            dram_size as u32,
         );
         let data_view = DataView::new_with_shared_array_buffer(&buffer, byte_offset, dram_size);
-        
+
         // Int32Array view for atomic operations (covers entire buffer including headers)
         // The index conversion must account for byte_offset when doing atomic ops
         let atomic_view = Int32Array::new(&buffer);
-        
-        Self { base, buffer, view, data_view, atomic_view, byte_offset, dram_size }
+
+        Self {
+            base,
+            buffer,
+            view,
+            data_view,
+            atomic_view,
+            byte_offset,
+            dram_size,
+        }
     }
 
     /// Get the underlying SharedArrayBuffer (for passing to workers).
@@ -385,11 +393,7 @@ impl Dram {
     #[inline(always)]
     pub fn offset(&self, addr: u64) -> Option<usize> {
         let off = addr.wrapping_sub(self.base) as usize;
-        if off < self.size() {
-            Some(off)
-        } else {
-            None
-        }
+        if off < self.size() { Some(off) } else { None }
     }
 
     // ========== READ METHODS (DataView for typed access) ==========
@@ -702,8 +706,9 @@ impl Dram {
             return Err(MemoryError::OutOfBounds(offset));
         }
         let idx = self.atomic_index(off);
-        let old = Atomics::compare_exchange(&self.atomic_view, idx, expected as i32, new_value as i32)
-            .unwrap_or(0);
+        let old =
+            Atomics::compare_exchange(&self.atomic_view, idx, expected as i32, new_value as i32)
+                .unwrap_or(0);
         let success = old as u32 == expected;
         Ok((success, old as u32))
     }
@@ -763,11 +768,12 @@ impl Dram {
         // This isn't perfectly atomic for 64-bit but works for common patterns
         let idx_lo = self.atomic_index(off);
         let idx_hi = self.atomic_index(off + 4);
-        
+
         // Read current values
         let old_lo = Atomics::exchange(&self.atomic_view, idx_lo, value as i32).unwrap_or(0) as u32;
-        let old_hi = Atomics::exchange(&self.atomic_view, idx_hi, (value >> 32) as i32).unwrap_or(0) as u32;
-        
+        let old_hi =
+            Atomics::exchange(&self.atomic_view, idx_hi, (value >> 32) as i32).unwrap_or(0) as u32;
+
         Ok((old_lo as u64) | ((old_hi as u64) << 32))
     }
 
@@ -786,7 +792,8 @@ impl Dram {
             let old = self.atomic_load_64(offset)?;
             let new_val = old.wrapping_add(value);
             // Try to CAS the low word
-            let (success, _) = self.atomic_compare_exchange_32(offset, old as u32, new_val as u32)?;
+            let (success, _) =
+                self.atomic_compare_exchange_32(offset, old as u32, new_val as u32)?;
             if success {
                 // Also update high word (not perfectly atomic but close enough)
                 self.atomic_store_32(offset + 4, (new_val >> 32) as u32)?;
@@ -806,7 +813,8 @@ impl Dram {
         loop {
             let old = self.atomic_load_64(offset)?;
             let new_val = old & value;
-            let (success, _) = self.atomic_compare_exchange_32(offset, old as u32, new_val as u32)?;
+            let (success, _) =
+                self.atomic_compare_exchange_32(offset, old as u32, new_val as u32)?;
             if success {
                 self.atomic_store_32(offset + 4, (new_val >> 32) as u32)?;
                 return Ok(old);
@@ -824,7 +832,8 @@ impl Dram {
         loop {
             let old = self.atomic_load_64(offset)?;
             let new_val = old | value;
-            let (success, _) = self.atomic_compare_exchange_32(offset, old as u32, new_val as u32)?;
+            let (success, _) =
+                self.atomic_compare_exchange_32(offset, old as u32, new_val as u32)?;
             if success {
                 self.atomic_store_32(offset + 4, (new_val >> 32) as u32)?;
                 return Ok(old);
@@ -842,7 +851,8 @@ impl Dram {
         loop {
             let old = self.atomic_load_64(offset)?;
             let new_val = old ^ value;
-            let (success, _) = self.atomic_compare_exchange_32(offset, old as u32, new_val as u32)?;
+            let (success, _) =
+                self.atomic_compare_exchange_32(offset, old as u32, new_val as u32)?;
             if success {
                 self.atomic_store_32(offset + 4, (new_val >> 32) as u32)?;
                 return Ok(old);
@@ -867,7 +877,8 @@ impl Dram {
             return Err(MemoryError::OutOfBounds(offset));
         }
         // CAS on low word, then high word if low succeeds
-        let (lo_success, old_lo) = self.atomic_compare_exchange_32(offset, expected as u32, new_value as u32)?;
+        let (lo_success, old_lo) =
+            self.atomic_compare_exchange_32(offset, expected as u32, new_value as u32)?;
         if !lo_success {
             // Low word mismatch - get full old value
             let old_hi = self.atomic_load_32(offset + 4)? as u64;

@@ -3,7 +3,9 @@
 //! Manages a cache of compiled basic blocks keyed by PC. Uses generation-based
 //! invalidation for efficient TLB flush handling.
 
-use crate::block::Block;
+use super::block::Block;
+#[cfg(test)]
+use super::microop::MicroOp;
 use std::collections::HashMap;
 
 /// Block cache configuration.
@@ -140,11 +142,17 @@ impl Default for BlockCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::microop::MicroOp;
 
     fn make_test_block(pc: u64, generation: u32) -> Block {
         let mut block = Block::new(pc, pc, generation);
-        block.push(MicroOp::Addi { rd: 1, rs1: 0, imm: 1 }, 4);
+        block.push(
+            MicroOp::Addi {
+                rd: 1,
+                rs1: 0,
+                imm: 1,
+            },
+            4,
+        );
         block
     }
 
@@ -217,4 +225,3 @@ mod tests {
         assert!((hit_rate - 0.333).abs() < 0.01);
     }
 }
-

@@ -6,8 +6,8 @@
 //! - Viewed via dmesg command
 
 use alloc::collections::VecDeque;
-use alloc::string::String;
 use alloc::format;
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -57,7 +57,7 @@ impl LogLevel {
             LogLevel::Trace => "TRACE",
         }
     }
-    
+
     pub fn color(&self) -> &'static str {
         match self {
             LogLevel::Emergency | LogLevel::Alert | LogLevel::Critical => "\x1b[1;31m",
@@ -99,7 +99,7 @@ impl LogEntry {
             self.message
         )
     }
-    
+
     /// Format with colors for terminal
     pub fn format_colored(&self) -> String {
         format!(
@@ -139,7 +139,7 @@ impl LogBuffer {
             enabled: AtomicBool::new(true),
         }
     }
-    
+
     /// Create a new log buffer with console output disabled
     /// Useful during boot to avoid UART contention
     pub const fn new_console_disabled() -> Self {
@@ -151,21 +151,21 @@ impl LogBuffer {
             enabled: AtomicBool::new(true),
         }
     }
-    
+
     /// Log a message
     pub fn log(&self, level: LogLevel, subsystem: &str, message: &str) {
         if !self.enabled.load(Ordering::Relaxed) {
             return;
         }
-        
+
         // Check level filter
         if (level as usize) > self.level_filter.load(Ordering::Relaxed) {
             return;
         }
-        
+
         let timestamp = crate::get_time_ms() as u64;
         let hart_id = crate::get_hart_id();
-        
+
         // Truncate message if too long
         let message = if message.len() > MAX_MESSAGE_LEN {
             let mut s = String::from(&message[..MAX_MESSAGE_LEN - 3]);
@@ -174,7 +174,7 @@ impl LogBuffer {
         } else {
             String::from(message)
         };
-        
+
         let entry = LogEntry {
             timestamp,
             level,
@@ -182,59 +182,59 @@ impl LogBuffer {
             message,
             hart_id,
         };
-        
+
         // Print to console if enabled
         if self.console_enabled.load(Ordering::Relaxed) && level <= LogLevel::Info {
             crate::uart::write_line(&entry.format_colored());
         }
-        
+
         // Add to buffer
         let mut buffer = self.entries.lock();
         if buffer.len() >= LOG_BUFFER_SIZE {
             buffer.pop_front(); // Drop oldest
         }
         buffer.push_back(entry);
-        
+
         self.sequence.fetch_add(1, Ordering::Relaxed);
     }
-    
+
     /// Drain all entries for writing to log file
     pub fn drain(&self) -> Vec<LogEntry> {
         let mut buffer = self.entries.lock();
         buffer.drain(..).collect()
     }
-    
+
     /// Get recent entries without removing them
     pub fn recent(&self, count: usize) -> Vec<LogEntry> {
         let buffer = self.entries.lock();
         buffer.iter().rev().take(count).cloned().collect()
     }
-    
+
     /// Get all entries without removing them
     pub fn all(&self) -> Vec<LogEntry> {
         self.entries.lock().iter().cloned().collect()
     }
-    
+
     /// Set the log level filter
     pub fn set_level(&self, level: LogLevel) {
         self.level_filter.store(level as usize, Ordering::Release);
     }
-    
+
     /// Enable/disable console output
     pub fn set_console(&self, enabled: bool) {
         self.console_enabled.store(enabled, Ordering::Release);
     }
-    
+
     /// Get current entry count
     pub fn len(&self) -> usize {
         self.entries.lock().len()
     }
-    
+
     /// Check if buffer is empty
     pub fn is_empty(&self) -> bool {
         self.entries.lock().is_empty()
     }
-    
+
     /// Get sequence number (total messages logged)
     pub fn sequence(&self) -> usize {
         self.sequence.load(Ordering::Relaxed)
@@ -303,4 +303,3 @@ pub fn set_log_level(level: LogLevel) {
 pub fn set_console_output(enabled: bool) {
     KLOG.set_console(enabled);
 }
-

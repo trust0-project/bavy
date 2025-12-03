@@ -47,7 +47,7 @@ impl Clint {
         // Default to 1 hart, can be set with set_num_harts()
         Self::with_harts(1)
     }
-    
+
     /// Create a new CLINT with a specific hart count.
     pub fn with_harts(num_harts: usize) -> Self {
         // Create arrays of atomics initialized to their default values.
@@ -63,10 +63,11 @@ impl Clint {
             num_harts: AtomicUsize::new(num_harts.min(MAX_HARTS)),
         }
     }
-    
+
     /// Set the number of harts (called by emulator at init).
     pub fn set_num_harts(&self, num_harts: usize) {
-        self.num_harts.store(num_harts.min(MAX_HARTS), Ordering::Release);
+        self.num_harts
+            .store(num_harts.min(MAX_HARTS), Ordering::Release);
     }
 
     /// Get the number of harts (lock-free using atomics).
@@ -292,9 +293,9 @@ impl Clint {
                 let sub_offset = (o - MTIMECMP_OFFSET) % 8;
                 let val = self.mtimecmp[hart_idx].load(Ordering::Relaxed);
                 match sub_offset {
-                    0 => val & 0xFFFF_FFFF,  // Low 32 bits
-                    4 => val >> 32,          // High 32 bits
-                    _ => 0,                  // Misaligned (shouldn't happen)
+                    0 => val & 0xFFFF_FFFF, // Low 32 bits
+                    4 => val >> 32,         // High 32 bits
+                    _ => 0,                 // Misaligned (shouldn't happen)
                 }
             }
 
@@ -498,7 +499,7 @@ mod tests {
 
         // Set MSIP for hart 1
         clint.set_msip(1, 1);
-        assert_eq!(clint.load(MSIP_OFFSET, 4), 0);     // Hart 0: still 0
+        assert_eq!(clint.load(MSIP_OFFSET, 4), 0); // Hart 0: still 0
         assert_eq!(clint.load(MSIP_OFFSET + 4, 4), 1); // Hart 1: now 1
     }
 
@@ -513,7 +514,7 @@ mod tests {
         assert_eq!(clint.load(MTIMECMP_OFFSET, 8), 0x1234_5678_9ABC_DEF0);
 
         // 32-bit split reads
-        assert_eq!(clint.load(MTIMECMP_OFFSET, 4), 0x9ABC_DEF0);     // Low
+        assert_eq!(clint.load(MTIMECMP_OFFSET, 4), 0x9ABC_DEF0); // Low
         assert_eq!(clint.load(MTIMECMP_OFFSET + 4, 4), 0x1234_5678); // High
     }
 

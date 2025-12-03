@@ -260,15 +260,15 @@ impl WasmVm {
     /// Load a disk image and attach it as a VirtIO block device.
     /// This should be called before starting execution if the kernel needs a filesystem.
     pub fn load_disk(&mut self, disk_image: &[u8]) {
-        let vblk = virtio::VirtioBlock::new(disk_image.to_vec());
+        let vblk = crate::devices::virtio::VirtioBlock::new(disk_image.to_vec());
         self.bus.virtio_devices.push(Box::new(vblk));
     }
     
     /// Connect to a WebTransport relay server.
     /// Note: Connection is asynchronous. Check network_status() to monitor connection state.
     pub fn connect_webtransport(&mut self, url: &str, cert_hash: Option<String>) -> Result<(), JsValue> {
+        use crate::devices::virtio::VirtioNet;
         use crate::net_webtransport::WebTransportBackend;
-        use crate::virtio::VirtioNet;
 
         // Status stays as Connecting until we can verify the connection is established
         // (when IP is assigned, the connection is confirmed)

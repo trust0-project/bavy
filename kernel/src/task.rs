@@ -7,11 +7,11 @@
 //! - CPU time tracking
 //! - WaitQueues for event-based blocking
 
-use alloc::string::String;
+use crate::Spinlock;
 use alloc::collections::VecDeque;
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use crate::Spinlock;
 
 /// Process identifier type
 pub type Pid = u32;
@@ -42,7 +42,7 @@ impl TaskState {
             _ => TaskState::Zombie,
         }
     }
-    
+
     pub fn as_str(&self) -> &'static str {
         match self {
             TaskState::Ready => "R",
@@ -132,7 +132,7 @@ impl Task {
             restart_on_exit: false,
         }
     }
-    
+
     /// Create a daemon task (long-running service)
     pub fn new_daemon(pid: Pid, name: &str, entry: TaskEntry, priority: Priority) -> Self {
         let mut task = Self::new(pid, name, entry, priority);
@@ -140,45 +140,45 @@ impl Task {
         task.restart_on_exit = true;
         task
     }
-    
+
     /// Get current task state
     pub fn get_state(&self) -> TaskState {
         TaskState::from_usize(self.state.load(Ordering::Acquire))
     }
-    
+
     /// Set task state
     pub fn set_state(&self, state: TaskState) {
         self.state.store(state as usize, Ordering::Release);
     }
-    
+
     /// Check if task is runnable
     pub fn is_runnable(&self) -> bool {
         matches!(self.get_state(), TaskState::Ready)
     }
-    
+
     /// Mark task as running on specified hart
     pub fn mark_running(&self, hart_id: usize) {
         self.current_hart.store(hart_id, Ordering::Release);
         self.set_state(TaskState::Running);
     }
-    
+
     /// Mark task as finished with exit code
     pub fn mark_finished(&self, exit_code: usize) {
         self.exit_code.store(exit_code, Ordering::Release);
         self.current_hart.store(usize::MAX, Ordering::Release);
         self.set_state(TaskState::Zombie);
     }
-    
+
     /// Add CPU time
     pub fn add_cpu_time(&self, ms: u64) {
         self.cpu_time.fetch_add(ms, Ordering::Relaxed);
     }
-    
+
     /// Get total CPU time consumed
     pub fn get_cpu_time(&self) -> u64 {
         self.cpu_time.load(Ordering::Relaxed)
     }
-    
+
     /// Get current hart (if running)
     pub fn get_current_hart(&self) -> Option<usize> {
         let hart = self.current_hart.load(Ordering::Acquire);
@@ -269,41 +269,59 @@ impl WaitQueue {
             pending_wakes: AtomicUsize::new(0),
         }
     }
-    
+
     /// Add a task to the wait queue
     pub fn wait(&self, pid: Pid, event: WaitEvent, timeout: Option<u64>, data: u64) {
-        let waiter = Waiter { pid, event, timeout, data };
+        let waiter = Waiter {
+            pid,
+            event,
+            timeout,
+            data,
+        };
         self.waiters.lock().push_back(waiter);
-        crate::klog::klog_trace("waitq", &alloc::format!(
-            "Task {} waiting on {:?} (queue={})", pid, event, self.name
-        ));
+        crate::klog::klog_trace(
+            "waitq",
+            &alloc::format!("Task {} waiting on {:?} (queue={})", pid, event, self.name),
+        );
     }
-    
+
     /// Wake one waiter (FIFO order)
     /// Returns the PID of the woken task, if any
     pub fn wake_one(&self) -> Option<Pid> {
         let waiter = self.waiters.lock().pop_front()?;
-        crate::klog::klog_trace("waitq", &alloc::format!(
-            "Waking task {} from {:?} (queue={})", waiter.pid, waiter.event, self.name
-        ));
-        
+        crate::klog::klog_trace(
+            "waitq",
+            &alloc::format!(
+                "Waking task {} from {:?} (queue={})",
+                waiter.pid,
+                waiter.event,
+                self.name
+            ),
+        );
+
         // Mark the task as ready
         if let Some(task) = crate::scheduler::SCHEDULER.get_task(waiter.pid) {
             task.set_state(TaskState::Ready);
         }
-        
+
         Some(waiter.pid)
     }
-    
+
     /// Wake all waiters
     /// Returns the number of tasks woken
     pub fn wake_all(&self) -> usize {
         let mut count = 0;
         let mut waiters = self.waiters.lock();
         while let Some(waiter) = waiters.pop_front() {
-            crate::klog::klog_trace("waitq", &alloc::format!(
-                "Waking task {} from {:?} (queue={})", waiter.pid, waiter.event, self.name
-            ));
+            crate::klog::klog_trace(
+                "waitq",
+                &alloc::format!(
+                    "Waking task {} from {:?} (queue={})",
+                    waiter.pid,
+                    waiter.event,
+                    self.name
+                ),
+            );
             if let Some(task) = crate::scheduler::SCHEDULER.get_task(waiter.pid) {
                 task.set_state(TaskState::Ready);
             }
@@ -311,18 +329,24 @@ impl WaitQueue {
         }
         count
     }
-    
+
     /// Wake waiters matching a specific event type
     pub fn wake_event(&self, event: WaitEvent) -> usize {
         let mut count = 0;
         let mut waiters = self.waiters.lock();
         let mut remaining = VecDeque::new();
-        
+
         while let Some(waiter) = waiters.pop_front() {
             if waiter.event == event {
-                crate::klog::klog_trace("waitq", &alloc::format!(
-                    "Waking task {} from {:?} (queue={})", waiter.pid, waiter.event, self.name
-                ));
+                crate::klog::klog_trace(
+                    "waitq",
+                    &alloc::format!(
+                        "Waking task {} from {:?} (queue={})",
+                        waiter.pid,
+                        waiter.event,
+                        self.name
+                    ),
+                );
                 if let Some(task) = crate::scheduler::SCHEDULER.get_task(waiter.pid) {
                     task.set_state(TaskState::Ready);
                 }
@@ -331,24 +355,30 @@ impl WaitQueue {
                 remaining.push_back(waiter);
             }
         }
-        
+
         *waiters = remaining;
         count
     }
-    
+
     /// Check for and remove timed-out waiters
     /// Returns PIDs of timed-out tasks
     pub fn check_timeouts(&self, current_time: u64) -> Vec<Pid> {
         let mut timed_out = Vec::new();
         let mut waiters = self.waiters.lock();
         let mut remaining = VecDeque::new();
-        
+
         while let Some(waiter) = waiters.pop_front() {
             if let Some(timeout) = waiter.timeout {
                 if current_time >= timeout {
-                    crate::klog::klog_trace("waitq", &alloc::format!(
-                        "Task {} timed out on {:?} (queue={})", waiter.pid, waiter.event, self.name
-                    ));
+                    crate::klog::klog_trace(
+                        "waitq",
+                        &alloc::format!(
+                            "Task {} timed out on {:?} (queue={})",
+                            waiter.pid,
+                            waiter.event,
+                            self.name
+                        ),
+                    );
                     if let Some(task) = crate::scheduler::SCHEDULER.get_task(waiter.pid) {
                         task.set_state(TaskState::Ready);
                     }
@@ -358,21 +388,21 @@ impl WaitQueue {
             }
             remaining.push_back(waiter);
         }
-        
+
         *waiters = remaining;
         timed_out
     }
-    
+
     /// Get number of waiters
     pub fn len(&self) -> usize {
         self.waiters.lock().len()
     }
-    
+
     /// Check if queue is empty
     pub fn is_empty(&self) -> bool {
         self.waiters.lock().is_empty()
     }
-    
+
     /// Check if a specific PID is waiting
     pub fn is_waiting(&self, pid: Pid) -> bool {
         self.waiters.lock().iter().any(|w| w.pid == pid)
@@ -404,7 +434,7 @@ pub fn init_wait_queues() {
 pub fn wait_timer(pid: Pid, timeout_ms: u64) {
     let current_time = crate::get_time_ms() as u64;
     let deadline = current_time + timeout_ms;
-    
+
     if let Some(ref wq) = *TIMER_WAITQ.lock() {
         wq.wait(pid, WaitEvent::Timer, Some(deadline), 0);
     }
@@ -439,7 +469,7 @@ pub fn wake_ipc(channel_id: u64) -> usize {
         let mut count = 0;
         let mut waiters = wq.waiters.lock();
         let mut remaining = VecDeque::new();
-        
+
         while let Some(waiter) = waiters.pop_front() {
             if waiter.event == WaitEvent::IpcMessage && waiter.data == channel_id {
                 if let Some(task) = crate::scheduler::SCHEDULER.get_task(waiter.pid) {
@@ -450,7 +480,7 @@ pub fn wake_ipc(channel_id: u64) -> usize {
                 remaining.push_back(waiter);
             }
         }
-        
+
         *waiters = remaining;
         count
     } else {
@@ -470,4 +500,3 @@ pub fn check_all_timeouts(current_time: u64) {
         wq.check_timeouts(current_time);
     }
 }
-

@@ -3,7 +3,7 @@
 //! This backend allows JavaScript code to inject/extract packets directly,
 //! enabling the use of native Node.js WebTransport addon with the WASM VM.
 
-use crate::net::NetworkBackend;
+use super::NetworkBackend;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
@@ -205,4 +205,3 @@ impl NetworkBackend for ExternalBackendWrapper {
         }
     }
 }
-

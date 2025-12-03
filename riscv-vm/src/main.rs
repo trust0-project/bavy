@@ -3,7 +3,7 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
-use riscv_vm::emulator::NativeVm;
+use riscv_vm::vm::native::NativeVm;
 
 #[derive(Parser, Debug)]
 #[command(name = "riscv-vm")]
@@ -63,13 +63,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize logging
     if args.debug {
-        env_logger::Builder::from_env(
-            env_logger::Env::default().default_filter_or("debug")
-        ).init();
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
     } else {
-        env_logger::Builder::from_env(
-            env_logger::Env::default().default_filter_or("info")
-        ).init();
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     }
 
     // Load kernel
@@ -84,15 +80,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (cpus / 2).max(1) // Use half the CPUs, ensure at least 1
     } else {
         args.harts
-    }.max(1); // Ensure at least 1
+    }
+    .max(1); // Ensure at least 1
 
     // Print banner
     uart_println!();
     uart_println!("╔══════════════════════════════════════════════════════════════╗");
     uart_println!("║              RISC-V Emulator (SMP Edition)                   ║");
     uart_println!("╠══════════════════════════════════════════════════════════════╣");
-    uart_println!("║  Kernel: {:50} ║", 
-             args.kernel.file_name().unwrap_or_default().to_string_lossy());
+    uart_println!(
+        "║  Kernel: {:50} ║",
+        args.kernel
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+    );
     uart_println!("║  Harts:  {:50} ║", num_harts);
     if let Some(relay) = &args.net_webtransport {
         uart_println!("║  Network: {:49} ║", relay);

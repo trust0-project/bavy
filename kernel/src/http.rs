@@ -6,10 +6,10 @@
 //! - Response parsing with status, headers, and body
 //! - Automatic redirect following (301, 302, 303, 307, 308)
 
-use alloc::string::{String, ToString};
-use alloc::vec::Vec;
 use alloc::collections::BTreeMap;
 use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 use smoltcp::wire::Ipv4Address;
 
 /// Maximum number of redirects to follow before giving up
@@ -53,22 +53,25 @@ impl HttpRequest {
     pub fn get(url: &str) -> Result<Self, &'static str> {
         Self::new(HttpMethod::Get, url)
     }
-    
+
     /// Create a new POST request
     pub fn post(url: &str) -> Result<Self, &'static str> {
         Self::new(HttpMethod::Post, url)
     }
-    
+
     /// Create a new request with the given method
     pub fn new(method: HttpMethod, url: &str) -> Result<Self, &'static str> {
         let parsed = parse_url(url)?;
-        
+
         let mut headers = BTreeMap::new();
         headers.insert("Host".to_string(), parsed.host.clone());
-        headers.insert("User-Agent".to_string(), format!("BAVY OS/{}", env!("CARGO_PKG_VERSION")));
+        headers.insert(
+            "User-Agent".to_string(),
+            format!("BAVY OS/{}", env!("CARGO_PKG_VERSION")),
+        );
         headers.insert("Accept".to_string(), "*/*".to_string());
         headers.insert("Connection".to_string(), "close".to_string());
-        
+
         Ok(HttpRequest {
             method,
             host: parsed.host,
@@ -79,49 +82,46 @@ impl HttpRequest {
             is_https: parsed.is_https,
         })
     }
-    
+
     /// Set a header
     pub fn header(mut self, key: &str, value: &str) -> Self {
         self.headers.insert(key.to_string(), value.to_string());
         self
     }
-    
+
     /// Set the request body
     pub fn body(mut self, body: Vec<u8>) -> Self {
         let len = body.len();
         self.body = Some(body);
-        self.headers.insert("Content-Length".to_string(), len.to_string());
+        self.headers
+            .insert("Content-Length".to_string(), len.to_string());
         self
     }
-    
+
     /// Set the request body as a string
     pub fn body_str(self, body: &str) -> Self {
         self.body(body.as_bytes().to_vec())
     }
-    
+
     /// Build the HTTP request bytes
     pub fn build(&self) -> Vec<u8> {
-        let mut request = format!(
-            "{} {} HTTP/1.1\r\n",
-            self.method.as_str(),
-            self.path
-        );
-        
+        let mut request = format!("{} {} HTTP/1.1\r\n", self.method.as_str(), self.path);
+
         for (key, value) in &self.headers {
             request.push_str(key);
             request.push_str(": ");
             request.push_str(value);
             request.push_str("\r\n");
         }
-        
+
         request.push_str("\r\n");
-        
+
         let mut bytes = request.into_bytes();
-        
+
         if let Some(ref body) = self.body {
             bytes.extend_from_slice(body);
         }
-        
+
         bytes
     }
 }
@@ -140,31 +140,31 @@ impl HttpResponse {
     pub fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).into_owned()
     }
-    
+
     /// Check if response is successful (2xx)
     pub fn is_success(&self) -> bool {
         self.status_code >= 200 && self.status_code < 300
     }
-    
+
     /// Check if response is redirect (3xx)
     pub fn is_redirect(&self) -> bool {
         self.status_code >= 300 && self.status_code < 400
     }
-    
+
     /// Get a header value (case-insensitive)
     pub fn header(&self, name: &str) -> Option<&String> {
         let lower = name.to_lowercase();
-        self.headers.iter()
+        self.headers
+            .iter()
             .find(|(k, _)| k.to_lowercase() == lower)
             .map(|(_, v)| v)
     }
-    
+
     /// Get content length from headers
     pub fn content_length(&self) -> Option<usize> {
-        self.header("content-length")
-            .and_then(|v| v.parse().ok())
+        self.header("content-length").and_then(|v| v.parse().ok())
     }
-    
+
     /// Get redirect location if this is a redirect response
     pub fn redirect_location(&self) -> Option<&String> {
         if self.is_redirect() {
@@ -193,13 +193,13 @@ fn parse_url(url: &str) -> Result<ParsedUrl, &'static str> {
     } else {
         (url, false, 80u16)
     };
-    
+
     // Split host and path
     let (host_port, path) = match url.find('/') {
         Some(idx) => (&url[..idx], &url[idx..]),
         None => (url, "/"),
     };
-    
+
     // Parse host and port
     let (host, port) = match host_port.find(':') {
         Some(idx) => {
@@ -209,7 +209,7 @@ fn parse_url(url: &str) -> Result<ParsedUrl, &'static str> {
         }
         None => (host_port, default_port),
     };
-    
+
     Ok(ParsedUrl {
         host: host.to_string(),
         port,
@@ -219,7 +219,7 @@ fn parse_url(url: &str) -> Result<ParsedUrl, &'static str> {
 }
 
 /// Resolve a redirect URL relative to the original request
-/// 
+///
 /// Handles:
 /// - Absolute URLs (http://example.com/path or https://...)
 /// - Protocol-relative URLs (//example.com/path)  
@@ -230,63 +230,69 @@ fn resolve_redirect_url(original: &HttpRequest, location: &str) -> Result<String
     if location.starts_with("http://") || location.starts_with("https://") {
         return Ok(location.to_string());
     }
-    
+
     // Protocol-relative URL
     if location.starts_with("//") {
         let protocol = if original.is_https { "https:" } else { "http:" };
         return Ok(format!("{}{}", protocol, location));
     }
-    
+
     // Build base URL from original request
     let protocol = if original.is_https { "https" } else { "http" };
-    let port_str = if (original.is_https && original.port == 443) || 
-                      (!original.is_https && original.port == 80) {
+    let port_str = if (original.is_https && original.port == 443)
+        || (!original.is_https && original.port == 80)
+    {
         String::new()
     } else {
         format!(":{}", original.port)
     };
-    
+
     // Absolute path
     if location.starts_with('/') {
-        return Ok(format!("{}://{}{}{}", protocol, original.host, port_str, location));
+        return Ok(format!(
+            "{}://{}{}{}",
+            protocol, original.host, port_str, location
+        ));
     }
-    
+
     // Relative path - resolve against current path
     let base_path = if let Some(last_slash) = original.path.rfind('/') {
         &original.path[..=last_slash]
     } else {
         "/"
     };
-    
-    Ok(format!("{}://{}{}{}{}", protocol, original.host, port_str, base_path, location))
+
+    Ok(format!(
+        "{}://{}{}{}{}",
+        protocol, original.host, port_str, base_path, location
+    ))
 }
 
 /// Parse raw HTTP response bytes into HttpResponse
 pub fn parse_response(data: &[u8]) -> Result<HttpResponse, &'static str> {
     // Convert to string for easier parsing
-    let response_str = core::str::from_utf8(data)
-        .map_err(|_| "Invalid UTF-8 in response")?;
-    
+    let response_str = core::str::from_utf8(data).map_err(|_| "Invalid UTF-8 in response")?;
+
     // Find header/body separator
-    let header_end = response_str.find("\r\n\r\n")
+    let header_end = response_str
+        .find("\r\n\r\n")
         .ok_or("No header/body separator found")?;
-    
+
     let header_section = &response_str[..header_end];
     let body_start = header_end + 4;
-    
+
     // Parse status line
     let mut lines = header_section.lines();
     let status_line = lines.next().ok_or("Missing status line")?;
-    
+
     // Parse "HTTP/1.x STATUS STATUS_TEXT"
     let mut parts = status_line.splitn(3, ' ');
     let _version = parts.next().ok_or("Missing HTTP version")?;
     let status_str = parts.next().ok_or("Missing status code")?;
     let status_text = parts.next().unwrap_or("").to_string();
-    
-    let status_code: u16 = status_str.parse()
-        .map_err(|_| "Invalid status code")?;
-    
+
+    let status_code: u16 = status_str.parse().map_err(|_| "Invalid status code")?;
+
     // Parse headers
     let mut headers = BTreeMap::new();
     for line in lines {
@@ -296,10 +302,10 @@ pub fn parse_response(data: &[u8]) -> Result<HttpResponse, &'static str> {
             headers.insert(key, value);
         }
     }
-    
+
     // Extract body
     let body = data[body_start..].to_vec();
-    
+
     Ok(HttpResponse {
         status_code,
         status_text,
@@ -309,7 +315,7 @@ pub fn parse_response(data: &[u8]) -> Result<HttpResponse, &'static str> {
 }
 
 /// Perform an HTTP request using the network stack
-/// 
+///
 /// This is a blocking call that:
 /// 1. Resolves the hostname to IP (if needed)
 /// 2. Connects via TCP (and TLS for HTTPS)
@@ -325,15 +331,15 @@ pub fn http_request(
     if request.is_https {
         return https_request(net, request, timeout_ms, get_time_ms);
     }
-    
+
     // HTTP (non-TLS) request
     let dest_ip = resolve_host(net, &request.host, timeout_ms, get_time_ms)?;
-    
+
     let start_time = get_time_ms();
-    
+
     // Connect to the server
     net.tcp_connect(dest_ip, request.port, start_time)?;
-    
+
     // Wait for connection to establish
     loop {
         let now = get_time_ms();
@@ -341,36 +347,36 @@ pub fn http_request(
             net.tcp_abort();
             return Err("Connection timeout");
         }
-        
+
         net.poll(now);
-        
+
         if net.tcp_is_connected() {
             break;
         }
-        
+
         if net.tcp_connection_failed() {
             return Err("Connection failed");
         }
-        
+
         // Small delay to avoid busy-waiting
         for _ in 0..10000 {
             core::hint::spin_loop();
         }
     }
-    
+
     // Send the HTTP request
     let request_bytes = request.build();
     let mut sent = 0;
-    
+
     while sent < request_bytes.len() {
         let now = get_time_ms();
         if now - start_time > timeout_ms {
             net.tcp_abort();
             return Err("Send timeout");
         }
-        
+
         net.poll(now);
-        
+
         match net.tcp_send(&request_bytes[sent..], now) {
             Ok(n) if n > 0 => sent += n,
             Ok(_) => {}
@@ -379,39 +385,39 @@ pub fn http_request(
                 return Err(e);
             }
         }
-        
+
         // Small delay
         for _ in 0..5000 {
             core::hint::spin_loop();
         }
     }
-    
+
     // Receive the response
     let mut response_buf = Vec::with_capacity(8192);
     let mut recv_buf = [0u8; 1024];
     let mut headers_complete = false;
     let mut content_length: Option<usize> = None;
     let mut body_start = 0;
-    
+
     loop {
         let now = get_time_ms();
         if now - start_time > timeout_ms {
             net.tcp_abort();
             return Err("Receive timeout");
         }
-        
+
         net.poll(now);
-        
+
         match net.tcp_recv(&mut recv_buf, now) {
             Ok(n) if n > 0 => {
                 response_buf.extend_from_slice(&recv_buf[..n]);
-                
+
                 // Check if we've received all headers
                 if !headers_complete {
                     if let Some(pos) = find_header_end(&response_buf) {
                         headers_complete = true;
                         body_start = pos + 4;
-                        
+
                         // Parse content-length from headers
                         if let Ok(s) = core::str::from_utf8(&response_buf[..pos]) {
                             for line in s.lines() {
@@ -424,7 +430,7 @@ pub fn http_request(
                         }
                     }
                 }
-                
+
                 // Check if we've received the complete response
                 if headers_complete {
                     let body_len = response_buf.len() - body_start;
@@ -451,29 +457,29 @@ pub fn http_request(
                 return Err(e);
             }
         }
-        
+
         // Small delay
         for _ in 0..5000 {
             core::hint::spin_loop();
         }
     }
-    
+
     // Close the connection
     net.tcp_close(get_time_ms());
-    
+
     // Parse the response
     if response_buf.is_empty() {
         return Err("Empty response");
     }
-    
+
     parse_response(&response_buf)
 }
 
 /// Perform an HTTP request with automatic redirect following
-/// 
+///
 /// This is similar to `http_request` but automatically follows 3xx redirects
 /// up to MAX_REDIRECTS times.
-/// 
+///
 /// Redirect types handled:
 /// - 301 Moved Permanently
 /// - 302 Found
@@ -495,60 +501,65 @@ pub fn http_request_follow_redirects(
         body: request.body.clone(),
         is_https: request.is_https,
     };
-    
+
     let mut redirects = 0u8;
-    
+
     loop {
         let response = http_request(net, &current_request, timeout_ms, get_time_ms)?;
-        
+
         // Check if this is a redirect
         if !response.is_redirect() {
             return Ok(response);
         }
-        
+
         // Check redirect limit
         redirects += 1;
         if redirects > MAX_REDIRECTS {
             return Err("Too many redirects");
         }
-        
+
         // Get redirect location
-        let location = response.redirect_location()
+        let location = response
+            .redirect_location()
             .ok_or("Redirect without Location header")?;
-        
+
         // Resolve the redirect URL
         let new_url = resolve_redirect_url(&current_request, location)?;
-        
+
         crate::uart::write_str("Redirecting to: ");
         crate::uart::write_line(&new_url);
-        
+
         // Parse the new URL
         let parsed = parse_url(&new_url)?;
-        
+
         // For 303, change method to GET and drop body
         // For 301/302, many clients also change to GET (though technically shouldn't for 301)
-        let new_method = if response.status_code == 303 || 
-                           (response.status_code == 301 || response.status_code == 302) && 
-                           current_request.method == HttpMethod::Post {
+        let new_method = if response.status_code == 303
+            || (response.status_code == 301 || response.status_code == 302)
+                && current_request.method == HttpMethod::Post
+        {
             HttpMethod::Get
         } else {
             current_request.method
         };
-        
+
         // Build new request
         let mut new_headers = BTreeMap::new();
         new_headers.insert("Host".to_string(), parsed.host.clone());
-        new_headers.insert("User-Agent".to_string(), format!("BAVY OS/{}", env!("CARGO_PKG_VERSION")));
+        new_headers.insert(
+            "User-Agent".to_string(),
+            format!("BAVY OS/{}", env!("CARGO_PKG_VERSION")),
+        );
         new_headers.insert("Accept".to_string(), "*/*".to_string());
         new_headers.insert("Connection".to_string(), "close".to_string());
-        
+
         // Drop body for GET requests
         let new_body = if new_method == HttpMethod::Get {
             None
         } else {
             current_request.body.clone()
         };
-        
+
         current_request = HttpRequest {
             method: new_method,
             host: parsed.host,
@@ -572,17 +583,23 @@ fn resolve_host(
     if let Some(ip) = crate::net::parse_ipv4(host.as_bytes()) {
         return Ok(ip);
     }
-    
+
     // Resolve via DNS
-    crate::dns::resolve(net, host.as_bytes(), crate::net::DNS_SERVER, timeout_ms, get_time_ms)
-        .ok_or("DNS resolution failed")
+    crate::dns::resolve(
+        net,
+        host.as_bytes(),
+        crate::net::DNS_SERVER,
+        timeout_ms,
+        get_time_ms,
+    )
+    .ok_or("DNS resolution failed")
 }
 
 /// Find the end of HTTP headers (double CRLF)
 fn find_header_end(data: &[u8]) -> Option<usize> {
     for i in 0..data.len().saturating_sub(3) {
-        if data[i] == b'\r' && data[i + 1] == b'\n' 
-           && data[i + 2] == b'\r' && data[i + 3] == b'\n' {
+        if data[i] == b'\r' && data[i + 1] == b'\n' && data[i + 2] == b'\r' && data[i + 3] == b'\n'
+        {
             return Some(i);
         }
     }
@@ -640,13 +657,13 @@ fn https_request(
 ) -> Result<HttpResponse, &'static str> {
     // Resolve hostname to IP address
     let dest_ip = resolve_host(net, &request.host, timeout_ms, get_time_ms)?;
-    
+
     // Build the HTTP request bytes
     let request_bytes = request.build();
-    
+
     // Use longer timeout for HTTPS (TLS handshake needs multiple round trips)
     let https_timeout = timeout_ms.max(30000);
-    
+
     // Try TLS 1.3 first (embedded-tls)
     let response_bytes = match crate::tls::https_request(
         net,
@@ -661,7 +678,7 @@ fn https_request(
         Err(_) => {
             // TLS 1.3 failed, try TLS 1.2
             crate::uart::write_line("TLS 1.3 failed, trying TLS 1.2...");
-            
+
             crate::tls12::https_request_tls12(
                 net,
                 dest_ip,
@@ -670,7 +687,8 @@ fn https_request(
                 &request_bytes,
                 https_timeout,
                 get_time_ms,
-            ).map_err(|e| match e {
+            )
+            .map_err(|e| match e {
                 crate::tls::TlsError::ConnectionError => "HTTPS: TCP connection failed",
                 crate::tls::TlsError::TlsProtocolError => "HTTPS: TLS handshake failed",
                 crate::tls::TlsError::Timeout => "HTTPS: Connection timeout",
@@ -683,12 +701,11 @@ fn https_request(
             })?
         }
     };
-    
+
     // Parse the response
     if response_bytes.is_empty() {
         return Err("Empty HTTPS response");
     }
-    
+
     parse_response(&response_bytes)
 }
-

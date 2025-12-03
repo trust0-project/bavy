@@ -1,7 +1,7 @@
-use crate::clint::MAX_HARTS;
+use crate::devices::clint::MAX_HARTS;
 use crate::dram::MemoryError;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 pub const PLIC_BASE: u64 = 0x0C00_0000;
 pub const PLIC_SIZE: u64 = 0x400_0000;
@@ -12,7 +12,7 @@ pub const VIRTIO0_IRQ: u32 = 1;
 const NUM_SOURCES: usize = 32;
 /// Number of interrupt contexts.
 /// Each hart has 2 contexts: M-mode (2*N) and S-mode (2*N+1).
-const NUM_CONTEXTS: usize = 2 * MAX_HARTS;  // 2 contexts per hart (M-mode and S-mode)
+const NUM_CONTEXTS: usize = 2 * MAX_HARTS; // 2 contexts per hart (M-mode and S-mode)
 
 /// Internal mutable state for PLIC, protected by Mutex
 struct PlicState {
@@ -27,20 +27,19 @@ struct PlicState {
 pub struct Plic {
     /// Authoritative state protected by Mutex
     state: Mutex<PlicState>,
-    
+
     // ============================================================
     // Atomic Caches - Updated on writes, used for fast polling
     // ============================================================
-    
     /// Cache of pending interrupt bits (mirrors state.pending)
     pending_cache: AtomicU32,
-    
+
     /// Cache of enable bits per context (mirrors state.enable)
     enable_cache: [AtomicU32; NUM_CONTEXTS],
-    
+
     /// Cache of threshold per context (mirrors state.threshold)
     threshold_cache: [AtomicU32; NUM_CONTEXTS],
-    
+
     /// Cache of priority per source (mirrors state.priority)
     /// Note: Only need cache for sources 0-31
     priority_cache: [AtomicU32; NUM_SOURCES],
@@ -52,7 +51,7 @@ impl Plic {
     pub fn m_context(hart_id: usize) -> usize {
         hart_id * 2
     }
-    
+
     /// Get the S-mode context ID for a given hart.
     #[inline]
     pub fn s_context(hart_id: usize) -> usize {
@@ -62,7 +61,7 @@ impl Plic {
     pub fn new() -> Self {
         // Create atomic arrays using const initialization
         const ZERO: AtomicU32 = AtomicU32::new(0);
-        
+
         Self {
             state: Mutex::new(PlicState {
                 priority: [0; NUM_SOURCES],
@@ -72,7 +71,7 @@ impl Plic {
                 active: [0; NUM_CONTEXTS],
                 debug: false,
             }),
-            
+
             // Initialize caches to match initial state
             pending_cache: AtomicU32::new(0),
             enable_cache: [ZERO; NUM_CONTEXTS],
@@ -86,23 +85,23 @@ impl Plic {
     // ============================================================
 
     /// Sync all caches from authoritative state.
-    /// 
+    ///
     /// This should be called while holding the PlicState lock.
     /// Takes a reference to the state to avoid double-locking.
     fn sync_caches_from(&self, state: &PlicState) {
         // Sync pending
         self.pending_cache.store(state.pending, Ordering::Release);
-        
+
         // Sync enable for all contexts
         for (i, &val) in state.enable.iter().enumerate() {
             self.enable_cache[i].store(val, Ordering::Release);
         }
-        
+
         // Sync threshold for all contexts
         for (i, &val) in state.threshold.iter().enumerate() {
             self.threshold_cache[i].store(val, Ordering::Release);
         }
-        
+
         // Sync priority for all sources
         for (i, &val) in state.priority.iter().enumerate() {
             self.priority_cache[i].store(val, Ordering::Release);
@@ -114,7 +113,7 @@ impl Plic {
     fn sync_pending_cache(&self, state: &PlicState) {
         self.pending_cache.store(state.pending, Ordering::Release);
     }
-    
+
     /// Sync only the enable cache for a specific context.
     #[inline]
     fn sync_enable_cache(&self, state: &PlicState, ctx: usize) {
@@ -122,7 +121,7 @@ impl Plic {
             self.enable_cache[ctx].store(state.enable[ctx], Ordering::Release);
         }
     }
-    
+
     /// Sync only the threshold cache for a specific context.
     #[inline]
     fn sync_threshold_cache(&self, state: &PlicState, ctx: usize) {
@@ -130,7 +129,7 @@ impl Plic {
             self.threshold_cache[ctx].store(state.threshold[ctx], Ordering::Release);
         }
     }
-    
+
     /// Sync only the priority cache for a specific source.
     #[inline]
     fn sync_priority_cache(&self, state: &PlicState, source: usize) {
@@ -140,7 +139,7 @@ impl Plic {
     }
 
     /// Force sync all caches from Mutex state.
-    /// 
+    ///
     /// This acquires the lock and syncs all caches.
     /// Mainly useful for testing and initialization.
     pub fn sync_caches(&self) {
@@ -157,7 +156,7 @@ impl Plic {
     pub fn pending_cached(&self) -> u32 {
         self.pending_cache.load(Ordering::Relaxed)
     }
-    
+
     /// Get enable bits for a context from cache (lock-free)
     #[inline]
     pub fn enable_cached(&self, ctx: usize) -> u32 {
@@ -167,7 +166,7 @@ impl Plic {
             0
         }
     }
-    
+
     /// Get threshold for a context from cache (lock-free)
     #[inline]
     pub fn threshold_cached(&self, ctx: usize) -> u32 {
@@ -177,7 +176,7 @@ impl Plic {
             0
         }
     }
-    
+
     /// Get priority for a source from cache (lock-free)
     #[inline]
     pub fn priority_cached(&self, source: usize) -> u32 {
@@ -193,11 +192,11 @@ impl Plic {
     // ============================================================
 
     /// Fast lock-free check for pending interrupts.
-    /// 
+    ///
     /// This uses atomic caches and is suitable for polling.
     /// Returns true if ANY interrupt might be pending; the caller should
     /// use claim_interrupt_for() to get the actual interrupt ID.
-    /// 
+    ///
     /// Note: May return false positives (cache slightly stale) but not false negatives
     /// when used correctly (caches synced on writes).
     #[inline]
@@ -205,18 +204,18 @@ impl Plic {
         if ctx >= NUM_CONTEXTS {
             return false;
         }
-        
+
         // Load cached values (lock-free)
         let pending = self.pending_cache.load(Ordering::Relaxed);
         let enable = self.enable_cache[ctx].load(Ordering::Relaxed);
         let threshold = self.threshold_cache[ctx].load(Ordering::Relaxed);
-        
+
         // Quick check: any enabled source pending?
         let candidates = pending & enable;
         if candidates == 0 {
             return false;
         }
-        
+
         // Check if any candidate has priority > threshold
         // This is a bit more expensive but still lock-free
         for source in 1..NUM_SOURCES {
@@ -227,12 +226,12 @@ impl Plic {
                 }
             }
         }
-        
+
         false
     }
 
     /// Ultra-fast pending check - only checks pending & enable.
-    /// 
+    ///
     /// This may return true when priority <= threshold, but is faster.
     /// Use when you want to minimize polling overhead and can tolerate
     /// occasional unnecessary claim attempts.
@@ -256,7 +255,7 @@ impl Plic {
         // Bus.refresh_irqs() may later clear this if device line is low.
         if source < 32 {
             if state.debug {
-                 eprintln!("[PLIC] Update Pending source={}", source);
+                eprintln!("[PLIC] Update Pending source={}", source);
             }
             state.pending |= 1 << source;
             // Sync pending cache
@@ -273,8 +272,10 @@ impl Plic {
         let was_pending = (state.pending & (1 << source)) != 0;
         if level {
             if state.debug && !was_pending {
-                 eprintln!("[PLIC] IRQ Line High: source={} enable[0]=0x{:x} enable[1]=0x{:x} prio={}", 
-                          source, state.enable[0], state.enable[1], state.priority[source as usize]);
+                eprintln!(
+                    "[PLIC] IRQ Line High: source={} enable[0]=0x{:x} enable[1]=0x{:x} prio={}",
+                    source, state.enable[0], state.enable[1], state.priority[source as usize]
+                );
             }
             state.pending |= 1 << source;
         } else {
@@ -385,7 +386,7 @@ impl Plic {
     pub fn load(&self, offset: u64, size: u64) -> Result<u64, MemoryError> {
         let mut state = self.state.lock().unwrap();
         if size != 4 {
-            return Ok(0); 
+            return Ok(0);
         }
 
         // Priority registers: 0x000000 .. 0x0000FC (4 bytes each)
@@ -431,7 +432,9 @@ impl Plic {
     fn debug_trace() -> bool {
         // Helper to check if trace logging is enabled without importing log everywhere if not needed
         // or just use std::env
-        std::env::var("RUST_LOG").map(|s| s.contains("trace")).unwrap_or(false)
+        std::env::var("RUST_LOG")
+            .map(|s| s.contains("trace"))
+            .unwrap_or(false)
     }
 
     pub fn store(&self, offset: u64, size: u64, value: u64) -> Result<(), MemoryError> {
@@ -484,7 +487,7 @@ impl Plic {
             let ctx = ((offset - 0x200000) / 0x1000) as usize;
             if ctx < NUM_CONTEXTS {
                 let base = 0x200000 + (0x1000 * ctx as u64);
-                
+
                 if offset == base {
                     // Threshold write
                     state.threshold[ctx] = val;
@@ -492,7 +495,7 @@ impl Plic {
                     self.sync_threshold_cache(&state, ctx);
                     return Ok(());
                 }
-                
+
                 if offset == base + 4 {
                     // Completion write: value is the source ID to complete
                     let id = (val & 0xffff) as u32;
@@ -543,7 +546,7 @@ impl Plic {
         let mut state = self.state.lock().unwrap();
         Self::claim_interrupt_for_internal(&mut state, ctx)
     }
-    
+
     pub fn is_interrupt_pending(&self) -> bool {
         // For current single-hart flow, report S-mode context (1) if available, else context 0.
         let ctx = if NUM_CONTEXTS > 1 { 1 } else { 0 };
@@ -551,7 +554,7 @@ impl Plic {
     }
 
     /// Accurate check using Mutex (for claim/complete path).
-    /// 
+    ///
     /// Use this when you need guaranteed correctness, such as
     /// before attempting a claim operation.
     pub fn is_interrupt_pending_for(&self, ctx: usize) -> bool {
@@ -575,8 +578,16 @@ impl Plic {
                 let over_threshold = state.priority[i] > state.threshold[ctx];
                 let not_active = ((state.active[ctx] >> i) & 1) == 0;
                 if pending {
-                    eprintln!("[PLIC] Source {} pending but not eligible for ctx={}: enabled={} over_threshold={} (prio={} > thresh={}) not_active={}", 
-                             i, ctx, enabled, over_threshold, state.priority[i], state.threshold[ctx], not_active);
+                    eprintln!(
+                        "[PLIC] Source {} pending but not eligible for ctx={}: enabled={} over_threshold={} (prio={} > thresh={}) not_active={}",
+                        i,
+                        ctx,
+                        enabled,
+                        over_threshold,
+                        state.priority[i],
+                        state.threshold[ctx],
+                        not_active
+                    );
                 }
             }
         }
@@ -601,7 +612,7 @@ mod tests {
     #[test]
     fn test_plic_multi_context() {
         let plic = Plic::new();
-        
+
         // Enable source 1 for hart 1 S-mode (context 3)
         {
             let mut state = plic.state.lock().unwrap();
@@ -611,9 +622,9 @@ mod tests {
         }
         // Sync caches after manual state modification
         plic.sync_caches();
-        
+
         plic.set_source_level(1, true);
-        
+
         // Should be pending for hart 1 S-mode, not hart 0
         assert!(!plic.is_interrupt_pending_for(Plic::s_context(0)));
         assert!(plic.is_interrupt_pending_for(Plic::s_context(1)));
@@ -655,13 +666,13 @@ mod tests {
     #[test]
     fn test_plic_cache_accessors() {
         let plic = Plic::new();
-        
+
         // Initial state: all zeros
         assert_eq!(plic.pending_cached(), 0);
         assert_eq!(plic.enable_cached(0), 0);
         assert_eq!(plic.threshold_cached(0), 0);
         assert_eq!(plic.priority_cached(0), 0);
-        
+
         // Out of bounds returns 0
         assert_eq!(plic.enable_cached(NUM_CONTEXTS + 100), 0);
         assert_eq!(plic.priority_cached(NUM_SOURCES + 100), 0);
@@ -670,15 +681,15 @@ mod tests {
     #[test]
     fn test_plic_cache_sync() {
         let plic = Plic::new();
-        
+
         // Manually modify state through store()
-        plic.store(0x000000 + 4 * 10, 4, 5).unwrap();  // priority[10] = 5
-        plic.store(0x002000, 4, 1 << 10).unwrap();     // enable[0] = bit 10
-        plic.store(0x200000, 4, 2).unwrap();           // threshold[0] = 2
-        
+        plic.store(0x000000 + 4 * 10, 4, 5).unwrap(); // priority[10] = 5
+        plic.store(0x002000, 4, 1 << 10).unwrap(); // enable[0] = bit 10
+        plic.store(0x200000, 4, 2).unwrap(); // threshold[0] = 2
+
         // Set pending via set_source_level
         plic.set_source_level(10, true);
-        
+
         // Caches should be synced by store() and set_source_level()
         assert_eq!(plic.priority_cached(10), 5);
         assert_eq!(plic.enable_cached(0), 1 << 10);
@@ -689,13 +700,13 @@ mod tests {
     #[test]
     fn test_store_syncs_priority_cache() {
         let plic = Plic::new();
-        
+
         // Write priority for source 5 via MMIO
         plic.store(0x000000 + 4 * 5, 4, 7).unwrap();
-        
+
         // Cache should be updated
         assert_eq!(plic.priority_cached(5), 7);
-        
+
         // Authoritative state should match
         assert_eq!(plic.get_priority()[5], 7);
     }
@@ -703,10 +714,10 @@ mod tests {
     #[test]
     fn test_store_syncs_enable_cache() {
         let plic = Plic::new();
-        
+
         // Write enable for context 1 (S-mode for hart 0) via MMIO
         plic.store(0x002000 + 0x80 * 1, 4, 0x1234).unwrap();
-        
+
         // Cache should be updated
         assert_eq!(plic.enable_cached(1), 0x1234);
     }
@@ -714,10 +725,10 @@ mod tests {
     #[test]
     fn test_store_syncs_threshold_cache() {
         let plic = Plic::new();
-        
+
         // Write threshold for context 0 via MMIO
         plic.store(0x200000, 4, 3).unwrap();
-        
+
         // Cache should be updated
         assert_eq!(plic.threshold_cached(0), 3);
     }
@@ -725,12 +736,12 @@ mod tests {
     #[test]
     fn test_set_source_level_syncs_cache() {
         let plic = Plic::new();
-        
+
         assert_eq!(plic.pending_cached(), 0);
-        
+
         plic.set_source_level(5, true);
         assert!((plic.pending_cached() & (1 << 5)) != 0);
-        
+
         plic.set_source_level(5, false);
         assert!((plic.pending_cached() & (1 << 5)) == 0);
     }
@@ -738,21 +749,21 @@ mod tests {
     #[test]
     fn test_fast_pending_check() {
         let plic = Plic::new();
-        
+
         // Setup: source 10, priority 5, enable for ctx 1, threshold 0
-        plic.store(0x000000 + 4 * 10, 4, 5).unwrap();  // priority[10] = 5
-        plic.store(0x002000 + 0x80 * 1, 4, 1 << 10).unwrap();  // enable[1] = bit 10
-        plic.store(0x200000 + 0x1000 * 1, 4, 0).unwrap();  // threshold[1] = 0
-        
+        plic.store(0x000000 + 4 * 10, 4, 5).unwrap(); // priority[10] = 5
+        plic.store(0x002000 + 0x80 * 1, 4, 1 << 10).unwrap(); // enable[1] = bit 10
+        plic.store(0x200000 + 0x1000 * 1, 4, 0).unwrap(); // threshold[1] = 0
+
         // No interrupt yet (not pending)
         assert!(!plic.is_interrupt_pending_for_fast(1));
-        
+
         // Set source 10 as pending
         plic.set_source_level(10, true);
-        
+
         // Now should detect interrupt
         assert!(plic.is_interrupt_pending_for_fast(1));
-        
+
         // But not for context 0 (not enabled there)
         assert!(!plic.is_interrupt_pending_for_fast(0));
     }
@@ -760,20 +771,20 @@ mod tests {
     #[test]
     fn test_fast_check_respects_threshold() {
         let plic = Plic::new();
-        
+
         // Setup: source 5, priority 3
         plic.store(0x000000 + 4 * 5, 4, 3).unwrap();
-        plic.store(0x002000, 4, 1 << 5).unwrap();  // enable for ctx 0
+        plic.store(0x002000, 4, 1 << 5).unwrap(); // enable for ctx 0
         plic.set_source_level(5, true);
-        
+
         // Threshold 0: should see interrupt
         plic.store(0x200000, 4, 0).unwrap();
         assert!(plic.is_interrupt_pending_for_fast(0));
-        
+
         // Threshold 3: priority not > threshold, no interrupt
         plic.store(0x200000, 4, 3).unwrap();
         assert!(!plic.is_interrupt_pending_for_fast(0));
-        
+
         // Threshold 2: priority > threshold, should see interrupt
         plic.store(0x200000, 4, 2).unwrap();
         assert!(plic.is_interrupt_pending_for_fast(0));
@@ -782,15 +793,15 @@ mod tests {
     #[test]
     fn test_has_pending_candidate() {
         let plic = Plic::new();
-        
+
         // Setup: source 3 enabled for ctx 0, but not pending
         plic.store(0x002000, 4, 1 << 3).unwrap();
         assert!(!plic.has_pending_candidate(0));
-        
+
         // Set source 3 as pending
         plic.set_source_level(3, true);
         assert!(plic.has_pending_candidate(0));
-        
+
         // Clear pending
         plic.set_source_level(3, false);
         assert!(!plic.has_pending_candidate(0));

@@ -1,5 +1,5 @@
-use core::ptr::{read_volatile, write_volatile};
-use crate::virtio_net::{VIRTIO_BASE, VIRTIO_STRIDE}; // Reuse constants
+use crate::virtio_net::{VIRTIO_BASE, VIRTIO_STRIDE};
+use core::ptr::{read_volatile, write_volatile}; // Reuse constants
 
 const VIRTIO_BLK_DEVICE_ID: u32 = 2;
 
@@ -18,8 +18,12 @@ pub struct VirtioBlock {
 
 // Static storage for block queue
 #[repr(C, align(4096))]
-struct BlkQueueMem { data: [u8; 4096 * 2] }
-static mut BLK_QUEUE_MEM: BlkQueueMem = BlkQueueMem { data: [0; 4096 * 2] };
+struct BlkQueueMem {
+    data: [u8; 4096 * 2],
+}
+static mut BLK_QUEUE_MEM: BlkQueueMem = BlkQueueMem {
+    data: [0; 4096 * 2],
+};
 
 impl VirtioBlock {
     pub fn probe() -> Option<Self> {
@@ -48,27 +52,38 @@ impl VirtioBlock {
     unsafe fn init(&mut self) {
         self.write32(0x070, 0); // Reset
         self.write32(0x070, 1 | 2); // ACK | DRIVER
-        
+
         let cap_low = self.read32(0x100);
         let cap_high = self.read32(0x104);
         self.capacity = (cap_low as u64) | ((cap_high as u64) << 32);
 
-        self.write32(0x028, 4096); 
-        self.write32(0x030, 0); 
-        self.write32(0x038, 16); 
+        self.write32(0x028, 4096);
+        self.write32(0x030, 0);
+        self.write32(0x038, 16);
         let pfn = (BLK_QUEUE_MEM.data.as_ptr() as u64) / 4096;
         self.write32(0x040, pfn as u32);
         self.write32(0x070, 1 | 2 | 4 | 8); // DRIVER_OK
     }
 
-    fn op_sector(&mut self, sector: u64, buf: &mut [u8], is_write: bool) -> Result<(), &'static str> {
-        if buf.len() != 512 { return Err("Buffer must be 512 bytes"); }
-        
+    fn op_sector(
+        &mut self,
+        sector: u64,
+        buf: &mut [u8],
+        is_write: bool,
+    ) -> Result<(), &'static str> {
+        if buf.len() != 512 {
+            return Err("Buffer must be 512 bytes");
+        }
+
         let head_idx = self.queue.alloc_desc().ok_or("No desc")?;
         let data_idx = self.queue.alloc_desc().ok_or("No desc")?;
         let status_idx = self.queue.alloc_desc().ok_or("No desc")?;
 
-        static mut REQ_HDR: VirtioBlkReqHeader = VirtioBlkReqHeader{ req_type: 0, reserved: 0, sector: 0 };
+        static mut REQ_HDR: VirtioBlkReqHeader = VirtioBlkReqHeader {
+            req_type: 0,
+            reserved: 0,
+            sector: 0,
+        };
         static mut REQ_STATUS: u8 = 0;
 
         unsafe {
@@ -96,17 +111,23 @@ impl VirtioBlock {
             self.queue.desc[status_idx as usize].flags = 2; // WRITE
 
             self.queue.push_avail(head_idx);
-            self.write32(0x050, 0); 
+            self.write32(0x050, 0);
 
             // Poll
-            while !self.queue.has_used() { core::hint::spin_loop(); }
+            while !self.queue.has_used() {
+                core::hint::spin_loop();
+            }
             self.queue.pop_used();
 
             self.queue.free_desc(head_idx);
             self.queue.free_desc(data_idx);
             self.queue.free_desc(status_idx);
 
-            if REQ_STATUS == 0 { Ok(()) } else { Err("IO Error") }
+            if REQ_STATUS == 0 {
+                Ok(())
+            } else {
+                Err("IO Error")
+            }
         }
     }
 
@@ -115,7 +136,7 @@ impl VirtioBlock {
     }
 
     pub fn write_sector(&mut self, sector: u64, buf: &[u8]) -> Result<(), &'static str> {
-        // Cast const slice to mut slice because op_sector signature expects mut, 
+        // Cast const slice to mut slice because op_sector signature expects mut,
         // but for write op the device won't actually modify it.
         let ptr = buf.as_ptr() as *mut u8;
         let mut_slice = unsafe { core::slice::from_raw_parts_mut(ptr, 512) };
@@ -128,5 +149,7 @@ impl VirtioBlock {
     fn write32(&self, offset: usize, val: u32) {
         unsafe { write_volatile((self.base + offset) as *mut u32, val) }
     }
-    pub fn capacity(&self) -> u64 { self.capacity }
+    pub fn capacity(&self) -> u64 {
+        self.capacity
+    }
 }

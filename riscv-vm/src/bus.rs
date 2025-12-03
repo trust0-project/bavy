@@ -1,8 +1,8 @@
-use crate::clint::{Clint, CLINT_BASE, CLINT_SIZE};
-use crate::plic::{Plic, PLIC_BASE, PLIC_SIZE, UART_IRQ, VIRTIO0_IRQ};
-use crate::uart::{Uart, UART_BASE, UART_SIZE};
-use crate::virtio::VirtioDevice;
 use crate::Trap;
+use crate::devices::clint::{CLINT_BASE, CLINT_SIZE, Clint};
+use crate::devices::plic::{PLIC_BASE, PLIC_SIZE, Plic, UART_IRQ, VIRTIO0_IRQ};
+use crate::devices::uart::{UART_BASE, UART_SIZE, Uart};
+use crate::devices::virtio::VirtioDevice;
 use crate::dram::Dram;
 
 #[cfg(target_arch = "wasm32")]
@@ -12,11 +12,11 @@ use js_sys::SharedArrayBuffer;
 use std::sync::Mutex;
 
 /// Global mutex for AMO (Atomic Memory Operations) to ensure atomicity across harts.
-/// 
+///
 /// On real RISC-V hardware, AMO instructions perform read-modify-write atomically.
 /// In our emulator, each hart runs in a separate thread, so we need explicit
 /// synchronization to prevent race conditions.
-/// 
+///
 /// For WASM builds, we use JavaScript Atomics API instead (see atomic_* methods below).
 #[cfg(not(target_arch = "wasm32"))]
 static AMO_LOCK: Mutex<()> = Mutex::new(());
@@ -172,12 +172,20 @@ pub trait Bus: Send + Sync {
     fn atomic_min(&self, addr: u64, value: u64, is_word: bool) -> Result<u64, Trap> {
         if is_word {
             let old = self.read32(addr)? as i32 as i64 as u64;
-            let new = if (old as i64) < (value as i64) { old } else { value };
+            let new = if (old as i64) < (value as i64) {
+                old
+            } else {
+                value
+            };
             self.write32(addr, new as u32)?;
             Ok(old)
         } else {
             let old = self.read64(addr)?;
-            let new = if (old as i64) < (value as i64) { old } else { value };
+            let new = if (old as i64) < (value as i64) {
+                old
+            } else {
+                value
+            };
             self.write64(addr, new)?;
             Ok(old)
         }
@@ -187,12 +195,20 @@ pub trait Bus: Send + Sync {
     fn atomic_max(&self, addr: u64, value: u64, is_word: bool) -> Result<u64, Trap> {
         if is_word {
             let old = self.read32(addr)? as i32 as i64 as u64;
-            let new = if (old as i64) > (value as i64) { old } else { value };
+            let new = if (old as i64) > (value as i64) {
+                old
+            } else {
+                value
+            };
             self.write32(addr, new as u32)?;
             Ok(old)
         } else {
             let old = self.read64(addr)?;
-            let new = if (old as i64) > (value as i64) { old } else { value };
+            let new = if (old as i64) > (value as i64) {
+                old
+            } else {
+                value
+            };
             self.write64(addr, new)?;
             Ok(old)
         }
@@ -202,7 +218,11 @@ pub trait Bus: Send + Sync {
     fn atomic_minu(&self, addr: u64, value: u64, is_word: bool) -> Result<u64, Trap> {
         if is_word {
             let old = self.read32(addr)? as u32 as u64;
-            let new = if old < (value as u32 as u64) { old } else { value };
+            let new = if old < (value as u32 as u64) {
+                old
+            } else {
+                value
+            };
             self.write32(addr, new as u32)?;
             Ok(old as i32 as i64 as u64)
         } else {
@@ -217,7 +237,11 @@ pub trait Bus: Send + Sync {
     fn atomic_maxu(&self, addr: u64, value: u64, is_word: bool) -> Result<u64, Trap> {
         if is_word {
             let old = self.read32(addr)? as u32 as u64;
-            let new = if old > (value as u32 as u64) { old } else { value };
+            let new = if old > (value as u32 as u64) {
+                old
+            } else {
+                value
+            };
             self.write32(addr, new as u32)?;
             Ok(old as i32 as i64 as u64)
         } else {
@@ -308,7 +332,7 @@ impl SystemBus {
     /// SharedArrayBuffer::slice() creates a copy, breaking shared memory.
     #[cfg(target_arch = "wasm32")]
     pub fn from_shared_buffer(
-        buffer: SharedArrayBuffer, 
+        buffer: SharedArrayBuffer,
         dram_offset: usize,
         shared_clint: crate::shared_mem::wasm::SharedClint,
         is_worker: bool,
@@ -317,17 +341,17 @@ impl SystemBus {
         // The local CLINT is a fallback; shared_clint is used for actual MMIO
         let num_harts = shared_clint.num_harts();
         let clint = Clint::with_harts(num_harts);
-        
+
         // Create shared UART output for workers to send output to main thread
         let shared_uart_output = crate::shared_mem::wasm::SharedUartOutput::new(&buffer);
-        
+
         // Create shared UART input only for workers - main thread reads from local UART
         let shared_uart_input = if is_worker {
             Some(crate::shared_mem::wasm::SharedUartInput::new(&buffer))
         } else {
             None
         };
-        
+
         Self {
             dram: Dram::from_shared(DRAM_BASE, buffer, dram_offset),
             clint,
@@ -347,7 +371,7 @@ impl SystemBus {
     pub fn dram_size(&self) -> usize {
         self.dram.size()
     }
-    
+
     /// Set the number of harts (called by emulator at init).
     /// This writes the hart count to a CLINT register so the kernel can read it.
     pub fn set_num_harts(&self, num_harts: usize) {
@@ -360,12 +384,12 @@ impl SystemBus {
     }
 
     /// Check interrupts for a specific hart.
-    /// 
+    ///
     /// Each hart has its own:
     /// - MSIP (software interrupt from CLINT)
     /// - MTIP (timer interrupt from CLINT)
     /// - SEIP/MEIP (external interrupt from PLIC)
-    /// 
+    ///
     /// Thread-safe: each device has internal locking.
     /// Optimized to minimize lock acquisitions.
     #[cfg(not(target_arch = "wasm32"))]
@@ -395,7 +419,7 @@ impl SystemBus {
 
         // Get CLINT interrupts in a single lock acquisition
         let (msip, timer) = self.clint.check_interrupts_for_hart(hart_id);
-        
+
         // MSIP (Machine Software Interrupt) - Bit 3
         if msip {
             mip |= 1 << 3;
@@ -408,21 +432,27 @@ impl SystemBus {
 
         // SEIP (Supervisor External Interrupt) - Bit 9
         // Use fast lock-free check
-        if self.plic.is_interrupt_pending_for_fast(Plic::s_context(hart_id)) {
+        if self
+            .plic
+            .is_interrupt_pending_for_fast(Plic::s_context(hart_id))
+        {
             mip |= 1 << 9;
         }
 
         // MEIP (Machine External Interrupt) - Bit 11
         // Use fast lock-free check
-        if self.plic.is_interrupt_pending_for_fast(Plic::m_context(hart_id)) {
+        if self
+            .plic
+            .is_interrupt_pending_for_fast(Plic::m_context(hart_id))
+        {
             mip |= 1 << 11;
         }
 
         mip
     }
-    
+
     /// Check interrupts for a specific hart (WASM version).
-    /// 
+    ///
     /// For WASM with shared memory, uses the shared CLINT to correctly
     /// receive IPIs between harts.
     #[cfg(target_arch = "wasm32")]
@@ -438,7 +468,7 @@ impl SystemBus {
         } else {
             self.clint.check_interrupts_for_hart(hart_id)
         };
-        
+
         // MSIP (Machine Software Interrupt) - Bit 3
         if msip {
             mip |= 1 << 3;
@@ -470,12 +500,18 @@ impl SystemBus {
         }
 
         // SEIP (Supervisor External Interrupt) - Bit 9
-        if self.plic.is_interrupt_pending_for_fast(Plic::s_context(hart_id)) {
+        if self
+            .plic
+            .is_interrupt_pending_for_fast(Plic::s_context(hart_id))
+        {
             mip |= 1 << 9;
         }
 
         // MEIP (Machine External Interrupt) - Bit 11
-        if self.plic.is_interrupt_pending_for_fast(Plic::m_context(hart_id)) {
+        if self
+            .plic
+            .is_interrupt_pending_for_fast(Plic::m_context(hart_id))
+        {
             mip |= 1 << 11;
         }
 
@@ -492,7 +528,7 @@ impl SystemBus {
         }
         None
     }
-    
+
     /// Check if an address is in the VirtIO MMIO region (even if no device present).
     /// Returns the offset within the device region if in range.
     fn is_virtio_region(&self, addr: u64) -> Option<u64> {
@@ -502,7 +538,7 @@ impl SystemBus {
             None
         }
     }
-    
+
     /// Poll all VirtIO devices for pending work (e.g., incoming network packets).
     /// Should be called periodically from the main emulation loop.
     pub fn poll_virtio(&self) {
@@ -512,7 +548,7 @@ impl SystemBus {
             }
         }
     }
-    
+
     /// Load from CLINT, routing through shared CLINT when available (WASM workers).
     #[cfg(target_arch = "wasm32")]
     #[inline]
@@ -523,14 +559,14 @@ impl SystemBus {
             self.clint.load(offset, size)
         }
     }
-    
+
     /// Load from CLINT (native builds always use local CLINT).
     #[cfg(not(target_arch = "wasm32"))]
     #[inline]
     fn clint_load(&self, offset: u64, size: u64) -> u64 {
         self.clint.load(offset, size)
     }
-    
+
     /// Store to CLINT, routing through shared CLINT when available (WASM workers).
     #[cfg(target_arch = "wasm32")]
     #[inline]
@@ -541,16 +577,16 @@ impl SystemBus {
             self.clint.store(offset, size, value);
         }
     }
-    
+
     /// Store to CLINT (native builds always use local CLINT).
     #[cfg(not(target_arch = "wasm32"))]
     #[inline]
     fn clint_store(&self, offset: u64, size: u64, value: u64) {
         self.clint.store(offset, size, value);
     }
-    
+
     // Slow path methods for MMIO device access (moved out of hot path)
-    
+
     #[cold]
     fn read8_slow(&self, addr: u64) -> Result<u8, Trap> {
         // Test finisher region: reads are harmless and return zero.
@@ -566,7 +602,10 @@ impl SystemBus {
 
         if addr >= PLIC_BASE && addr < PLIC_BASE + PLIC_SIZE {
             let offset = addr - PLIC_BASE;
-            let val = self.plic.load(offset, 1).map_err(|_| Trap::LoadAccessFault(addr))?;
+            let val = self
+                .plic
+                .load(offset, 1)
+                .map_err(|_| Trap::LoadAccessFault(addr))?;
             return Ok(val as u8);
         }
 
@@ -595,18 +634,23 @@ impl SystemBus {
                 }
             }
             // Fall through to local UART for main thread or other registers
-            let val = self.uart.load(offset, 1).map_err(|_| Trap::LoadAccessFault(addr))?;
+            let val = self
+                .uart
+                .load(offset, 1)
+                .map_err(|_| Trap::LoadAccessFault(addr))?;
             return Ok(val as u8);
         }
 
         if let Some((idx, offset)) = self.get_virtio_device(addr) {
             // Emulate narrow MMIO reads by extracting from the 32-bit register value
             let aligned = offset & !3;
-            let word = self.virtio_devices[idx].read(aligned).map_err(|_| Trap::LoadAccessFault(addr))?;
+            let word = self.virtio_devices[idx]
+                .read(aligned)
+                .map_err(|_| Trap::LoadAccessFault(addr))?;
             let shift = ((offset & 3) * 8) as u64;
             return Ok(((word >> shift) & 0xff) as u8);
         }
-        
+
         // Unmapped VirtIO slots return 0 (allows safe probing)
         if self.is_virtio_region(addr).is_some() {
             return Ok(0);
@@ -614,7 +658,7 @@ impl SystemBus {
 
         Err(Trap::LoadAccessFault(addr))
     }
-    
+
     #[cold]
     fn read16_slow(&self, addr: u64) -> Result<u16, Trap> {
         if addr >= TEST_FINISHER_BASE && addr < TEST_FINISHER_BASE + TEST_FINISHER_SIZE {
@@ -629,23 +673,31 @@ impl SystemBus {
 
         if addr >= PLIC_BASE && addr < PLIC_BASE + PLIC_SIZE {
             let offset = addr - PLIC_BASE;
-            let val = self.plic.load(offset, 2).map_err(|_| Trap::LoadAccessFault(addr))?;
+            let val = self
+                .plic
+                .load(offset, 2)
+                .map_err(|_| Trap::LoadAccessFault(addr))?;
             return Ok(val as u16);
         }
 
         if addr >= UART_BASE && addr < UART_BASE + UART_SIZE {
-             let offset = addr - UART_BASE;
-             let val = self.uart.load(offset, 2).map_err(|_| Trap::LoadAccessFault(addr))?;
-             return Ok(val as u16);
+            let offset = addr - UART_BASE;
+            let val = self
+                .uart
+                .load(offset, 2)
+                .map_err(|_| Trap::LoadAccessFault(addr))?;
+            return Ok(val as u16);
         }
 
         if let Some((idx, offset)) = self.get_virtio_device(addr) {
             let aligned = offset & !3;
-            let word = self.virtio_devices[idx].read(aligned).map_err(|_| Trap::LoadAccessFault(addr))?;
+            let word = self.virtio_devices[idx]
+                .read(aligned)
+                .map_err(|_| Trap::LoadAccessFault(addr))?;
             let shift = ((offset & 3) * 8) as u64;
             return Ok(((word >> shift) & 0xffff) as u16);
         }
-        
+
         // Unmapped VirtIO slots return 0 (allows safe probing)
         if self.is_virtio_region(addr).is_some() {
             return Ok(0);
@@ -653,7 +705,7 @@ impl SystemBus {
 
         Err(Trap::LoadAccessFault(addr))
     }
-    
+
     #[cold]
     fn read32_slow(&self, addr: u64) -> Result<u32, Trap> {
         if addr >= TEST_FINISHER_BASE && addr < TEST_FINISHER_BASE + TEST_FINISHER_SIZE {
@@ -668,21 +720,29 @@ impl SystemBus {
 
         if addr >= PLIC_BASE && addr < PLIC_BASE + PLIC_SIZE {
             let offset = addr - PLIC_BASE;
-            let val = self.plic.load(offset, 4).map_err(|_| Trap::LoadAccessFault(addr))?;
+            let val = self
+                .plic
+                .load(offset, 4)
+                .map_err(|_| Trap::LoadAccessFault(addr))?;
             return Ok(val as u32);
         }
 
         if addr >= UART_BASE && addr < UART_BASE + UART_SIZE {
-             let offset = addr - UART_BASE;
-             let val = self.uart.load(offset, 4).map_err(|_| Trap::LoadAccessFault(addr))?;
-             return Ok(val as u32);
+            let offset = addr - UART_BASE;
+            let val = self
+                .uart
+                .load(offset, 4)
+                .map_err(|_| Trap::LoadAccessFault(addr))?;
+            return Ok(val as u32);
         }
 
         if let Some((idx, offset)) = self.get_virtio_device(addr) {
-            let val = self.virtio_devices[idx].read(offset).map_err(|_| Trap::LoadAccessFault(addr))?;
+            let val = self.virtio_devices[idx]
+                .read(offset)
+                .map_err(|_| Trap::LoadAccessFault(addr))?;
             return Ok(val as u32);
         }
-        
+
         // Unmapped VirtIO slots return 0 (allows safe probing)
         if self.is_virtio_region(addr).is_some() {
             return Ok(0);
@@ -690,7 +750,7 @@ impl SystemBus {
 
         Err(Trap::LoadAccessFault(addr))
     }
-    
+
     #[cold]
     fn read64_slow(&self, addr: u64) -> Result<u64, Trap> {
         if addr >= TEST_FINISHER_BASE && addr < TEST_FINISHER_BASE + TEST_FINISHER_SIZE {
@@ -705,22 +765,32 @@ impl SystemBus {
 
         if addr >= PLIC_BASE && addr < PLIC_BASE + PLIC_SIZE {
             let offset = addr - PLIC_BASE;
-            let val = self.plic.load(offset, 8).map_err(|_| Trap::LoadAccessFault(addr))?;
+            let val = self
+                .plic
+                .load(offset, 8)
+                .map_err(|_| Trap::LoadAccessFault(addr))?;
             return Ok(val);
         }
 
         if addr >= UART_BASE && addr < UART_BASE + UART_SIZE {
-             let offset = addr - UART_BASE;
-             let val = self.uart.load(offset, 8).map_err(|_| Trap::LoadAccessFault(addr))?;
-             return Ok(val);
+            let offset = addr - UART_BASE;
+            let val = self
+                .uart
+                .load(offset, 8)
+                .map_err(|_| Trap::LoadAccessFault(addr))?;
+            return Ok(val);
         }
 
         if let Some((idx, offset)) = self.get_virtio_device(addr) {
-            let low = self.virtio_devices[idx].read(offset).map_err(|_| Trap::LoadAccessFault(addr))?;
-            let high = self.virtio_devices[idx].read(offset + 4).map_err(|_| Trap::LoadAccessFault(addr + 4))?;
+            let low = self.virtio_devices[idx]
+                .read(offset)
+                .map_err(|_| Trap::LoadAccessFault(addr))?;
+            let high = self.virtio_devices[idx]
+                .read(offset + 4)
+                .map_err(|_| Trap::LoadAccessFault(addr + 4))?;
             return Ok((low as u64) | ((high as u64) << 32));
         }
-        
+
         // Unmapped VirtIO slots return 0 (allows safe probing)
         if self.is_virtio_region(addr).is_some() {
             return Ok(0);
@@ -728,7 +798,7 @@ impl SystemBus {
 
         Err(Trap::LoadAccessFault(addr))
     }
-    
+
     #[cold]
     fn write8_slow(&self, addr: u64, val: u8) -> Result<(), Trap> {
         // Any write in the test finisher region signals a requested trap to the host.
@@ -744,7 +814,9 @@ impl SystemBus {
 
         if addr >= PLIC_BASE && addr < PLIC_BASE + PLIC_SIZE {
             let offset = addr - PLIC_BASE;
-            self.plic.store(offset, 1, val as u64).map_err(|_| Trap::StoreAccessFault(addr))?;
+            self.plic
+                .store(offset, 1, val as u64)
+                .map_err(|_| Trap::StoreAccessFault(addr))?;
             return Ok(());
         }
 
@@ -761,7 +833,9 @@ impl SystemBus {
                 }
             }
             // Fall through to local UART for main thread or non-THR registers
-            self.uart.store(offset, 1, val as u64).map_err(|_| Trap::StoreAccessFault(addr))?;
+            self.uart
+                .store(offset, 1, val as u64)
+                .map_err(|_| Trap::StoreAccessFault(addr))?;
             return Ok(());
         }
 
@@ -773,7 +847,7 @@ impl SystemBus {
 
         Err(Trap::StoreAccessFault(addr))
     }
-    
+
     #[cold]
     fn write16_slow(&self, addr: u64, val: u16) -> Result<(), Trap> {
         if addr >= TEST_FINISHER_BASE && addr < TEST_FINISHER_BASE + TEST_FINISHER_SIZE {
@@ -788,14 +862,18 @@ impl SystemBus {
 
         if addr >= PLIC_BASE && addr < PLIC_BASE + PLIC_SIZE {
             let offset = addr - PLIC_BASE;
-            self.plic.store(offset, 2, val as u64).map_err(|_| Trap::StoreAccessFault(addr))?;
+            self.plic
+                .store(offset, 2, val as u64)
+                .map_err(|_| Trap::StoreAccessFault(addr))?;
             return Ok(());
         }
 
         if addr >= UART_BASE && addr < UART_BASE + UART_SIZE {
-             let offset = addr - UART_BASE;
-             self.uart.store(offset, 2, val as u64).map_err(|_| Trap::StoreAccessFault(addr))?;
-             return Ok(());
+            let offset = addr - UART_BASE;
+            self.uart
+                .store(offset, 2, val as u64)
+                .map_err(|_| Trap::StoreAccessFault(addr))?;
+            return Ok(());
         }
 
         if let Some((_idx, _offset)) = self.get_virtio_device(addr) {
@@ -804,7 +882,7 @@ impl SystemBus {
 
         Err(Trap::StoreAccessFault(addr))
     }
-    
+
     #[cold]
     fn write32_slow(&self, addr: u64, val: u32) -> Result<(), Trap> {
         if addr >= TEST_FINISHER_BASE && addr < TEST_FINISHER_BASE + TEST_FINISHER_SIZE {
@@ -819,22 +897,27 @@ impl SystemBus {
 
         if addr >= PLIC_BASE && addr < PLIC_BASE + PLIC_SIZE {
             let offset = addr - PLIC_BASE;
-            self.plic.store(offset, 4, val as u64).map_err(|_| Trap::StoreAccessFault(addr))?;
+            self.plic
+                .store(offset, 4, val as u64)
+                .map_err(|_| Trap::StoreAccessFault(addr))?;
             return Ok(());
         }
 
         if addr >= UART_BASE && addr < UART_BASE + UART_SIZE {
-             let offset = addr - UART_BASE;
-             self.uart.store(offset, 4, val as u64).map_err(|_| Trap::StoreAccessFault(addr))?;
-             return Ok(());
-        }
-
-        if let Some((idx, offset)) = self.get_virtio_device(addr) {
-            self.virtio_devices[idx].write(offset, val as u64, &self.dram)
+            let offset = addr - UART_BASE;
+            self.uart
+                .store(offset, 4, val as u64)
                 .map_err(|_| Trap::StoreAccessFault(addr))?;
             return Ok(());
         }
-        
+
+        if let Some((idx, offset)) = self.get_virtio_device(addr) {
+            self.virtio_devices[idx]
+                .write(offset, val as u64, &self.dram)
+                .map_err(|_| Trap::StoreAccessFault(addr))?;
+            return Ok(());
+        }
+
         // Writes to unmapped VirtIO slots are silently ignored (allows safe probing)
         if self.is_virtio_region(addr).is_some() {
             return Ok(());
@@ -842,7 +925,7 @@ impl SystemBus {
 
         Err(Trap::StoreAccessFault(addr))
     }
-    
+
     #[cold]
     fn write64_slow(&self, addr: u64, val: u64) -> Result<(), Trap> {
         if addr >= TEST_FINISHER_BASE && addr < TEST_FINISHER_BASE + TEST_FINISHER_SIZE {
@@ -857,14 +940,18 @@ impl SystemBus {
 
         if addr >= PLIC_BASE && addr < PLIC_BASE + PLIC_SIZE {
             let offset = addr - PLIC_BASE;
-            self.plic.store(offset, 8, val).map_err(|_| Trap::StoreAccessFault(addr))?;
+            self.plic
+                .store(offset, 8, val)
+                .map_err(|_| Trap::StoreAccessFault(addr))?;
             return Ok(());
         }
 
         if addr >= UART_BASE && addr < UART_BASE + UART_SIZE {
-             let offset = addr - UART_BASE;
-             self.uart.store(offset, 8, val).map_err(|_| Trap::StoreAccessFault(addr))?;
-             return Ok(());
+            let offset = addr - UART_BASE;
+            self.uart
+                .store(offset, 8, val)
+                .map_err(|_| Trap::StoreAccessFault(addr))?;
+            return Ok(());
         }
 
         if let Some((_idx, _offset)) = self.get_virtio_device(addr) {
@@ -872,7 +959,7 @@ impl SystemBus {
             // except for legacy queue PFN which is 32-bit anyway.
             return Ok(());
         }
-        
+
         // Writes to unmapped VirtIO slots are silently ignored (allows safe probing)
         if self.is_virtio_region(addr).is_some() {
             return Ok(());
@@ -902,11 +989,15 @@ impl Bus for SystemBus {
     fn atomic_swap(&self, addr: u64, value: u64, is_word: bool) -> Result<u64, Trap> {
         if let Some(off) = self.dram.offset(addr) {
             if is_word {
-                let old = self.dram.atomic_swap_32(off as u64, value as u32)
+                let old = self
+                    .dram
+                    .atomic_swap_32(off as u64, value as u32)
                     .map_err(|_| Trap::StoreAccessFault(addr))?;
                 Ok(old as i32 as i64 as u64)
             } else {
-                let old = self.dram.atomic_swap_64(off as u64, value)
+                let old = self
+                    .dram
+                    .atomic_swap_64(off as u64, value)
                     .map_err(|_| Trap::StoreAccessFault(addr))?;
                 Ok(old)
             }
@@ -928,11 +1019,15 @@ impl Bus for SystemBus {
     fn atomic_add(&self, addr: u64, value: u64, is_word: bool) -> Result<u64, Trap> {
         if let Some(off) = self.dram.offset(addr) {
             if is_word {
-                let old = self.dram.atomic_add_32(off as u64, value as u32)
+                let old = self
+                    .dram
+                    .atomic_add_32(off as u64, value as u32)
                     .map_err(|_| Trap::StoreAccessFault(addr))?;
                 Ok(old as i32 as i64 as u64)
             } else {
-                let old = self.dram.atomic_add_64(off as u64, value)
+                let old = self
+                    .dram
+                    .atomic_add_64(off as u64, value)
                     .map_err(|_| Trap::StoreAccessFault(addr))?;
                 Ok(old)
             }
@@ -953,11 +1048,15 @@ impl Bus for SystemBus {
     fn atomic_and(&self, addr: u64, value: u64, is_word: bool) -> Result<u64, Trap> {
         if let Some(off) = self.dram.offset(addr) {
             if is_word {
-                let old = self.dram.atomic_and_32(off as u64, value as u32)
+                let old = self
+                    .dram
+                    .atomic_and_32(off as u64, value as u32)
                     .map_err(|_| Trap::StoreAccessFault(addr))?;
                 Ok(old as i32 as i64 as u64)
             } else {
-                let old = self.dram.atomic_and_64(off as u64, value)
+                let old = self
+                    .dram
+                    .atomic_and_64(off as u64, value)
                     .map_err(|_| Trap::StoreAccessFault(addr))?;
                 Ok(old)
             }
@@ -978,11 +1077,15 @@ impl Bus for SystemBus {
     fn atomic_or(&self, addr: u64, value: u64, is_word: bool) -> Result<u64, Trap> {
         if let Some(off) = self.dram.offset(addr) {
             if is_word {
-                let old = self.dram.atomic_or_32(off as u64, value as u32)
+                let old = self
+                    .dram
+                    .atomic_or_32(off as u64, value as u32)
                     .map_err(|_| Trap::StoreAccessFault(addr))?;
                 Ok(old as i32 as i64 as u64)
             } else {
-                let old = self.dram.atomic_or_64(off as u64, value)
+                let old = self
+                    .dram
+                    .atomic_or_64(off as u64, value)
                     .map_err(|_| Trap::StoreAccessFault(addr))?;
                 Ok(old)
             }
@@ -1003,11 +1106,15 @@ impl Bus for SystemBus {
     fn atomic_xor(&self, addr: u64, value: u64, is_word: bool) -> Result<u64, Trap> {
         if let Some(off) = self.dram.offset(addr) {
             if is_word {
-                let old = self.dram.atomic_xor_32(off as u64, value as u32)
+                let old = self
+                    .dram
+                    .atomic_xor_32(off as u64, value as u32)
                     .map_err(|_| Trap::StoreAccessFault(addr))?;
                 Ok(old as i32 as i64 as u64)
             } else {
-                let old = self.dram.atomic_xor_64(off as u64, value)
+                let old = self
+                    .dram
+                    .atomic_xor_64(off as u64, value)
                     .map_err(|_| Trap::StoreAccessFault(addr))?;
                 Ok(old)
             }
@@ -1030,23 +1137,36 @@ impl Bus for SystemBus {
         if let Some(off) = self.dram.offset(addr) {
             loop {
                 let old = if is_word {
-                    self.dram.atomic_load_32(off as u64)
-                        .map_err(|_| Trap::LoadAccessFault(addr))? as i32 as i64 as u64
+                    self.dram
+                        .atomic_load_32(off as u64)
+                        .map_err(|_| Trap::LoadAccessFault(addr))? as i32 as i64
+                        as u64
                 } else {
-                    self.dram.atomic_load_64(off as u64)
+                    self.dram
+                        .atomic_load_64(off as u64)
                         .map_err(|_| Trap::LoadAccessFault(addr))?
                 };
-                let new = if (old as i64) < (value as i64) { old } else { value };
-                if is_word {
-                    let (success, _) = self.dram.atomic_compare_exchange_32(
-                        off as u64, old as u32, new as u32
-                    ).map_err(|_| Trap::StoreAccessFault(addr))?;
-                    if success { return Ok(old); }
+                let new = if (old as i64) < (value as i64) {
+                    old
                 } else {
-                    let (success, _) = self.dram.atomic_compare_exchange_64(
-                        off as u64, old, new
-                    ).map_err(|_| Trap::StoreAccessFault(addr))?;
-                    if success { return Ok(old); }
+                    value
+                };
+                if is_word {
+                    let (success, _) = self
+                        .dram
+                        .atomic_compare_exchange_32(off as u64, old as u32, new as u32)
+                        .map_err(|_| Trap::StoreAccessFault(addr))?;
+                    if success {
+                        return Ok(old);
+                    }
+                } else {
+                    let (success, _) = self
+                        .dram
+                        .atomic_compare_exchange_64(off as u64, old, new)
+                        .map_err(|_| Trap::StoreAccessFault(addr))?;
+                    if success {
+                        return Ok(old);
+                    }
                 }
                 std::hint::spin_loop();
             }
@@ -1054,12 +1174,20 @@ impl Bus for SystemBus {
             // Fallback for non-DRAM
             if is_word {
                 let old = self.read32(addr)? as i32 as i64 as u64;
-                let new = if (old as i64) < (value as i64) { old } else { value };
+                let new = if (old as i64) < (value as i64) {
+                    old
+                } else {
+                    value
+                };
                 self.write32(addr, new as u32)?;
                 Ok(old)
             } else {
                 let old = self.read64(addr)?;
-                let new = if (old as i64) < (value as i64) { old } else { value };
+                let new = if (old as i64) < (value as i64) {
+                    old
+                } else {
+                    value
+                };
                 self.write64(addr, new)?;
                 Ok(old)
             }
@@ -1071,35 +1199,56 @@ impl Bus for SystemBus {
         if let Some(off) = self.dram.offset(addr) {
             loop {
                 let old = if is_word {
-                    self.dram.atomic_load_32(off as u64)
-                        .map_err(|_| Trap::LoadAccessFault(addr))? as i32 as i64 as u64
+                    self.dram
+                        .atomic_load_32(off as u64)
+                        .map_err(|_| Trap::LoadAccessFault(addr))? as i32 as i64
+                        as u64
                 } else {
-                    self.dram.atomic_load_64(off as u64)
+                    self.dram
+                        .atomic_load_64(off as u64)
                         .map_err(|_| Trap::LoadAccessFault(addr))?
                 };
-                let new = if (old as i64) > (value as i64) { old } else { value };
-                if is_word {
-                    let (success, _) = self.dram.atomic_compare_exchange_32(
-                        off as u64, old as u32, new as u32
-                    ).map_err(|_| Trap::StoreAccessFault(addr))?;
-                    if success { return Ok(old); }
+                let new = if (old as i64) > (value as i64) {
+                    old
                 } else {
-                    let (success, _) = self.dram.atomic_compare_exchange_64(
-                        off as u64, old, new
-                    ).map_err(|_| Trap::StoreAccessFault(addr))?;
-                    if success { return Ok(old); }
+                    value
+                };
+                if is_word {
+                    let (success, _) = self
+                        .dram
+                        .atomic_compare_exchange_32(off as u64, old as u32, new as u32)
+                        .map_err(|_| Trap::StoreAccessFault(addr))?;
+                    if success {
+                        return Ok(old);
+                    }
+                } else {
+                    let (success, _) = self
+                        .dram
+                        .atomic_compare_exchange_64(off as u64, old, new)
+                        .map_err(|_| Trap::StoreAccessFault(addr))?;
+                    if success {
+                        return Ok(old);
+                    }
                 }
                 std::hint::spin_loop();
             }
         } else {
             if is_word {
                 let old = self.read32(addr)? as i32 as i64 as u64;
-                let new = if (old as i64) > (value as i64) { old } else { value };
+                let new = if (old as i64) > (value as i64) {
+                    old
+                } else {
+                    value
+                };
                 self.write32(addr, new as u32)?;
                 Ok(old)
             } else {
                 let old = self.read64(addr)?;
-                let new = if (old as i64) > (value as i64) { old } else { value };
+                let new = if (old as i64) > (value as i64) {
+                    old
+                } else {
+                    value
+                };
                 self.write64(addr, new)?;
                 Ok(old)
             }
@@ -1111,32 +1260,44 @@ impl Bus for SystemBus {
         if let Some(off) = self.dram.offset(addr) {
             loop {
                 let old = if is_word {
-                    self.dram.atomic_load_32(off as u64)
+                    self.dram
+                        .atomic_load_32(off as u64)
                         .map_err(|_| Trap::LoadAccessFault(addr))? as u64
                 } else {
-                    self.dram.atomic_load_64(off as u64)
+                    self.dram
+                        .atomic_load_64(off as u64)
                         .map_err(|_| Trap::LoadAccessFault(addr))?
                 };
                 let cmp_old = if is_word { old as u32 as u64 } else { old };
                 let cmp_val = if is_word { value as u32 as u64 } else { value };
                 let new = if cmp_old < cmp_val { old } else { value };
                 if is_word {
-                    let (success, _) = self.dram.atomic_compare_exchange_32(
-                        off as u64, old as u32, new as u32
-                    ).map_err(|_| Trap::StoreAccessFault(addr))?;
-                    if success { return Ok(old as i32 as i64 as u64); }
+                    let (success, _) = self
+                        .dram
+                        .atomic_compare_exchange_32(off as u64, old as u32, new as u32)
+                        .map_err(|_| Trap::StoreAccessFault(addr))?;
+                    if success {
+                        return Ok(old as i32 as i64 as u64);
+                    }
                 } else {
-                    let (success, _) = self.dram.atomic_compare_exchange_64(
-                        off as u64, old, new
-                    ).map_err(|_| Trap::StoreAccessFault(addr))?;
-                    if success { return Ok(old); }
+                    let (success, _) = self
+                        .dram
+                        .atomic_compare_exchange_64(off as u64, old, new)
+                        .map_err(|_| Trap::StoreAccessFault(addr))?;
+                    if success {
+                        return Ok(old);
+                    }
                 }
                 std::hint::spin_loop();
             }
         } else {
             if is_word {
                 let old = self.read32(addr)? as u32 as u64;
-                let new = if old < (value as u32 as u64) { old } else { value };
+                let new = if old < (value as u32 as u64) {
+                    old
+                } else {
+                    value
+                };
                 self.write32(addr, new as u32)?;
                 Ok(old as i32 as i64 as u64)
             } else {
@@ -1153,32 +1314,44 @@ impl Bus for SystemBus {
         if let Some(off) = self.dram.offset(addr) {
             loop {
                 let old = if is_word {
-                    self.dram.atomic_load_32(off as u64)
+                    self.dram
+                        .atomic_load_32(off as u64)
                         .map_err(|_| Trap::LoadAccessFault(addr))? as u64
                 } else {
-                    self.dram.atomic_load_64(off as u64)
+                    self.dram
+                        .atomic_load_64(off as u64)
                         .map_err(|_| Trap::LoadAccessFault(addr))?
                 };
                 let cmp_old = if is_word { old as u32 as u64 } else { old };
                 let cmp_val = if is_word { value as u32 as u64 } else { value };
                 let new = if cmp_old > cmp_val { old } else { value };
                 if is_word {
-                    let (success, _) = self.dram.atomic_compare_exchange_32(
-                        off as u64, old as u32, new as u32
-                    ).map_err(|_| Trap::StoreAccessFault(addr))?;
-                    if success { return Ok(old as i32 as i64 as u64); }
+                    let (success, _) = self
+                        .dram
+                        .atomic_compare_exchange_32(off as u64, old as u32, new as u32)
+                        .map_err(|_| Trap::StoreAccessFault(addr))?;
+                    if success {
+                        return Ok(old as i32 as i64 as u64);
+                    }
                 } else {
-                    let (success, _) = self.dram.atomic_compare_exchange_64(
-                        off as u64, old, new
-                    ).map_err(|_| Trap::StoreAccessFault(addr))?;
-                    if success { return Ok(old); }
+                    let (success, _) = self
+                        .dram
+                        .atomic_compare_exchange_64(off as u64, old, new)
+                        .map_err(|_| Trap::StoreAccessFault(addr))?;
+                    if success {
+                        return Ok(old);
+                    }
                 }
                 std::hint::spin_loop();
             }
         } else {
             if is_word {
                 let old = self.read32(addr)? as u32 as u64;
-                let new = if old > (value as u32 as u64) { old } else { value };
+                let new = if old > (value as u32 as u64) {
+                    old
+                } else {
+                    value
+                };
                 self.write32(addr, new as u32)?;
                 Ok(old as i32 as i64 as u64)
             } else {
@@ -1200,14 +1373,16 @@ impl Bus for SystemBus {
     ) -> Result<(bool, u64), Trap> {
         if let Some(off) = self.dram.offset(addr) {
             if is_word {
-                let (success, old) = self.dram.atomic_compare_exchange_32(
-                    off as u64, expected as u32, new_value as u32
-                ).map_err(|_| Trap::StoreAccessFault(addr))?;
+                let (success, old) = self
+                    .dram
+                    .atomic_compare_exchange_32(off as u64, expected as u32, new_value as u32)
+                    .map_err(|_| Trap::StoreAccessFault(addr))?;
                 Ok((success, old as i32 as i64 as u64))
             } else {
-                let (success, old) = self.dram.atomic_compare_exchange_64(
-                    off as u64, expected, new_value
-                ).map_err(|_| Trap::StoreAccessFault(addr))?;
+                let (success, old) = self
+                    .dram
+                    .atomic_compare_exchange_64(off as u64, expected, new_value)
+                    .map_err(|_| Trap::StoreAccessFault(addr))?;
                 Ok((success, old))
             }
         } else {
@@ -1312,12 +1487,20 @@ impl Bus for SystemBus {
         let _guard = AMO_LOCK.lock().unwrap();
         if is_word {
             let old = self.read32(addr)? as i32 as i64 as u64;
-            let new = if (old as i64) < (value as i64) { old } else { value };
+            let new = if (old as i64) < (value as i64) {
+                old
+            } else {
+                value
+            };
             self.write32(addr, new as u32)?;
             Ok(old)
         } else {
             let old = self.read64(addr)?;
-            let new = if (old as i64) < (value as i64) { old } else { value };
+            let new = if (old as i64) < (value as i64) {
+                old
+            } else {
+                value
+            };
             self.write64(addr, new)?;
             Ok(old)
         }
@@ -1328,12 +1511,20 @@ impl Bus for SystemBus {
         let _guard = AMO_LOCK.lock().unwrap();
         if is_word {
             let old = self.read32(addr)? as i32 as i64 as u64;
-            let new = if (old as i64) > (value as i64) { old } else { value };
+            let new = if (old as i64) > (value as i64) {
+                old
+            } else {
+                value
+            };
             self.write32(addr, new as u32)?;
             Ok(old)
         } else {
             let old = self.read64(addr)?;
-            let new = if (old as i64) > (value as i64) { old } else { value };
+            let new = if (old as i64) > (value as i64) {
+                old
+            } else {
+                value
+            };
             self.write64(addr, new)?;
             Ok(old)
         }
@@ -1344,7 +1535,11 @@ impl Bus for SystemBus {
         let _guard = AMO_LOCK.lock().unwrap();
         if is_word {
             let old = self.read32(addr)? as u32 as u64;
-            let new = if old < (value as u32 as u64) { old } else { value };
+            let new = if old < (value as u32 as u64) {
+                old
+            } else {
+                value
+            };
             self.write32(addr, new as u32)?;
             Ok(old as i32 as i64 as u64)
         } else {
@@ -1360,7 +1555,11 @@ impl Bus for SystemBus {
         let _guard = AMO_LOCK.lock().unwrap();
         if is_word {
             let old = self.read32(addr)? as u32 as u64;
-            let new = if old > (value as u32 as u64) { old } else { value };
+            let new = if old > (value as u32 as u64) {
+                old
+            } else {
+                value
+            };
             self.write32(addr, new as u32)?;
             Ok(old as i32 as i64 as u64)
         } else {
@@ -1403,7 +1602,10 @@ impl Bus for SystemBus {
     fn read8(&self, addr: u64) -> Result<u8, Trap> {
         // Fast path: DRAM access (most common case)
         if let Some(off) = self.dram.offset(addr) {
-            return self.dram.load_8(off as u64).map_err(|_| Trap::LoadAccessFault(addr));
+            return self
+                .dram
+                .load_8(off as u64)
+                .map_err(|_| Trap::LoadAccessFault(addr));
         }
         // Slow path: MMIO devices
         self.read8_slow(addr)
@@ -1416,7 +1618,10 @@ impl Bus for SystemBus {
         }
         // Fast path: DRAM access (most common case)
         if let Some(off) = self.dram.offset(addr) {
-            return self.dram.load_16(off as u64).map_err(|_| Trap::LoadAccessFault(addr));
+            return self
+                .dram
+                .load_16(off as u64)
+                .map_err(|_| Trap::LoadAccessFault(addr));
         }
         // Slow path: MMIO devices
         self.read16_slow(addr)
@@ -1429,7 +1634,10 @@ impl Bus for SystemBus {
         }
         // Fast path: DRAM access (most common case)
         if let Some(off) = self.dram.offset(addr) {
-            return self.dram.load_32(off as u64).map_err(|_| Trap::LoadAccessFault(addr));
+            return self
+                .dram
+                .load_32(off as u64)
+                .map_err(|_| Trap::LoadAccessFault(addr));
         }
         // Slow path: MMIO devices
         self.read32_slow(addr)
@@ -1442,7 +1650,10 @@ impl Bus for SystemBus {
         }
         // Fast path: DRAM access (most common case)
         if let Some(off) = self.dram.offset(addr) {
-            return self.dram.load_64(off as u64).map_err(|_| Trap::LoadAccessFault(addr));
+            return self
+                .dram
+                .load_64(off as u64)
+                .map_err(|_| Trap::LoadAccessFault(addr));
         }
         // Slow path: MMIO devices
         self.read64_slow(addr)
@@ -1452,7 +1663,10 @@ impl Bus for SystemBus {
     fn write8(&self, addr: u64, val: u8) -> Result<(), Trap> {
         // Fast path: DRAM access (most common case)
         if let Some(off) = self.dram.offset(addr) {
-            return self.dram.store_8(off as u64, val as u64).map_err(|_| Trap::StoreAccessFault(addr));
+            return self
+                .dram
+                .store_8(off as u64, val as u64)
+                .map_err(|_| Trap::StoreAccessFault(addr));
         }
         // Slow path: MMIO devices
         self.write8_slow(addr, val)
@@ -1465,7 +1679,10 @@ impl Bus for SystemBus {
         }
         // Fast path: DRAM access (most common case)
         if let Some(off) = self.dram.offset(addr) {
-            return self.dram.store_16(off as u64, val as u64).map_err(|_| Trap::StoreAccessFault(addr));
+            return self
+                .dram
+                .store_16(off as u64, val as u64)
+                .map_err(|_| Trap::StoreAccessFault(addr));
         }
         // Slow path: MMIO devices
         self.write16_slow(addr, val)
@@ -1478,7 +1695,10 @@ impl Bus for SystemBus {
         }
         // Fast path: DRAM access (most common case)
         if let Some(off) = self.dram.offset(addr) {
-            return self.dram.store_32(off as u64, val as u64).map_err(|_| Trap::StoreAccessFault(addr));
+            return self
+                .dram
+                .store_32(off as u64, val as u64)
+                .map_err(|_| Trap::StoreAccessFault(addr));
         }
         // Slow path: MMIO devices
         self.write32_slow(addr, val)
@@ -1491,7 +1711,10 @@ impl Bus for SystemBus {
         }
         // Fast path: DRAM access (most common case)
         if let Some(off) = self.dram.offset(addr) {
-            return self.dram.store_64(off as u64, val).map_err(|_| Trap::StoreAccessFault(addr));
+            return self
+                .dram
+                .store_64(off as u64, val)
+                .map_err(|_| Trap::StoreAccessFault(addr));
         }
         // Slow path: MMIO devices
         self.write64_slow(addr, val)
