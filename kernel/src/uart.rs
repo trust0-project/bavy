@@ -2,6 +2,18 @@ use core::fmt::{self, Write};
 
 const UART_BASE: usize = 0x1000_0000;
 
+// NS16550A UART register offsets
+const RBR: usize = 0x00; // Receiver Buffer Register (read)
+const THR: usize = 0x00; // Transmitter Holding Register (write)
+const IER: usize = 0x01; // Interrupt Enable Register
+const FCR: usize = 0x02; // FIFO Control Register (write)
+const LCR: usize = 0x03; // Line Control Register
+const LSR: usize = 0x05; // Line Status Register
+
+// LSR bits
+const LSR_RX_READY: u8 = 0x01; // Data ready
+const LSR_TX_IDLE: u8 = 0x20;  // THR empty (Transmitter Holding Register Empty)
+
 pub struct Console;
 
 impl Console {
@@ -9,19 +21,68 @@ impl Console {
         Self
     }
 
+    /// Initialize the UART for QEMU compatibility
+    /// This sets up the UART with 8N1 configuration and enables FIFOs
+    #[allow(dead_code)]
+    pub fn init() {
+        unsafe {
+            let base = UART_BASE as *mut u8;
+            
+            // Disable all interrupts
+            core::ptr::write_volatile(base.add(IER), 0x00);
+            
+            // Enable DLAB (Divisor Latch Access Bit) to set baud rate
+            core::ptr::write_volatile(base.add(LCR), 0x80);
+            
+            // Set divisor to 1 (115200 baud with 1.8432 MHz clock)
+            // DLL (Divisor Latch Low)
+            core::ptr::write_volatile(base.add(0), 0x01);
+            // DLM (Divisor Latch High)
+            core::ptr::write_volatile(base.add(1), 0x00);
+            
+            // 8 bits, no parity, one stop bit (8N1), disable DLAB
+            core::ptr::write_volatile(base.add(LCR), 0x03);
+            
+            // Enable FIFO, clear TX/RX queues, set 14-byte threshold
+            core::ptr::write_volatile(base.add(FCR), 0xC7);
+            
+            // Enable receiver interrupts (optional, not strictly needed for polling)
+            // core::ptr::write_volatile(base.add(IER), 0x01);
+        }
+    }
+
     #[inline(always)]
-    fn data_reg() -> *mut u8 {
-        UART_BASE as *mut u8
+    fn lsr() -> u8 {
+        unsafe { core::ptr::read_volatile((UART_BASE + LSR) as *const u8) }
+    }
+
+    #[inline(always)]
+    fn wait_for_tx_ready() {
+        // Wait until THR is empty (LSR bit 5)
+        while (Self::lsr() & LSR_TX_IDLE) == 0 {
+            core::hint::spin_loop();
+        }
+    }
+
+    #[inline(always)]
+    fn is_rx_ready() -> bool {
+        (Self::lsr() & LSR_RX_READY) != 0
     }
 
     pub fn write_byte(&mut self, byte: u8) {
+        Self::wait_for_tx_ready();
         unsafe {
-            core::ptr::write_volatile(Self::data_reg(), byte);
+            core::ptr::write_volatile((UART_BASE + THR) as *mut u8, byte);
         }
     }
 
     pub fn read_byte(&self) -> u8 {
-        unsafe { core::ptr::read_volatile(Self::data_reg() as *const u8) }
+        // Only return a byte if data is ready, otherwise return 0
+        if Self::is_rx_ready() {
+            unsafe { core::ptr::read_volatile((UART_BASE + RBR) as *const u8) }
+        } else {
+            0
+        }
     }
 }
 

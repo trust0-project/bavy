@@ -950,6 +950,12 @@ fn main() -> ! {
         }
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    // INITIALIZE UART FOR QEMU COMPATIBILITY
+    // ═══════════════════════════════════════════════════════════════════
+    // Must be done before any output. Sets up 8N1, enables FIFOs, etc.
+    uart::Console::init();
+
     // ─── CPU & ARCHITECTURE INFO ──────────────────────────────────────────────
     print_section("CPU & ARCHITECTURE");
     print_boot_info("Primary Hart", "0");

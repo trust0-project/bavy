@@ -1,3 +1,2 @@
 #!/bin/bash
-
-./target/release/riscv-vm --kernel target/riscv64gc-unknown-none-elf/release/kernel
+qemu-system-riscv64 -machine virt -m 1G -nographic -bios none \  -kernel target/riscv64gc-unknown-none-elf/release/kernel \  -drive file=target/riscv64gc-unknown-none-elf/release/fs.img,format=raw,id=hd0,if=none \  -device virtio-blk-device,drive=hd0
