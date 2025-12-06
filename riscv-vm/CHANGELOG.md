@@ -1,3 +1,13 @@
+## 0.1.5 (2025-12-06)
+
+### 🩹 Fixes
+
+- rust runtime Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([ed21970](https://github.com/elribonazo/riscv-vm/commit/ed21970))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.1.4 (2025-12-05)
 
 ### 🩹 Fixes
