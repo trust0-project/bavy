@@ -1,3 +1,13 @@
+## 0.1.9 (2025-12-06)
+
+### 🩹 Fixes
+
+- change Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([f646e2e](https://github.com/trust0-project/bavy/commit/f646e2e))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.1.8 (2025-12-06)
 
 ### 🩹 Fixes
