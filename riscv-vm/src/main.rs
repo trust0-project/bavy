@@ -85,9 +85,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Print banner
     uart_println!();
-    uart_println!("╔══════════════════════════════════════════════════════════════╗");
-    uart_println!("║              RISC-V Emulator (SMP Edition)                   ║");
-    uart_println!("╠══════════════════════════════════════════════════════════════╣");
     uart_println!(
         "║  Kernel: {:50} ║",
         args.kernel
