@@ -11,6 +11,8 @@
  * - runs the VM in a tight loop
  * - connects stdin → UART input and UART output → stdout
  *
+ * 
+ * 
  * Multi-hart support:
  * - Uses Node.js worker_threads for parallel execution
  * - Hart 0 runs on main thread (handles I/O)
