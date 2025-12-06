@@ -15,12 +15,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Kernel
-          - project: kernel
-            os: ubuntu-latest
-            target: riscv64gc-unknown-none-elf
-            binary_name: kernel
-            asset_name: kernel
 
           # RISC-V VM
           - project: riscv-vm
@@ -38,23 +32,6 @@ jobs:
             target: aarch64-apple-darwin
             binary_name: riscv-vm
             asset_name: riscv-vm-darwin-arm64
-
-          # Relay
-          - project: relay
-            os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            binary_name: relay
-            asset_name: relay-linux-amd64
-          - project: relay
-            os: macos-latest
-            target: x86_64-apple-darwin
-            binary_name: relay
-            asset_name: relay-darwin-amd64
-          - project: relay
-            os: macos-latest
-            target: aarch64-apple-darwin
-            binary_name: relay
-            asset_name: relay-darwin-arm64
 
     steps:
       - name: Check if project matches tag

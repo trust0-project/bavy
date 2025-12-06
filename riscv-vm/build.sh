@@ -9,6 +9,8 @@ PACKAGEJSON=./pkg/package.json
 IMPORTFILE=./pkg/riscv_vm.js
 
 echo "Building the rust library"
+cargo build --release
+
 RUSTFLAGS=--cfg=web_sys_unstable_apis npx wasm-pack build  --target web 
 
 if is_mac; then
