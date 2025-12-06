@@ -1,3 +1,13 @@
+## 0.1.8 (2025-12-06)
+
+### 🩹 Fixes
+
+- improve release pipeline Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([4e83148](https://github.com/trust0-project/bavy/commit/4e83148))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.1.7 (2025-12-06)
 
 ### 🩹 Fixes
