@@ -115,9 +115,11 @@ async function createVm(
   }
 
   // Create VM with requested number of harts
-  const numHarts = options?.harts ?? 1;
-  const vm = VmCtor.new_with_harts 
-    ? VmCtor.new_with_harts(kernelBytes, numHarts) 
+  // If harts is specified and >= 1, use new_with_harts
+  // Otherwise use default constructor which auto-detects (cpu/2)
+  const requestedHarts = options?.harts;
+  const vm = (requestedHarts !== undefined && requestedHarts >= 1 && VmCtor.new_with_harts)
+    ? VmCtor.new_with_harts(kernelBytes, requestedHarts) 
     : new VmCtor(kernelBytes);
 
   if (options?.disk) {
@@ -134,8 +136,10 @@ async function createVm(
   }
 
   // Start worker threads for secondary harts (1..numHarts)
+  // Use vm.num_harts() to get the actual hart count (handles auto-detect case)
   const workers: Worker[] = [];
-  if (numHarts > 1 && typeof vm.get_shared_buffer === 'function') {
+  const actualHarts = typeof vm.num_harts === 'function' ? vm.num_harts() : (requestedHarts ?? 1);
+  if (actualHarts > 1 && typeof vm.get_shared_buffer === 'function') {
     const sharedBuffer = vm.get_shared_buffer();
     
     if (sharedBuffer) {
@@ -146,9 +150,9 @@ async function createVm(
       const wasmPath = path.resolve(__dirname, '..', 'pkg', 'riscv_vm_bg.wasm');
       const workerPath = path.resolve(__dirname, 'node-worker.js');
       
-      console.error(`[VM] Starting ${numHarts - 1} worker threads...`);
+      console.error(`[VM] Starting ${actualHarts - 1} worker threads...`);
       
-      for (let hartId = 1; hartId < numHarts; hartId++) {
+      for (let hartId = 1; hartId < actualHarts; hartId++) {
         const worker = new Worker(workerPath, {
           workerData: {
             hartId,
@@ -438,8 +442,7 @@ const argv = (yargs(hideBin(process.argv)) as any)
   .option('harts', {
     alias: 'n',
     type: 'number',
-    describe: 'Number of harts (0 = auto-detect as CPU/2)',
-    default: 0,
+    describe: 'Number of harts (omit or 0 = auto-detect as CPU/2, >= 1 = explicit count)',
   })
   .option('net-webtransport', {
     type: 'string',
@@ -461,13 +464,29 @@ const argv = (yargs(hideBin(process.argv)) as any)
 (async () => {
   const kernelPath = argv.kernel as string;
   const diskPath = argv.disk as string | undefined;
-  const hartsArg = argv.harts as number;
+  const hartsArg = argv.harts as number | undefined;
   const netWebtransport = argv['net-webtransport'] as string | undefined;
   const certHash = argv['cert-hash'] as string | undefined;
   const debug = argv.debug as boolean;
 
-  // Auto-detect harts if set to 0, otherwise use user-specified value
-  const numHarts = hartsArg === 0 ? detectHartCount() : hartsArg;
+  // Hart count logic:
+  // - undefined or 0: auto-detect (cpu/2)
+  // - >= 1: use the user-specified value (capped at available CPUs)
+  let numHarts: number;
+  if (hartsArg === undefined || hartsArg === 0) {
+    numHarts = detectHartCount();
+  } else if (hartsArg >= 1) {
+    // Respect user-specified count, but cap at available CPUs for sanity
+    const maxHarts = os.cpus().length;
+    numHarts = Math.min(hartsArg, maxHarts);
+    if (hartsArg > maxHarts) {
+      console.error(`[CLI] Warning: requested ${hartsArg} harts but only ${maxHarts} CPUs available, using ${numHarts}`);
+    }
+  } else {
+    // Invalid value (negative), fall back to auto-detect
+    console.error(`[CLI] Warning: invalid harts value ${hartsArg}, using auto-detect`);
+    numHarts = detectHartCount();
+  }
 
   // Print banner
   printBanner(kernelPath, numHarts, netWebtransport);

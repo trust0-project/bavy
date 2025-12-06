@@ -45,10 +45,11 @@ export interface VmOptions {
  *
  * NOTE: In WASM, multi-hart mode is significantly slower due to
  * SharedArrayBuffer/Atomics overhead (see tasks/improvements.md).
- * Default is 1 hart unless explicitly specified.
+ * Default is auto-detect (cpu/2) unless explicitly specified.
  *
  * @param kernelData - ELF kernel binary
  * @param options - VM configuration options
+ * @param options.harts - Number of harts: undefined/0 = auto-detect (cpu/2), >= 1 = explicit count
  * @returns WasmVm instance
  */
 export async function createVM(
@@ -57,14 +58,14 @@ export async function createVM(
 ): Promise<import("./pkg/riscv_vm").WasmVm> {
   const module = await WasmInternal();
 
-  // In WASM, default to 1 hart due to SharedArrayBuffer/Atomics overhead
-  // Multi-hart mode is ~8x slower than single hart (see tasks/improvements.md)
-  // Users can explicitly request multiple harts if needed
-  const defaultHarts = typeof window !== 'undefined' ? 1 : undefined;
-  const harts = options.harts ?? defaultHarts;
+  // Hart count logic:
+  // - undefined or 0: auto-detect (cpu/2) via Rust default constructor
+  // - >= 1: use the specified value via new_with_harts
+  const harts = options.harts;
 
-  // Create VM with specified hart count (0 = auto-detect)
-  const vm = harts !== undefined && harts > 0
+  // Create VM with specified hart count
+  // new_with_harts(harts) for explicit count, default constructor for auto-detect
+  const vm = (harts !== undefined && harts >= 1)
     ? module.WasmVm.new_with_harts(kernelData, harts)
     : new module.WasmVm(kernelData);
 
