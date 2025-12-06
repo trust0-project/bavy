@@ -7,7 +7,7 @@ use riscv_vm::vm::native::NativeVm;
 
 #[derive(Parser, Debug)]
 #[command(name = "riscv-vm")]
-#[command(about = "RISC-V emulator with SMP support")]
+#[command(about = "RISCV emulator with SMP support")]
 #[command(version)]
 struct Args {
     /// Path to kernel ELF or binary

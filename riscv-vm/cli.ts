@@ -2,7 +2,6 @@
 /// <reference types="node" />
 /**
  * RISC-V VM CLI
- *
  * This CLI mirrors the native Rust VM CLI interface:
  * - loads a kernel image (ELF or raw binary) via --kernel/-k
  * - optionally loads a VirtIO block disk image (e.g. xv6 `fs.img`) via --disk/-d
@@ -10,6 +9,7 @@
  * - can optionally connect to a network relay via --net-webtransport
  * - runs the VM in a tight loop
  * - connects stdin → UART input and UART output → stdout
+ * 
  * Multi-hart support:
  * - Uses Node.js worker_threads for parallel execution
  * - Hart 0 runs on main thread (handles I/O)
