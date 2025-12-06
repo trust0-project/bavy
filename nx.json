@@ -5,9 +5,7 @@
   ],
   "release": {
     "projects": [
-      "riscv-vm",
-      "kernel",
-      "relay"
+      "riscv-vm"
     ],
     "version": {
       "specifierSource": "conventional-commits",

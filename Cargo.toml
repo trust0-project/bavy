@@ -1,5 +1,5 @@
 [workspace]
-members = ["riscv-vm", "kernel", "relay", "mkfs"]
+members = ["riscv-vm", "kernel", "mkfs"]
 resolver = "2"
 
 # Workspace-wide release optimizations
