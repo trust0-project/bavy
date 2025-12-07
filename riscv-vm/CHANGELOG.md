@@ -1,3 +1,13 @@
+## 0.1.15 (2025-12-07)
+
+### 🩹 Fixes
+
+- riscv package Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([495c31a](https://github.com/trust0-project/bavy/commit/495c31a))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.1.14 (2025-12-07)
 
 ### 🩹 Fixes
