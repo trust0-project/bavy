@@ -15,13 +15,15 @@
  *
  * ## Communication Protocol
  *
- * Main → Worker: workerData (hartId, sharedMem, entryPc, wasmPath)
+ * Main → Worker: workerData (hartId, sharedMem, entryPc)
  * Worker → Main: WorkerReadyMessage | WorkerHaltedMessage | WorkerErrorMessage
  */
 
 import { parentPort, workerData } from 'node:worker_threads';
-import fs from 'node:fs';
-import path from 'node:path';
+
+// Import WASM as embedded buffer (converted to base64 by tsup wasmPlugin)
+import wasmBuffer from "./pkg/riscv_vm_bg.wasm";
+import { initSync, WorkerState } from "./pkg/riscv_vm.js";
 
 // WorkerStepResult enum values (must match worker.rs)
 const WorkerStepResult = {
@@ -39,7 +41,6 @@ interface WorkerData {
   hartId: number;
   sharedMem: SharedArrayBuffer;
   entryPc: number;
-  wasmPath: string;
 }
 
 interface WorkerReadyMessage {
@@ -147,20 +148,13 @@ function cleanup(): void {
 }
 
 async function main(): Promise<void> {
-  const { hartId, sharedMem, entryPc, wasmPath } = workerData as WorkerData;
+  const { hartId, sharedMem, entryPc } = workerData as WorkerData;
 
-  console.log(`[Worker ${hartId}] Starting with WASM from ${wasmPath}`);
+  console.log(`[Worker ${hartId}] Starting with bundled WASM`);
 
   try {
-    // Load WASM module
-    const wasmBytes = fs.readFileSync(wasmPath);
-    
-    // Load the JS bindings
-    const jsPath = wasmPath.replace('_bg.wasm', '.js');
-    const wasmModule = await import(jsPath);
-    
-    // Initialize WASM with the bytes
-    wasmModule.initSync(wasmBytes);
+    // Initialize WASM with the bundled buffer
+    initSync(wasmBuffer);
     
     console.log(`[Worker ${hartId}] WASM initialized`);
 
@@ -180,7 +174,7 @@ async function main(): Promise<void> {
     controlView = new Int32Array(sharedMem);
 
     // Create worker state
-    workerState = new wasmModule.WorkerState(hartId, sharedMem, pc);
+    workerState = new WorkerState(hartId, sharedMem, pc);
 
     // Start the run loop
     runLoop(hartId);

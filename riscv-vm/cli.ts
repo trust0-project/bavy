@@ -145,8 +145,7 @@ async function createVm(
       // Get entry PC for workers
       const entryPc = typeof (vm as any).entry_pc === 'function' ? (vm as any).entry_pc() : 0x80000000;
       
-      // Path to WASM file and worker script
-      const wasmPath = path.resolve(__dirname, '..', 'pkg', 'riscv_vm_bg.wasm');
+      // Path to worker script - WASM bytes are passed directly
       const workerPath = path.resolve(__dirname, 'node-worker.js');
       
       console.error(`[VM] Starting ${actualHarts - 1} worker threads...`);
@@ -157,7 +156,6 @@ async function createVm(
             hartId,
             sharedMem: sharedBuffer,
             entryPc: Number(entryPc),
-            wasmPath,
           },
         });
         
