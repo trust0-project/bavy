@@ -1,3 +1,13 @@
+## 0.1.14 (2025-12-07)
+
+### 🩹 Fixes
+
+- vm update for multi threading Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([2d99e41](https://github.com/trust0-project/bavy/commit/2d99e41))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.1.13 (2025-12-07)
 
 ### 🩹 Fixes
