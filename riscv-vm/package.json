@@ -1,6 +1,6 @@
 {
   "name": "virtual-machine",
-  "version": "0.1.11",
+  "version": "0.1.12",
   "description": "RISC-V Virtual Machine with WASM and Node.js native support",
   "bin": "build/cli.js",
   "publishConfig": {
