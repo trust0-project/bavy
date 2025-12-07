@@ -61,6 +61,9 @@ pub enum Trap {
     SupervisorTimerInterrupt,
     SupervisorExternalInterrupt,
 
+    // Sleep request
+    Wfi,
+
     // Custom internal errors
     RequestedTrap(u64), // For testing (software interrupts, etc)
     Fatal(String),

@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
 
 pub const CLINT_BASE: u64 = 0x0200_0000;
 pub const CLINT_SIZE: u64 = 0x10000;
@@ -18,6 +19,51 @@ pub const MAX_HARTS: usize = 128;
 /// increment by 256 to maintain the same effective timer rate.
 /// At 10MHz and ~1 instruction per cycle at ~10MHz CPU, this gives roughly real-time.
 const MTIME_INCREMENT: u64 = 256;
+
+/// Tick rate assumed for the CLINT timer (10MHz like QEMU virt).
+/// Used to convert ticks to milliseconds for WFI sleep timeout.
+pub const TICKS_PER_MS: u64 = 10_000;
+
+/// Per-hart WFI parking state.
+/// Contains a mutex/condvar pair for blocking on WFI.
+pub struct HartWakeup {
+    /// Mutex protecting the wakeup state (dummy, just for Condvar API).
+    lock: Mutex<()>,
+    /// Condvar for blocking until interrupt arrives.
+    cond: Condvar,
+}
+
+impl HartWakeup {
+    pub const fn new() -> Self {
+        Self {
+            lock: Mutex::new(()),
+            cond: Condvar::new(),
+        }
+    }
+
+    /// Wait for an interrupt or timeout.
+    /// Returns immediately if an interrupt is already pending.
+    pub fn wait_for_interrupt(&self, timeout_ms: u64) {
+        if timeout_ms == 0 {
+            return;
+        }
+        let guard = self.lock.lock().unwrap();
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+        let _ = self.cond.wait_timeout(guard, timeout);
+    }
+
+    /// Wake up the hart (called when MSIP is set or timer fires).
+    pub fn wake(&self) {
+        // No need to hold the lock, just notify
+        self.cond.notify_one();
+    }
+}
+
+impl Default for HartWakeup {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Core Local Interruptor (CLINT) - Timer and Software Interrupts
 ///
@@ -40,6 +86,9 @@ pub struct Clint {
 
     /// Number of harts in the system (set at initialization).
     num_harts: AtomicUsize,
+
+    /// Per-hart wakeup condvars for WFI.
+    wakeups: [HartWakeup; MAX_HARTS],
 }
 
 impl Clint {
@@ -55,12 +104,14 @@ impl Clint {
         // don't implement Copy. We use consts for array initialization.
         const ZERO_U32: AtomicU32 = AtomicU32::new(0);
         const MAX_U64: AtomicU64 = AtomicU64::new(u64::MAX);
+        const WAKEUP: HartWakeup = HartWakeup::new();
 
         Self {
             mtime: AtomicU64::new(0),
             msip: [ZERO_U32; MAX_HARTS],
             mtimecmp: [MAX_U64; MAX_HARTS],
             num_harts: AtomicUsize::new(num_harts.min(MAX_HARTS)),
+            wakeups: [WAKEUP; MAX_HARTS],
         }
     }
 
@@ -116,10 +167,36 @@ impl Clint {
     /// Set MSIP value for a specific hart (only bit 0 is meaningful).
     /// Uses Release ordering to ensure any prior writes (e.g., data being
     /// passed to the target hart) are visible before the target sees the interrupt.
+    /// Also wakes the hart if it's sleeping in WFI.
     pub fn set_msip(&self, hart: usize, value: u32) {
         if hart < MAX_HARTS {
             // Only bit 0 matters for MSIP
             self.msip[hart].store(value & 1, Ordering::Release);
+            // Wake the hart if setting MSIP (it may be sleeping in WFI)
+            if value & 1 != 0 {
+                self.wakeups[hart].wake();
+            }
+        }
+    }
+
+    /// Block the current hart until an interrupt arrives or timeout expires.
+    /// Used to implement WFI (Wait For Interrupt) instruction.
+    /// 
+    /// # Arguments
+    /// * `hart` - The hart ID that is sleeping
+    /// * `timeout_ms` - Maximum time to sleep (0 = return immediately, u64::MAX = indefinite)
+    pub fn wait_for_interrupt(&self, hart: usize, timeout_ms: u64) {
+        if hart >= MAX_HARTS || timeout_ms == 0 {
+            return;
+        }
+        self.wakeups[hart].wait_for_interrupt(timeout_ms);
+    }
+
+    /// Wake a hart that may be sleeping in WFI.
+    /// Called when an interrupt becomes pending.
+    pub fn wake_hart(&self, hart: usize) {
+        if hart < MAX_HARTS {
+            self.wakeups[hart].wake();
         }
     }
 

@@ -873,12 +873,8 @@ impl Cpu {
                                 }
                                 0x1050_0073 => {
                                     // WFI - Wait For Interrupt
-                                    // Instead of busy-spinning, hint to the CPU to reduce power usage.
-                                    // This uses the PAUSE instruction on x86 or equivalent on other archs.
-                                    // Multiple iterations give the scheduler a chance to run other threads.
-                                    for _ in 0..10 {
-                                        std::hint::spin_loop();
-                                    }
+                                    // Return special trap to let the worker sleep
+                                    return self.handle_trap(Trap::Wfi, pc, Some(insn_raw));
                                 }
                                 0x0000_0073 => {
                                     // ECALL - route based on current privilege mode

@@ -162,7 +162,7 @@ pub mod wasm {
     /// using JavaScript Atomics for thread-safe access.
     pub struct SharedClint {
         /// View of the entire SharedArrayBuffer as Int32Array for Atomics
-        view: Int32Array,
+        pub view: Int32Array,
         /// CLINT region byte offset
         clint_base: usize,
     }
@@ -209,6 +209,13 @@ pub mod wasm {
             self.store_i32(offset + 4, (new_val >> 32) as i32);
         }
 
+        /// Get the i32 index for the MSIP word of a specific hart.
+        /// This is used for Atomics.wait.
+        pub fn msip_index(&self, hart_id: usize) -> u32 {
+            let offset = msip_offset(hart_id);
+            self.i32_index(offset)
+        }
+
         /// Get MSIP for a hart.
         pub fn get_msip(&self, hart_id: usize) -> u32 {
             if hart_id >= MAX_HARTS {
@@ -225,6 +232,11 @@ pub mod wasm {
             }
             let offset = msip_offset(hart_id);
             self.store_i32(offset, (value & 1) as i32);
+            // Wake up the hart if it's sleeping in WFI (waiting on this MSIP word)
+            if value & 1 != 0 {
+                let index = self.i32_index(offset);
+                let _ = Atomics::notify(&self.view, index);
+            }
         }
 
         /// Get MTIMECMP for a hart.

@@ -196,7 +196,7 @@ impl Cpu {
             Trap::SupervisorExternalInterrupt => Some((true, 9, 0)),
             Trap::MachineExternalInterrupt => Some((true, 11, 0)),
 
-            Trap::RequestedTrap(_) | Trap::Fatal(_) => None,
+            Trap::Wfi | Trap::RequestedTrap(_) | Trap::Fatal(_) => None,
         }
     }
 

@@ -175,6 +175,49 @@ impl WorkerState {
                     self.control.signal_halted(code);
                     return WorkerStepResult::Shutdown;
                 }
+                Err(Trap::Wfi) => {
+                    // WFI executed: advance PC (4 bytes) and check if we can sleep
+                    self.cpu.pc = self.cpu.pc.wrapping_add(4);
+
+                    // If interrupts are pending, don't sleep
+                    let (msip, timer) = self.clint.check_interrupts(self.hart_id);
+                    if msip || timer {
+                        continue;
+                    }
+
+                    // No pending interrupts - we can sleep.
+                    // Calculate wait timeout based on next timer interrupt.
+                    let now = self.clint.mtime();
+                    let trigger = self.clint.get_mtimecmp(self.hart_id);
+
+                    // Default to indefinite wait if timer is far in future or disabled (u64::MAX)
+                    let timeout_ms = if trigger > now {
+                         // Time differs by ticks. We need to convert ticks to ms.
+                         // Assuming 10MHz (100ns per tick) like QEMU virt board?
+                         // Or 1MHz? The code doesn't specify tick rate.
+                         // Let's assume 10MHz for now (10,000 ticks = 1ms)
+                         let diff = trigger - now;
+                         let ms = diff / 10_000;
+                         // Cap at 100ms to allow periodic checks
+                         if ms > 100 { 100 } else { ms as i32 }
+                    } else {
+                        // Timer already passed? Should have been caught by check_interrupts
+                        0
+                    };
+
+                    // Wait on MSIP word.
+                    // If MSIP becomes 1 (IPI), Atomics.wait returns "not-equal" immediately.
+                    // If MSIP stays 0, it returns "ok" (woken by notify) or "timed-out".
+                    if timeout_ms > 0 {
+                        // We need raw access to the Atomics API via js_sys
+                        let view = &self.clint.view;
+                        let index = self.clint.msip_index(self.hart_id);
+                        let _ = js_sys::Atomics::wait_with_timeout(view, index, 0, timeout_ms.into());
+                    }
+
+                    // After waking (or skipping wait), just continue the loop.
+                    // Next instruction will re-check interrupts.
+                }
                 Err(Trap::Fatal(msg)) => {
                     web_sys::console::error_1(&JsValue::from_str(&format!(
                         "[Worker {}] Fatal: {} at PC=0x{:x}",

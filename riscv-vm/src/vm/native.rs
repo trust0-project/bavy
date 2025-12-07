@@ -2,6 +2,7 @@ use crate::Trap;
 use crate::bus::{DRAM_BASE, SystemBus};
 use crate::console::Console;
 use crate::cpu::Cpu;
+use crate::devices::clint::TICKS_PER_MS;
 use crate::loader::load_elf_into_dram;
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -347,6 +348,7 @@ impl NativeVm {
 
     fn execute_batch(&self, cpu: &mut Cpu, max_steps: u64) -> (u64, Option<HaltReason>) {
         let mut count = 0u64;
+        let hart_id: usize = 0; // Hart 0 runs on main thread
 
         for _ in 0..max_steps {
             match cpu.step(&*self.bus) {
@@ -359,7 +361,36 @@ impl NativeVm {
                 Err(Trap::Fatal(msg)) => {
                     return (count, Some(HaltReason::Fatal(msg, cpu.pc)));
                 }
+                Err(Trap::Wfi) => {
+                    // WFI: Advance PC past the instruction
+                    cpu.pc = cpu.pc.wrapping_add(4);
+
+                    // Check if interrupts are already pending
+                    let (msip, timer) = self.bus.clint.check_interrupts_for_hart(hart_id);
+                    if msip || timer {
+                        // Interrupt pending, continue immediately
+                        continue;
+                    }
+
+                    // Calculate timeout based on mtimecmp - mtime
+                    let now = self.bus.clint.mtime();
+                    let trigger = self.bus.clint.get_mtimecmp(hart_id);
+                    let timeout_ms = if trigger > now {
+                        let diff = trigger - now;
+                        let ms = diff / TICKS_PER_MS;
+                        // Cap at 100ms to allow periodic checks
+                        ms.min(100)
+                    } else {
+                        0
+                    };
+
+                    // Sleep until interrupt or timeout
+                    if timeout_ms > 0 {
+                        self.bus.clint.wait_for_interrupt(hart_id, timeout_ms);
+                    }
+                }
                 Err(_) => {
+                    // Other architectural traps handled by CPU
                     count += 1;
                 }
             }
@@ -444,7 +475,7 @@ fn hart_thread(hart_id: usize, entry_pc: u64, bus: Arc<SystemBus>, shared: Arc<S
             break;
         }
 
-        let (batch_steps, halt_reason) = execute_batch_worker(&mut cpu, &bus, BATCH_SIZE);
+        let (batch_steps, halt_reason) = execute_batch_worker(&mut cpu, &bus, hart_id, BATCH_SIZE);
         step_count += batch_steps;
 
         if let Some(reason) = halt_reason {
@@ -506,6 +537,7 @@ fn hart_thread(hart_id: usize, entry_pc: u64, bus: Arc<SystemBus>, shared: Arc<S
 fn execute_batch_worker(
     cpu: &mut Cpu,
     bus: &SystemBus,
+    hart_id: usize,
     max_steps: u64,
 ) -> (u64, Option<HaltReason>) {
     let mut count = 0u64;
@@ -521,7 +553,36 @@ fn execute_batch_worker(
             Err(Trap::Fatal(msg)) => {
                 return (count, Some(HaltReason::Fatal(msg, cpu.pc)));
             }
+            Err(Trap::Wfi) => {
+                // WFI: Advance PC past the instruction
+                cpu.pc = cpu.pc.wrapping_add(4);
+
+                // Check if interrupts are already pending
+                let (msip, timer) = bus.clint.check_interrupts_for_hart(hart_id);
+                if msip || timer {
+                    // Interrupt pending, continue immediately
+                    continue;
+                }
+
+                // Calculate timeout based on mtimecmp - mtime
+                let now = bus.clint.mtime();
+                let trigger = bus.clint.get_mtimecmp(hart_id);
+                let timeout_ms = if trigger > now {
+                    let diff = trigger - now;
+                    let ms = diff / TICKS_PER_MS;
+                    // Cap at 100ms to allow periodic checks
+                    ms.min(100)
+                } else {
+                    0
+                };
+
+                // Sleep until interrupt or timeout
+                if timeout_ms > 0 {
+                    bus.clint.wait_for_interrupt(hart_id, timeout_ms);
+                }
+            }
             Err(_) => {
+                // Other architectural traps handled by CPU
                 count += 1;
             }
         }
