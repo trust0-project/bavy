@@ -8,7 +8,7 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = []
-# Enable Node.js native addon via napi-rs (for WebTransport in Node.js)
+#  Enable Node.js native addon via napi-rs (for WebTransport in Node.js)
 napi = ["napi-rs", "napi-derive"]
 
 [dependencies]
