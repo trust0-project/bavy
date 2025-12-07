@@ -5,3 +5,4 @@ pub mod types;
 
 pub use core::Cpu;
 pub use types::{Mode, Trap};
+

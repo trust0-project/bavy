@@ -70,3 +70,4 @@ pub struct MemRegionSnapshot {
     pub hash: String,
     pub data: Option<Vec<u8>>,
 }
+
