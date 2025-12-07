@@ -1,3 +1,13 @@
+## 0.1.13 (2025-12-07)
+
+### 🩹 Fixes
+
+- node worker update Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([d943c00](https://github.com/trust0-project/bavy/commit/d943c00))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.1.12 (2025-12-07)
 
 ### 🩹 Fixes
