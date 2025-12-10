@@ -1,3 +1,13 @@
+## 0.2.1 (2025-12-10)
+
+### 🩹 Fixes
+
+- update single and multi hart processing Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([cd2a2f3](https://github.com/trust0-project/bavy/commit/cd2a2f3))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.2.0 (2025-12-10)
 
 ### 🚀 Features
