@@ -4,6 +4,7 @@
 //! using the relay protocol:
 //! - 0x00 prefix: Control messages (JSON-encoded)
 //! - 0x01 prefix: Ethernet data frames
+//! - 0x02 prefix: Chunked data frames for large packets
 
 use super::NetworkBackend;
 
@@ -11,6 +12,8 @@ use super::NetworkBackend;
 const MSG_TYPE_CONTROL: u8 = 0x00;
 /// Message type prefix for Ethernet data frames
 const MSG_TYPE_DATA: u8 = 0x01;
+/// Message type prefix for chunked data frames
+const MSG_TYPE_CHUNKED: u8 = 0x02;
 
 /// Heartbeat interval in seconds (reduced for better keepalive in browsers)
 const HEARTBEAT_INTERVAL_SECS: u64 = 15;
@@ -18,6 +21,12 @@ const HEARTBEAT_INTERVAL_SECS: u64 = 15;
 /// QUIC keep-alive interval in seconds.
 /// Client sends QUIC PING frames at this interval to keep the connection alive.
 const QUIC_KEEP_ALIVE_SECS: u64 = 10;
+
+/// Maximum safe chunk payload size (leave room for QUIC overhead)
+const MAX_CHUNK_PAYLOAD: usize = 900;
+
+/// Threshold for chunking - frames larger than this will be chunked
+const CHUNK_THRESHOLD: usize = 950;
 
 /// Control message for registration
 fn make_register_message(mac: &[u8; 6]) -> Vec<u8> {
@@ -48,7 +57,39 @@ fn encode_data_frame(ethernet_frame: &[u8]) -> Vec<u8> {
     frame
 }
 
+/// Encode a large Ethernet frame as multiple chunks
+fn encode_chunked_frame(ethernet_frame: &[u8], chunk_id: u16) -> Vec<Vec<u8>> {
+    let total_chunks = (ethernet_frame.len() + MAX_CHUNK_PAYLOAD - 1) / MAX_CHUNK_PAYLOAD;
+    let total_chunks = total_chunks.min(255) as u8;
+    
+    let mut chunks = Vec::new();
+    
+    for (i, chunk_data) in ethernet_frame.chunks(MAX_CHUNK_PAYLOAD).enumerate() {
+        let mut frame = Vec::with_capacity(5 + chunk_data.len());
+        frame.push(MSG_TYPE_CHUNKED);
+        frame.extend(&chunk_id.to_be_bytes());
+        frame.push(i as u8);
+        frame.push(total_chunks);
+        frame.extend(chunk_data);
+        chunks.push(frame);
+    }
+    
+    chunks
+}
+
+/// Smart frame encoder: uses chunking only if needed
+fn encode_frame_smart(ethernet_frame: &[u8], chunk_id: &mut u16) -> Vec<Vec<u8>> {
+    if ethernet_frame.len() <= CHUNK_THRESHOLD {
+        vec![encode_data_frame(ethernet_frame)]
+    } else {
+        let id = *chunk_id;
+        *chunk_id = chunk_id.wrapping_add(1);
+        encode_chunked_frame(ethernet_frame, id)
+    }
+}
+
 /// Decode a received message, stripping the type prefix for data frames
+/// Note: This doesn't handle chunked messages - those need separate reassembly
 fn decode_message(data: &[u8]) -> Option<Vec<u8>> {
     if data.is_empty() {
         return None;
@@ -73,11 +114,44 @@ fn decode_message(data: &[u8]) -> Option<Vec<u8>> {
             }
             None
         }
+        MSG_TYPE_CHUNKED => {
+            // Chunked messages need special handling - return None here
+            // The caller should use try_decode_chunk instead
+            None
+        }
         _ => {
             log::warn!("[WebTransport] Unknown message type: {}", data[0]);
             None
         }
     }
+}
+
+/// Decoded chunk information
+#[derive(Debug, Clone)]
+struct ChunkInfo {
+    chunk_id: u16,
+    chunk_index: u8,
+    total_chunks: u8,
+    payload: Vec<u8>,
+}
+
+/// Decode a chunked frame header
+fn decode_chunk(data: &[u8]) -> Option<ChunkInfo> {
+    if data.len() < 5 || data[0] != MSG_TYPE_CHUNKED {
+        return None;
+    }
+    
+    let chunk_id = u16::from_be_bytes([data[1], data[2]]);
+    let chunk_index = data[3];
+    let total_chunks = data[4];
+    let payload = data[5..].to_vec();
+    
+    Some(ChunkInfo {
+        chunk_id,
+        chunk_index,
+        total_chunks,
+        payload,
+    })
 }
 
 /// Parse IP address from JSON string containing "ip":[a,b,c,d]
@@ -129,6 +203,8 @@ mod native {
         assigned_ip: Arc<Mutex<Option<[u8; 4]>>>,
         /// Connection attempt counter (for debugging)
         connection_attempts: Arc<AtomicU32>,
+        /// Counter for generating chunk IDs when sending large frames
+        chunk_id_counter: Arc<Mutex<u16>>,
     }
 
     impl WebTransportBackend {
@@ -276,6 +352,9 @@ mod native {
                         let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
                         let mut send_check_interval = tokio::time::interval(Duration::from_millis(1));
                         
+                        // Chunk reassembly buffer: chunk_id -> (chunks_vec, total_chunks, received_count)
+                        let mut chunk_buffer: std::collections::HashMap<u16, (Vec<Option<Vec<u8>>>, u8, u8)> = std::collections::HashMap::new();
+                        
                         'connection_loop: loop {
                             tokio::select! {
                                 // Check for data to send to relay
@@ -334,8 +413,40 @@ mod native {
                                                 }
                                             }
                                             
-                                            // Decode and forward Ethernet frames
-                                            if let Some(ethernet_frame) = decode_message(&data) {
+                                            // Handle chunked frames
+                                            if !data.is_empty() && data[0] == MSG_TYPE_CHUNKED {
+                                                if let Some(chunk_info) = decode_chunk(&data) {
+                                                    let entry = chunk_buffer.entry(chunk_info.chunk_id).or_insert_with(|| {
+                                                        (vec![None; chunk_info.total_chunks as usize], chunk_info.total_chunks, 0)
+                                                    });
+
+                                                    if chunk_info.chunk_index == 0 {
+                                                        log::info!("[WebTransport] Received CHUNKED frame start: id={}, total={}", chunk_info.chunk_id, chunk_info.total_chunks);
+                                                    }
+                                                    
+                                                    let idx = chunk_info.chunk_index as usize;
+                                                    if idx < entry.0.len() && entry.0[idx].is_none() {
+                                                        entry.0[idx] = Some(chunk_info.payload);
+                                                        entry.2 += 1;
+                                                        
+                                                        // Check if all chunks received
+                                                        if entry.2 == entry.1 {
+                                                            // Reassemble complete frame
+                                                            let mut complete_frame = Vec::new();
+                                                            for chunk in &entry.0 {
+                                                                if let Some(data) = chunk {
+                                                                    complete_frame.extend(data);
+                                                                }
+                                                            }
+                                                            chunk_buffer.remove(&chunk_info.chunk_id);
+                                                            log::info!("[WebTransport] Reassembled {} byte frame from {} chunks", 
+                                                                complete_frame.len(), chunk_info.total_chunks);
+                                                            let _ = tx_from_transport.send(complete_frame);
+                                                        }
+                                                    }
+                                                }
+                                            } else if let Some(ethernet_frame) = decode_message(&data) {
+                                                // Decode and forward regular Ethernet frames
                                                 let _ = tx_from_transport.send(ethernet_frame);
                                             }
                                         }
@@ -364,6 +475,7 @@ mod native {
                 registered,
                 assigned_ip,
                 connection_attempts,
+                chunk_id_counter: Arc::new(Mutex::new(0)),
             }
         }
 
@@ -392,9 +504,17 @@ mod native {
 
         fn send(&self, buf: &[u8]) -> Result<(), String> {
             if let Some(tx) = &self.tx_to_transport {
-                // Frame the Ethernet data with the protocol prefix
-                let framed = encode_data_frame(buf);
-                tx.send(framed).map_err(|e| e.to_string())?;
+                // Use smart encoding - chunks large frames automatically
+                let mut chunk_id = self.chunk_id_counter.lock().map_err(|e| e.to_string())?;
+                let datagrams = encode_frame_smart(buf, &mut chunk_id);
+                
+                if datagrams.len() > 1 {
+                    log::info!("[WebTransport] Sending {} bytes in {} chunks", buf.len(), datagrams.len());
+                }
+                
+                for datagram in datagrams {
+                    tx.send(datagram).map_err(|e| e.to_string())?;
+                }
                 Ok(())
             } else {
                 Err("Not connected".to_string())
@@ -448,6 +568,8 @@ mod wasm {
         connection_generation: u32,
         /// Heartbeat interval ID for cleanup
         heartbeat_interval_id: Option<i32>,
+        /// Chunk reassembly buffer: chunk_id -> (chunks_vec, total_chunks, received_count)
+        chunk_buffer: std::collections::HashMap<u16, (Vec<Option<Vec<u8>>>, u8, u8)>,
     }
 
     pub struct WebTransportBackend {
@@ -457,6 +579,7 @@ mod wasm {
         transport: Rc<RefCell<Option<WebTransport>>>,
         writer: Rc<RefCell<Option<WritableStreamDefaultWriter>>>,
         state: Rc<RefCell<SharedState>>,
+        chunk_id_counter: Rc<RefCell<u16>>,
     }
 
     // WASM is single threaded
@@ -485,6 +608,7 @@ mod wasm {
                 connection_state: ConnectionState::Disconnected,
                 connection_generation: 0,
                 heartbeat_interval_id: None,
+                chunk_buffer: std::collections::HashMap::new(),
             }));
 
             Self {
@@ -494,6 +618,7 @@ mod wasm {
                 transport: Rc::new(RefCell::new(None)),
                 writer: Rc::new(RefCell::new(None)),
                 state,
+                chunk_id_counter: Rc::new(RefCell::new(0)),
             }
         }
 
@@ -726,8 +851,42 @@ mod wasm {
                                         }
                                     }
 
-                                    // Queue Ethernet frames
-                                    if let Some(frame) = decode_message(&data) {
+                                    // Handle chunked frames
+                                    if !data.is_empty() && data[0] == MSG_TYPE_CHUNKED {
+                                        if let Some(chunk_info) = decode_chunk(&data) {
+                                            // Debug log for chunk receipt
+                                            if chunk_info.chunk_index == 0 {
+                                                 console_log(&format!("[WebTransport] Received CHUNKED frame start: id={}, total={}", chunk_info.chunk_id, chunk_info.total_chunks));
+                                            }
+
+                                            let mut s = state.borrow_mut();
+                                            let entry = s.chunk_buffer.entry(chunk_info.chunk_id).or_insert_with(|| {
+                                                (vec![None; chunk_info.total_chunks as usize], chunk_info.total_chunks, 0)
+                                            });
+                                            
+                                            let idx = chunk_info.chunk_index as usize;
+                                            if idx < entry.0.len() && entry.0[idx].is_none() {
+                                                entry.0[idx] = Some(chunk_info.payload);
+                                                entry.2 += 1;
+                                                
+                                                // Check if all chunks received
+                                                if entry.2 == entry.1 {
+                                                    // Reassemble complete frame
+                                                    let mut complete_frame = Vec::new();
+                                                    for chunk in &entry.0 {
+                                                        if let Some(data) = chunk {
+                                                            complete_frame.extend(data);
+                                                        }
+                                                    }
+                                                    // Remove from buffer
+                                                    let id = chunk_info.chunk_id;
+                                                    s.chunk_buffer.remove(&id);
+                                                    console_log(&format!("[WebTransport] Reassembled frame: {} bytes", complete_frame.len()));
+                                                    s.rx_queue.push_back(complete_frame);
+                                                }
+                                            }
+                                        }
+                                    } else if let Some(frame) = decode_message(&data) {
                                         state.borrow_mut().rx_queue.push_back(frame);
                                     }
                                 }
@@ -850,6 +1009,7 @@ mod wasm {
                 transport: transport_rc,
                 writer: writer_rc,
                 state,
+                chunk_id_counter: Rc::new(RefCell::new(0)),
             };
             backend.start_connection();
         });
@@ -915,10 +1075,18 @@ mod wasm {
 
         fn send(&self, buf: &[u8]) -> Result<(), String> {
             if let Some(writer) = self.writer.borrow().as_ref() {
-                // Frame the Ethernet data with the protocol prefix
-                let framed = encode_data_frame(buf);
-                let array = Uint8Array::from(&framed[..]);
-                let _ = writer.write_with_chunk(&array);
+                // Use smart encoding - chunks large frames automatically
+                let mut id_counter = self.chunk_id_counter.borrow_mut();
+                let datagrams = encode_frame_smart(buf, &mut *id_counter);
+                
+                if datagrams.len() > 1 {
+                    console_log(&format!("[WebTransport] Sending {} bytes in {} chunks", buf.len(), datagrams.len()));
+                }
+
+                for datagram in datagrams {
+                    let array = Uint8Array::from(&datagram[..]);
+                    let _ = writer.write_with_chunk(&array);
+                }
                 Ok(())
             } else {
                 Err("Not connected".to_string())

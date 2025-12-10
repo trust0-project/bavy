@@ -22,6 +22,68 @@ use wtransport::tls::Sha256Digest;
 const MSG_TYPE_CONTROL: u8 = 0x00;
 /// Message type prefix for Ethernet data frames  
 const MSG_TYPE_DATA: u8 = 0x01;
+/// Message type prefix for chunked frames
+const MSG_TYPE_CHUNKED: u8 = 0x02;
+
+/// Maximum payload size for a single chunk (leaving room for header + overhead)
+const MAX_CHUNK_PAYLOAD: usize = 900;
+
+/// Threshold above which we switch to chunking
+const CHUNK_THRESHOLD: usize = 950;
+
+#[derive(Debug, Clone)]
+struct ChunkInfo {
+    chunk_id: u16,
+    chunk_index: u8,
+    total_chunks: u8,
+    payload: Vec<u8>,
+}
+
+fn encode_chunked_frame(ethernet_frame: &[u8], chunk_id: u16) -> Vec<Vec<u8>> {
+    let total_len = ethernet_frame.len();
+    let total_chunks = (total_len + MAX_CHUNK_PAYLOAD - 1) / MAX_CHUNK_PAYLOAD;
+    let mut messages = Vec::with_capacity(total_chunks);
+
+    for (i, chunk_data) in ethernet_frame.chunks(MAX_CHUNK_PAYLOAD).enumerate() {
+        let mut frame = Vec::with_capacity(5 + chunk_data.len());
+        frame.push(MSG_TYPE_CHUNKED);
+        frame.extend(&chunk_id.to_be_bytes()); // 2 bytes
+        frame.push(i as u8);
+        frame.push(total_chunks as u8);
+        frame.extend(chunk_data);
+        messages.push(frame);
+    }
+
+    messages
+}
+
+fn decode_chunk(data: &[u8]) -> Option<ChunkInfo> {
+    if data.len() < 5 || data[0] != MSG_TYPE_CHUNKED {
+        return None;
+    }
+    
+    let chunk_id = u16::from_be_bytes([data[1], data[2]]);
+    let chunk_index = data[3];
+    let total_chunks = data[4];
+    let payload = data[5..].to_vec();
+
+    Some(ChunkInfo {
+        chunk_id,
+        chunk_index,
+        total_chunks,
+        payload,
+    })
+}
+
+fn encode_frame_smart(ethernet_frame: &[u8], chunk_id_counter: &mut u16) -> Vec<Vec<u8>> {
+    if ethernet_frame.len() > CHUNK_THRESHOLD {
+        let chunk_id = *chunk_id_counter;
+        *chunk_id_counter = chunk_id_counter.wrapping_add(1);
+        encode_chunked_frame(ethernet_frame, chunk_id)
+    } else {
+        vec![encode_data_frame(ethernet_frame)]
+    }
+}
 
 /// Heartbeat interval in seconds
 const HEARTBEAT_INTERVAL_SECS: u64 = 15;
@@ -139,6 +201,7 @@ pub struct WebTransportClient {
     connection_attempts: Arc<AtomicU32>,
     connected: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
+    chunk_id_counter: Arc<Mutex<u16>>,
 }
 
 #[napi]
@@ -305,6 +368,7 @@ impl WebTransportClient {
                     let mut heartbeat_interval =
                         tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
                     let mut send_check_interval = tokio::time::interval(Duration::from_millis(1));
+                    let mut chunk_buffer: std::collections::HashMap<u16, (Vec<Option<Vec<u8>>>, u8, u8)> = std::collections::HashMap::new();
 
                     'connection_loop: loop {
                         // Check for shutdown
@@ -343,7 +407,6 @@ impl WebTransportClient {
                                 log::trace!("[WebTransport] Heartbeat sent");
                             }
 
-                            // Receive data
                             result = connection.receive_datagram() => {
                                 match result {
                                     Ok(datagram) => {
@@ -374,7 +437,31 @@ impl WebTransportClient {
                                         }
 
                                         // Forward Ethernet frames
-                                        if let Some(ethernet_frame) = decode_message(&data) {
+                                        if !data.is_empty() && data[0] == MSG_TYPE_CHUNKED {
+                                            if let Some(chunk_info) = decode_chunk(&data) {
+                                                let entry = chunk_buffer.entry(chunk_info.chunk_id).or_insert_with(|| {
+                                                    (vec![None; chunk_info.total_chunks as usize], chunk_info.total_chunks, 0)
+                                                });
+                                                
+                                                let idx = chunk_info.chunk_index as usize;
+                                                if idx < entry.0.len() && entry.0[idx].is_none() {
+                                                    entry.0[idx] = Some(chunk_info.payload);
+                                                    entry.2 += 1;
+                                                    
+                                                    if entry.2 == entry.1 {
+                                                        let mut complete_frame = Vec::new();
+                                                        for chunk in &entry.0 {
+                                                            if let Some(data) = chunk {
+                                                                complete_frame.extend(data);
+                                                            }
+                                                        }
+                                                        chunk_buffer.remove(&chunk_info.chunk_id);
+                                                        log::info!("[WebTransport] Reassembled {} byte frame from {} chunks", complete_frame.len(), chunk_info.total_chunks);
+                                                        let _ = tx_from_transport.send(complete_frame);
+                                                    }
+                                                }
+                                            }
+                                        } else if let Some(ethernet_frame) = decode_message(&data) {
                                             let _ = tx_from_transport.send(ethernet_frame);
                                         }
                                     }
@@ -408,6 +495,7 @@ impl WebTransportClient {
             connection_attempts,
             connected,
             shutdown,
+            chunk_id_counter: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -481,8 +569,28 @@ impl WebTransportClient {
     #[napi]
     pub fn send(&self, data: Buffer) -> bool {
         if let Some(tx) = &self.tx_to_transport {
-            let framed = encode_data_frame(&data);
-            tx.send(framed).is_ok()
+            // Use smart encoding to chunk if necessary
+            let mut id_guard = match self.chunk_id_counter.lock() {
+                Ok(g) => g,
+                Err(e) => {
+                    log::error!("[WebTransport] Failed to lock chunk counter: {:?}", e);
+                    return false;
+                }
+            };
+            
+            let datagrams = encode_frame_smart(&data, &mut *id_guard);
+            
+            if datagrams.len() > 1 {
+                 log::info!("[WebTransport] Sending {} bytes in {} chunks", data.len(), datagrams.len());
+            }
+
+            let mut all_sent = true;
+            for datagram in datagrams {
+                if tx.send(datagram).is_err() {
+                    all_sent = false;
+                }
+            }
+            all_sent
         } else {
             false
         }

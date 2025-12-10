@@ -599,6 +599,9 @@ impl VirtioDevice for VirtioNet {
 
     fn poll(&self, dram: &Dram) -> Result<(), MemoryError> {
         let mut state = self.state.lock().unwrap();
+        // Process both RX and TX queues during polling
+        // TX processing is critical: ensures packets queued by guest are actually sent
+        Self::process_tx_queue(&mut state, dram)?;
         Self::process_rx_queue(&mut state, dram)
     }
 }

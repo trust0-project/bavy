@@ -47,7 +47,7 @@ async function loadNativeWebTransport(): Promise<any | null> {
   // Try to load from the native directory (built with npm run build:native)
   // ESM requires explicit file path, not directory imports
   const addonPath = path.resolve(__dirname, '..', 'native', 'index.js');
-  
+
   try {
     const addon = await import(addonPath);
     if (addon.WebTransportClient) {
@@ -118,7 +118,7 @@ async function createVm(
   // Otherwise use default constructor which auto-detects (cpu/2)
   const requestedHarts = options?.harts;
   const vm = (requestedHarts !== undefined && requestedHarts >= 1 && VmCtor.new_with_harts)
-    ? VmCtor.new_with_harts(kernelBytes, requestedHarts) 
+    ? VmCtor.new_with_harts(kernelBytes, requestedHarts)
     : new VmCtor(kernelBytes);
 
   if (options?.disk) {
@@ -140,16 +140,16 @@ async function createVm(
   const actualHarts = typeof vm.num_harts === 'function' ? vm.num_harts() : (requestedHarts ?? 1);
   if (actualHarts > 1 && typeof vm.get_shared_buffer === 'function') {
     const sharedBuffer = vm.get_shared_buffer();
-    
+
     if (sharedBuffer) {
       // Get entry PC for workers
       const entryPc = typeof (vm as any).entry_pc === 'function' ? (vm as any).entry_pc() : 0x80000000;
-      
+
       // Path to worker script - WASM bytes are passed directly
       const workerPath = path.resolve(__dirname, 'node-worker.js');
-      
+
       console.error(`[VM] Starting ${actualHarts - 1} worker threads...`);
-      
+
       for (let hartId = 1; hartId < actualHarts; hartId++) {
         const worker = new Worker(workerPath, {
           workerData: {
@@ -158,7 +158,7 @@ async function createVm(
             entryPc: Number(entryPc),
           },
         });
-        
+
         worker.on('message', (msg: any) => {
           if (msg.type === 'ready') {
             console.error(`[VM] Worker ${msg.hartId} ready`);
@@ -168,20 +168,20 @@ async function createVm(
             console.error(`[VM] Worker ${msg.hartId} error: ${msg.error}`);
           }
         });
-        
+
         worker.on('error', (err) => {
           console.error(`[VM] Worker ${hartId} error:`, err);
         });
-        
+
         worker.on('exit', (code) => {
           if (code !== 0) {
             console.error(`[VM] Worker ${hartId} exited with code ${code}`);
           }
         });
-        
+
         workers.push(worker);
       }
-      
+
       console.error(`[VM] Started ${workers.length} worker threads`);
     } else {
       console.error('[VM] Warning: SharedArrayBuffer not available, running single-threaded');
@@ -193,14 +193,14 @@ async function createVm(
   if (options?.netWebtransport) {
     const relayUrl = options.netWebtransport;
     const certHash = options.certHash || DEFAULT_CERT_HASH || undefined;
-    
+
     // Try to use native WebTransport addon
     const WebTransportClient = await loadNativeWebTransport();
-    
+
     if (WebTransportClient) {
       // Use native addon for WebTransport
       nativeNetClient = new WebTransportClient(relayUrl, certHash);
-      
+
       // Get MAC address from native client and set up external network
       const macBytes = nativeNetClient.macBytes();
       if (typeof vm.setup_external_network === 'function') {
@@ -327,20 +327,20 @@ function runVmLoop(vm: any, nativeNetClient: any | null, workers: Worker[] = [])
   // Bridge packets between native WebTransport and VM
   const bridgeNetwork = () => {
     if (!nativeNetClient) return;
-    
+
     // Check connection status
     if (!networkConnected && nativeNetClient.isRegistered()) {
       networkConnected = true;
       const ip = nativeNetClient.assignedIp();
       console.error(`\r\n[Network] Connected! IP: ${ip}`);
-      
+
       // Set IP in VM's external network backend
       const ipBytes = nativeNetClient.assignedIpBytes();
       if (ipBytes && typeof vm.set_external_network_ip === 'function') {
         vm.set_external_network_ip(new Uint8Array(ipBytes));
       }
     }
-    
+
     // Forward packets from native client to VM (RX)
     let packet = nativeNetClient.recv();
     while (packet) {
@@ -350,7 +350,8 @@ function runVmLoop(vm: any, nativeNetClient: any | null, workers: Worker[] = [])
       }
       packet = nativeNetClient.recv();
     }
-    
+
+
     // Forward packets from VM to native client (TX)
     if (typeof vm.extract_network_packet === 'function') {
       let txPacket = vm.extract_network_packet();
@@ -373,7 +374,7 @@ function runVmLoop(vm: any, nativeNetClient: any | null, workers: Worker[] = [])
 
       // Drain output
       drainOutput();
-      
+
       // Bridge network packets
       bridgeNetwork();
 
@@ -381,7 +382,7 @@ function runVmLoop(vm: any, nativeNetClient: any | null, workers: Worker[] = [])
       if (typeof vm.is_halted === 'function' && vm.is_halted()) {
         // Drain any remaining output
         drainOutput();
-        
+
         const haltCode = typeof vm.halt_code === 'function' ? vm.halt_code() : 0n;
         if (haltCode === 0x5555n) {
           console.log('\r\n[VM] Clean shutdown (PASS)');
@@ -409,7 +410,7 @@ function runVmLoop(vm: any, nativeNetClient: any | null, workers: Worker[] = [])
  */
 function printBanner(kernelPath: string, numHarts: number, netWebtransport?: string) {
   const kernelName = path.basename(kernelPath);
-  
+
   console.log();
   console.log('╔══════════════════════════════════════════════════════════════╗');
   console.log('║              RISC-V Emulator (WASM + Worker Threads)         ║');
@@ -496,7 +497,7 @@ const argv = (yargs(hideBin(process.argv)) as any)
       certHash,
       debug,
     });
-    
+
     // Signal workers that they can start executing
     // This is done after the main hart has had a chance to initialize
     if (typeof (vm as any).allow_workers_to_start === 'function') {
@@ -506,7 +507,7 @@ const argv = (yargs(hideBin(process.argv)) as any)
         console.error('[VM] Workers allowed to start');
       }, 100);
     }
-    
+
     runVmLoop(vm, nativeNetClient, workers);
   } catch (err) {
     console.error('[CLI] Failed to start VM:', err);
