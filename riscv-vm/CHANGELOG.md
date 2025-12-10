@@ -1,3 +1,13 @@
+## 0.2.0 (2025-12-10)
+
+### 🚀 Features
+
+- full tcp listen, quic transport chunking and recomposing Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([c045ede](https://github.com/trust0-project/bavy/commit/c045ede))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.1.15 (2025-12-07)
 
 ### 🩹 Fixes
