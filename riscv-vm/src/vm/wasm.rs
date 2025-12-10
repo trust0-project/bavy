@@ -206,6 +206,7 @@ impl WasmVm {
                 dram_offset,
                 shared_clint_for_bus,
                 false,
+                0,  // hart_id for main thread
             );
 
             let control = shared_mem::wasm::SharedControl::new(&sab);
@@ -479,6 +480,38 @@ impl WasmVm {
         self.net_status
     }
 
+    /// Process pending VirtIO MMIO requests from workers.
+    /// 
+    /// Workers write VirtIO requests to shared memory slots.
+    /// This method processes those requests using local devices and writes responses.
+    fn process_virtio_requests(&mut self) {
+        // Skip if not in SMP mode - no workers to submit requests
+        // Also skip if no shared memory or no VirtIO devices
+        if self.num_harts <= 1 || self.shared_buffer.is_none() || self.bus.virtio_devices.is_empty() {
+            return;
+        }
+
+        let shared_buffer = self.shared_buffer.as_ref().unwrap();
+        let shared_virtio = crate::shared_mem::wasm::SharedVirtioMmio::new(shared_buffer, 0);
+
+        shared_virtio.process_pending(|device_idx, offset, is_write, value| {
+            let idx = device_idx as usize;
+            if idx >= self.bus.virtio_devices.len() {
+                // No device at this index - return 0 for unmapped reads
+                return 0;
+            }
+
+            if is_write {
+                // Handle write
+                let _ = self.bus.virtio_devices[idx].write(offset, value, &self.bus.dram);
+                0
+            } else {
+                // Handle read
+                self.bus.virtio_devices[idx].read(offset).unwrap_or(0)
+            }
+        });
+    }
+
     /// Execute one instruction on hart 0 (primary hart).
     ///
     /// In SMP mode, secondary harts run in Web Workers and execute in parallel.
@@ -532,10 +565,16 @@ impl WasmVm {
         if self.poll_counter % 100 == 0 {
             self.bus.poll_virtio();
 
-            // Update shared CLINT timer (if in SMP mode)
+            // Process VirtIO requests from workers (SMP mode only)
+            self.process_virtio_requests();
+
+            // Update CLINT timer - use shared CLINT if available, otherwise local
             if let Some(ref clint) = self.shared_clint {
-                // Increment mtime in shared memory
+                // Increment mtime in shared memory (SMP mode)
                 clint.tick(100); // 100 ticks per poll
+            } else {
+                // Increment mtime in local CLINT (non-SAB single-hart mode)
+                self.bus.clint.tick();
             }
         }
 

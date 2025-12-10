@@ -298,6 +298,9 @@ pub struct SystemBus {
     /// Shared UART input for WASM workers (receives keyboard input from main thread)
     #[cfg(target_arch = "wasm32")]
     shared_uart_input: Option<crate::shared_mem::wasm::SharedUartInput>,
+    /// Shared VirtIO MMIO proxy for workers (routes VirtIO accesses to main thread)
+    #[cfg(target_arch = "wasm32")]
+    shared_virtio: Option<crate::shared_mem::wasm::SharedVirtioMmio>,
 }
 
 impl SystemBus {
@@ -315,6 +318,8 @@ impl SystemBus {
             shared_uart_output: None,
             #[cfg(target_arch = "wasm32")]
             shared_uart_input: None,
+            #[cfg(target_arch = "wasm32")]
+            shared_virtio: None,
         }
     }
 
@@ -330,6 +335,7 @@ impl SystemBus {
     /// * `shared_clint` - SharedClint accessor for the shared CLINT region
     /// * `is_worker` - If true, enables shared UART input for receiving keyboard input.
     ///                 Main thread (hart 0) should pass false since it reads from local UART.
+    /// * `hart_id` - Hart ID for this bus (used for VirtIO proxy slot allocation)
     ///
     /// IMPORTANT: Pass the FULL SharedArrayBuffer, not a sliced copy!
     /// SharedArrayBuffer::slice() creates a copy, breaking shared memory.
@@ -339,6 +345,7 @@ impl SystemBus {
         dram_offset: usize,
         shared_clint: crate::shared_mem::wasm::SharedClint,
         is_worker: bool,
+        hart_id: usize,
     ) -> Self {
         // Use the shared CLINT's hart count for local CLINT initialization
         // The local CLINT is a fallback; shared_clint is used for actual MMIO
@@ -355,6 +362,13 @@ impl SystemBus {
             None
         };
 
+        // Create shared VirtIO MMIO proxy for workers - main thread has local devices
+        let shared_virtio = if is_worker {
+            Some(crate::shared_mem::wasm::SharedVirtioMmio::new(&buffer, hart_id))
+        } else {
+            None
+        };
+
         Self {
             dram: Dram::from_shared(DRAM_BASE, buffer, dram_offset),
             clint,
@@ -365,6 +379,7 @@ impl SystemBus {
             shared_clint: Some(shared_clint),
             shared_uart_output: Some(shared_uart_output),
             shared_uart_input,
+            shared_virtio,
         }
     }
 
@@ -662,6 +677,18 @@ impl SystemBus {
             return Ok(((word >> shift) & 0xff) as u8);
         }
 
+        // For workers: Route VirtIO accesses through shared memory proxy
+        #[cfg(target_arch = "wasm32")]
+        if let Some(ref shared_virtio) = self.shared_virtio {
+            if let Some(offset) = self.is_virtio_region(addr) {
+                let device_idx = ((addr - VIRTIO_BASE) / VIRTIO_STRIDE) as u32;
+                let aligned = offset & !3;
+                let word = shared_virtio.virtio_read(device_idx, aligned);
+                let shift = ((offset & 3) * 8) as u64;
+                return Ok(((word >> shift) & 0xff) as u8);
+            }
+        }
+
         // Unmapped VirtIO slots return 0 (allows safe probing)
         if self.is_virtio_region(addr).is_some() {
             return Ok(0);
@@ -715,6 +742,18 @@ impl SystemBus {
             return Ok(((word >> shift) & 0xffff) as u16);
         }
 
+        // For workers: Route VirtIO accesses through shared memory proxy
+        #[cfg(target_arch = "wasm32")]
+        if let Some(ref shared_virtio) = self.shared_virtio {
+            if let Some(offset) = self.is_virtio_region(addr) {
+                let device_idx = ((addr - VIRTIO_BASE) / VIRTIO_STRIDE) as u32;
+                let aligned = offset & !3;
+                let word = shared_virtio.virtio_read(device_idx, aligned);
+                let shift = ((offset & 3) * 8) as u64;
+                return Ok(((word >> shift) & 0xffff) as u16);
+            }
+        }
+
         // Unmapped VirtIO slots return 0 (allows safe probing)
         if self.is_virtio_region(addr).is_some() {
             return Ok(0);
@@ -764,6 +803,16 @@ impl SystemBus {
                 .read(offset)
                 .map_err(|_| Trap::LoadAccessFault(addr))?;
             return Ok(val as u32);
+        }
+
+        // For workers: Route VirtIO accesses through shared memory proxy
+        #[cfg(target_arch = "wasm32")]
+        if let Some(ref shared_virtio) = self.shared_virtio {
+            if let Some(offset) = self.is_virtio_region(addr) {
+                let device_idx = ((addr - VIRTIO_BASE) / VIRTIO_STRIDE) as u32;
+                let val = shared_virtio.virtio_read(device_idx, offset);
+                return Ok(val as u32);
+            }
         }
 
         // Unmapped VirtIO slots return 0 (allows safe probing)
@@ -818,6 +867,17 @@ impl SystemBus {
                 .read(offset + 4)
                 .map_err(|_| Trap::LoadAccessFault(addr + 4))?;
             return Ok((low as u64) | ((high as u64) << 32));
+        }
+
+        // For workers: Route VirtIO accesses through shared memory proxy
+        #[cfg(target_arch = "wasm32")]
+        if let Some(ref shared_virtio) = self.shared_virtio {
+            if let Some(offset) = self.is_virtio_region(addr) {
+                let device_idx = ((addr - VIRTIO_BASE) / VIRTIO_STRIDE) as u32;
+                let low = shared_virtio.virtio_read(device_idx, offset);
+                let high = shared_virtio.virtio_read(device_idx, offset + 4);
+                return Ok((low as u64) | ((high as u64) << 32));
+            }
         }
 
         // Unmapped VirtIO slots return 0 (allows safe probing)
@@ -963,6 +1023,16 @@ impl SystemBus {
                 .write(offset, val as u64, &self.dram)
                 .map_err(|_| Trap::StoreAccessFault(addr))?;
             return Ok(());
+        }
+
+        // For workers: Route VirtIO writes through shared memory proxy
+        #[cfg(target_arch = "wasm32")]
+        if let Some(ref shared_virtio) = self.shared_virtio {
+            if let Some(offset) = self.is_virtio_region(addr) {
+                let device_idx = ((addr - VIRTIO_BASE) / VIRTIO_STRIDE) as u32;
+                shared_virtio.virtio_write(device_idx, offset, val as u64);
+                return Ok(());
+            }
         }
 
         // Writes to unmapped VirtIO slots are silently ignored (allows safe probing)

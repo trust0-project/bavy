@@ -82,7 +82,7 @@ impl WorkerState {
         let dram_offset = shared_mem::dram_offset();
         let shared_clint_for_bus = SharedClint::new(&sab);
         // Workers read from shared UART input (is_worker = true)
-        let bus = SystemBus::from_shared_buffer(sab, dram_offset, shared_clint_for_bus, true);
+        let bus = SystemBus::from_shared_buffer(sab, dram_offset, shared_clint_for_bus, true, hart_id);
 
         // Create CPU for this hart
         let cpu = Cpu::new(entry_pc, hart_id as u64);
