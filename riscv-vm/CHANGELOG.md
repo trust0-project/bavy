@@ -1,3 +1,13 @@
+## 0.2.2 (2025-12-11)
+
+### 🩹 Fixes
+
+- improve riscv gui Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([c6236a2](https://github.com/trust0-project/bavy/commit/c6236a2))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.2.1 (2025-12-10)
 
 ### 🩹 Fixes
