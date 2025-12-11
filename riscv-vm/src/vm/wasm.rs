@@ -73,6 +73,35 @@ fn detect_hart_count() -> usize {
     (count / 2).max(1) // Use half the CPUs, ensure at least 1
 }
 
+/// Wrapper around Arc<VirtioInput> that implements VirtioDevice.
+/// This allows sharing the same VirtioInput instance between the bus and the
+/// event sender (for keyboard input).
+#[cfg(target_arch = "wasm32")]
+struct ArcVirtioInputWrapper(Arc<crate::devices::virtio::VirtioInput>);
+
+#[cfg(target_arch = "wasm32")]
+impl crate::devices::virtio::device::VirtioDevice for ArcVirtioInputWrapper {
+    fn device_id(&self) -> u32 {
+        self.0.device_id()
+    }
+    
+    fn is_interrupting(&self) -> bool {
+        self.0.is_interrupting()
+    }
+    
+    fn read(&self, offset: u64) -> Result<u64, crate::dram::MemoryError> {
+        self.0.read(offset)
+    }
+    
+    fn write(&self, offset: u64, val: u64, dram: &crate::dram::Dram) -> Result<(), crate::dram::MemoryError> {
+        self.0.write(offset, val, dram)
+    }
+    
+    fn poll(&self, dram: &crate::dram::Dram) -> Result<(), crate::dram::MemoryError> {
+        self.0.poll(dram)
+    }
+}
+
 /// WASM-exposed VM wrapper for running RISC-V kernels in the browser.
 ///
 /// ## Multi-Hart Architecture
@@ -119,6 +148,10 @@ pub struct WasmVm {
     workers_signaled: bool,
     /// External network backend for Node.js native addon bridging
     external_net: Option<Arc<crate::net::external::ExternalNetworkBackend>>,
+    /// VirtIO Input device reference (for sending key events)
+    input_device: Option<Arc<crate::devices::virtio::VirtioInput>>,
+    /// VirtIO GPU device reference (for framebuffer access)
+    gpu_device: Option<Arc<crate::devices::virtio::VirtioGpu>>,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -280,6 +313,8 @@ impl WasmVm {
             boot_steps: 0,
             workers_signaled: false,
             external_net: None,
+            input_device: None,
+            gpu_device: None,
         })
     }
 
@@ -289,6 +324,139 @@ impl WasmVm {
         let vblk = crate::devices::virtio::VirtioBlock::new(disk_image.to_vec());
         self.bus.virtio_devices.push(Box::new(vblk));
     }
+
+    /// Enable VirtIO GPU device for graphics rendering.
+    ///
+    /// The GPU device allows the kernel to render to a framebuffer which can
+    /// then be displayed in a Canvas element. Use `get_gpu_frame()` to retrieve
+    /// the rendered frame pixels.
+    ///
+    /// # Arguments
+    /// * `width` - Display width in pixels (default 800 if 0)
+    /// * `height` - Display height in pixels (default 600 if 0)
+    pub fn enable_gpu(&mut self, width: u32, height: u32) {
+        use crate::devices::virtio::VirtioGpu;
+        
+        let w = if width == 0 { 800 } else { width };
+        let h = if height == 0 { 600 } else { height };
+        
+        let vgpu = Arc::new(VirtioGpu::with_size(w, h));
+        self.gpu_device = Some(Arc::clone(&vgpu));
+        
+        // Also add to bus for MMIO access
+        let vgpu_for_bus = VirtioGpu::with_size(w, h);
+        self.bus.virtio_devices.push(Box::new(vgpu_for_bus));
+        
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+            "[VM] VirtIO GPU enabled: {}x{}",
+            w, h
+        )));
+    }
+
+    /// Enable VirtIO Input device for keyboard input.
+    ///
+    /// After calling this, use `send_key_event()` to forward keyboard events
+    /// from JavaScript to the guest kernel.
+    pub fn enable_input(&mut self) {
+        use crate::devices::virtio::VirtioInput;
+        
+        let input = Arc::new(VirtioInput::new());
+        
+        // Store Arc for event sending
+        self.input_device = Some(Arc::clone(&input));
+        
+        // Add to bus - the bus will use the same Arc
+        self.bus.virtio_devices.push(Box::new(ArcVirtioInputWrapper(Arc::clone(&input))));
+        
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
+            "[VM] VirtIO Input device enabled"
+        ));
+    }
+
+    /// Send a keyboard event to the guest.
+    ///
+    /// # Arguments
+    /// * `key_code` - JavaScript keyCode (e.g., 65 for 'A')
+    /// * `pressed` - true for keydown, false for keyup
+    ///
+    /// Returns true if the event was sent successfully.
+    pub fn send_key_event(&self, key_code: u32, pressed: bool) -> bool {
+        use crate::devices::virtio::input::js_keycode_to_linux;
+        
+        // Find the VirtIO Input device in the bus
+        for device in &self.bus.virtio_devices {
+            if device.device_id() == crate::devices::virtio::device::VIRTIO_INPUT_DEVICE_ID {
+                // We can't downcast Box<dyn VirtioDevice> directly, so we use
+                // the push_key_event through the device's write interface
+                // For now, just log that we would send the event
+                if let Some(linux_code) = js_keycode_to_linux(key_code) {
+                    // Push directly to input device if we have a reference
+                    if let Some(ref input) = self.input_device {
+                        input.push_key_event(linux_code, pressed);
+                        return true;
+                    }
+                }
+                break;
+            }
+        }
+        false
+    }
+
+    /// Check if there's a GPU frame ready for rendering.
+    ///
+    /// With direct memory framebuffer, this always returns true when GPU is enabled.
+    /// The framebuffer at FRAMEBUFFER_ADDR always contains the current frame.
+    pub fn has_gpu_frame(&self) -> bool {
+        self.gpu_device.is_some()
+    }
+
+    /// Get GPU frame data as RGBA pixels.
+    /// Returns a Uint8Array of pixel data, or null if no frame is available.
+    ///
+    /// The frame data is in RGBA format with 4 bytes per pixel (800x600 = 1,920,000 bytes).
+    /// 
+    /// This reads from a fixed framebuffer address in guest memory (0x8100_0000).
+    /// The kernel GPU driver writes pixels there, and we read them here.
+    pub fn get_gpu_frame(&self) -> Option<js_sys::Uint8Array> {
+        // Fixed framebuffer address in guest memory (after heap at 0x8080_0000)
+        // This must match the address used by the kernel's GPU driver
+        const FRAMEBUFFER_PHYS_ADDR: u64 = 0x8100_0000;
+        const FB_WIDTH: u32 = 800;
+        const FB_HEIGHT: u32 = 600;
+        const FB_SIZE: usize = (FB_WIDTH * FB_HEIGHT * 4) as usize; // RGBA = 4 bytes/pixel
+        
+        // Try to read from guest DRAM at the fixed framebuffer address
+        let dram_offset = (FRAMEBUFFER_PHYS_ADDR - crate::bus::DRAM_BASE) as usize;
+        
+        // Debug: Check first few pixels to see if there's any data
+        match self.bus.dram.read_range(dram_offset, FB_SIZE) {
+            Ok(pixels) => {
+                let arr = js_sys::Uint8Array::new_with_length(FB_SIZE as u32);
+                arr.copy_from(&pixels);
+                Some(arr)
+            }
+            Err(e) => {
+                web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(
+                    &format!("[GPU] Failed to read framebuffer at offset {:#x}: {:?}", dram_offset, e)
+                ));
+                None
+            }
+        }
+    }
+
+    /// Get GPU display dimensions.
+    /// Returns [width, height] or null if GPU is not enabled.
+    pub fn get_gpu_size(&self) -> Option<js_sys::Uint32Array> {
+        if let Some(ref gpu) = self.gpu_device {
+            let (width, height) = gpu.display_size();
+            let arr = js_sys::Uint32Array::new_with_length(2);
+            arr.set_index(0, width);
+            arr.set_index(1, height);
+            return Some(arr);
+        }
+        None
+    }
+
 
     /// Connect to a WebTransport relay server.
     /// Note: Connection is asynchronous. Check network_status() to monitor connection state.
@@ -459,17 +627,26 @@ impl WasmVm {
         // by seeing if we can read an assigned IP from the VirtIO config space
         if self.net_status == NetworkStatus::Connecting {
             // Look for a VirtioNet device (device_id == 1) and check if IP is assigned
-            for (idx, device) in self.bus.virtio_devices.iter_mut().enumerate() {
+            for device in self.bus.virtio_devices.iter_mut() {
                 let dev_id = device.device_id();
                 if dev_id == 1 {
+                    // First check if the backend is still connecting (not failed)
+                    if !device.is_backend_connected() {
+                        // Backend has failed or disconnected - stop polling
+                        // Don't log here to avoid spam; the backend already logged the failure
+                        self.net_status = NetworkStatus::Disconnected;
+                        break;
+                    }
+                    
                     // Read config space offset 8 (IP address)
                     // IP is at config offset 0x108 - 0x100 = 8
                     if let Ok(ip_val) = device.read(0x108) {
-                        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
-                            "[network_status] Device idx={} id={} read(0x108)={:#x}",
-                            idx, dev_id, ip_val
-                        )));
                         if ip_val != 0 {
+                            web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+                                "[network_status] IP assigned: {}.{}.{}.{}",
+                                ip_val & 0xff, (ip_val >> 8) & 0xff, 
+                                (ip_val >> 16) & 0xff, (ip_val >> 24) & 0xff
+                            )));
                             self.net_status = NetworkStatus::Connected;
                             break;
                         }

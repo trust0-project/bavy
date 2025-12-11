@@ -532,6 +532,11 @@ mod native {
                 None
             }
         }
+
+        fn is_connected(&self) -> bool {
+            // For native, we're connected if we have registered with the relay
+            self.registered.load(std::sync::atomic::Ordering::SeqCst)
+        }
     }
 }
 
@@ -1099,6 +1104,10 @@ mod wasm {
 
         fn get_assigned_ip(&self) -> Option<[u8; 4]> {
             self.state.borrow().assigned_ip
+        }
+
+        fn is_connected(&self) -> bool {
+            self.state.borrow().connection_state == ConnectionState::Connected
         }
     }
 }

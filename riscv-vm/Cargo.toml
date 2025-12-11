@@ -24,6 +24,9 @@ bincode = "1.3"
 sha2 = "0.10"
 wasm-bindgen = "0.2"
 
+# Cross-platform GPU rendering
+wgpu = "24"
+
 # napi-rs bindings (optional, for Node.js native addon)
 napi-rs = { package = "napi", version = "2", features = ["async", "tokio_rt"], optional = true }
 napi-derive = { version = "2", optional = true }
@@ -35,6 +38,9 @@ tungstenite = "0.21"
 wtransport = { version = "0.6", features = ["dangerous-configuration"] }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
+# Windowing for native GPU rendering
+winit = "0.30"
+pollster = "0.4"
 
 # Unix-only dependencies (tun-tap doesn't support Windows)
 [target.'cfg(all(not(target_arch = "wasm32"), unix))'.dependencies]
@@ -61,7 +67,11 @@ web-sys = { version = "0.3", features = [
     "Navigator",
     "Worker",
     "WorkerOptions",
-    "WorkerType"
+    "WorkerType",
+    "Document",
+    "Element",
+    "HtmlCanvasElement",
+    "KeyboardEvent"
 ] }
 js-sys = "0.3"
 wasm-bindgen-futures = "0.4"

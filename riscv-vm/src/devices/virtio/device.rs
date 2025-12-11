@@ -39,6 +39,8 @@ pub const VIRTIO_BLK_DEVICE_ID: u32 = 2;
 #[allow(dead_code)]
 pub const VIRTIO_CONSOLE_DEVICE_ID: u32 = 3;
 pub const VIRTIO_RNG_DEVICE_ID: u32 = 4;
+pub const VIRTIO_GPU_DEVICE_ID: u32 = 16;
+pub const VIRTIO_INPUT_DEVICE_ID: u32 = 18;
 
 // VirtIO Block Features
 #[allow(dead_code)]
@@ -92,5 +94,11 @@ pub trait VirtioDevice: Send + Sync {
     /// Default implementation does nothing.
     fn poll(&self, _dram: &Dram) -> Result<(), MemoryError> {
         Ok(())
+    }
+
+    /// Check if the backend (e.g., network) is connected.
+    /// Only meaningful for network devices. Returns true by default.
+    fn is_backend_connected(&self) -> bool {
+        true
     }
 }

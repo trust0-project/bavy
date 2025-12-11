@@ -38,6 +38,15 @@ pub trait NetworkBackend: Send {
         None
     }
 
+    /// Check if the backend is currently connected.
+    /// Returns true if connected, false if disconnected, connecting, or failed.
+    /// This is used to detect connection failures (where get_assigned_ip returns None
+    /// but we're not actually connecting anymore).
+    fn is_connected(&self) -> bool {
+        // Default: assume connected (for backends that don't track state)
+        true
+    }
+
     /// Receive with timeout (for async wrapper).
     ///
     /// Waits up to `timeout` for an incoming packet. Returns `Ok(Some(packet))`

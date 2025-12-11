@@ -5,9 +5,6 @@ use std::sync::Mutex;
 
 use super::device::{self, VirtioDevice};
 
-#[cfg(target_arch = "wasm32")]
-use wasm_bindgen;
-
 /// VirtIO Network Queue state
 struct NetQueue {
     num: u32,
@@ -467,11 +464,6 @@ impl VirtioDevice for VirtioNet {
                         // Bytes 8-11: Assigned IP address (from relay/network controller)
                         // Returns 0 if no IP has been assigned yet
                         let ip_opt = state.backend.get_assigned_ip();
-                        #[cfg(target_arch = "wasm32")]
-                        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
-                            "[VirtioNet] Config read offset=8, backend.get_assigned_ip()={:?}",
-                            ip_opt
-                        )));
                         if let Some(ip) = ip_opt {
                             // Return IP as u32 (Little Endian)
                             // IP: [10, 0, 2, 15] -> 0x0F02000A
@@ -603,5 +595,10 @@ impl VirtioDevice for VirtioNet {
         // TX processing is critical: ensures packets queued by guest are actually sent
         Self::process_tx_queue(&mut state, dram)?;
         Self::process_rx_queue(&mut state, dram)
+    }
+
+    fn is_backend_connected(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        state.backend.is_connected()
     }
 }

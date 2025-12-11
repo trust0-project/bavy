@@ -175,6 +175,40 @@ impl NativeVm {
         }
     }
 
+    /// Enable VirtIO GPU device for graphics rendering.
+    ///
+    /// Must be called before `run()` / `start_workers()`.
+    ///
+    /// # Arguments
+    /// * `width` - Display width in pixels
+    /// * `height` - Display height in pixels
+    pub fn enable_gpu(&mut self, width: u32, height: u32) {
+        use crate::devices::virtio::VirtioGpu;
+
+        if let Some(bus) = Arc::get_mut(&mut self.bus) {
+            let vgpu = VirtioGpu::with_size(width, height);
+            bus.virtio_devices.push(Box::new(vgpu));
+            println!("[VM] VirtIO GPU enabled: {}x{}", width, height);
+        } else {
+            eprintln!("[VM] Cannot enable GPU: workers already running");
+        }
+    }
+
+    /// Enable VirtIO Input device for keyboard input.
+    ///
+    /// Must be called before `run()` / `start_workers()`.
+    pub fn enable_input(&mut self) {
+        use crate::devices::virtio::VirtioInput;
+
+        if let Some(bus) = Arc::get_mut(&mut self.bus) {
+            let vinput = VirtioInput::new();
+            bus.virtio_devices.push(Box::new(vinput));
+            println!("[VM] VirtIO Input device enabled");
+        } else {
+            eprintln!("[VM] Cannot enable input: workers already running");
+        }
+    }
+
     /// Get the number of harts.
     pub fn num_harts(&self) -> usize {
         self.num_harts
