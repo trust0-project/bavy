@@ -1,3 +1,13 @@
+## 0.3.0 (2025-12-12)
+
+### 🚀 Features
+
+- add mouse pointer and better GPU support Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([fd3902d](https://github.com/trust0-project/bavy/commit/fd3902d))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.2.2 (2025-12-11)
 
 ### 🩹 Fixes
