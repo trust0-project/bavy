@@ -402,6 +402,50 @@ impl WasmVm {
         false
     }
 
+    /// Send a mouse event to the guest.
+    ///
+    /// # Arguments
+    /// * `x` - X position (0-799)
+    /// * `y` - Y position (0-599)
+    /// * `buttons` - Button state bitmask (bit 0 = left, bit 1 = right, bit 2 = middle)
+    /// * `prev_buttons` - Previous button state to detect changes
+    ///
+    /// Returns true if the event was sent successfully.
+    pub fn send_mouse_event(&self, x: u32, y: u32, buttons: u32) -> bool {
+        use crate::devices::virtio::input::{BTN_LEFT, BTN_RIGHT, BTN_MIDDLE};
+        
+        if let Some(ref input) = self.input_device {
+            // Send position update
+            input.push_mouse_move(x as u16, y as u16);
+            
+            // Note: Button state changes are handled separately via send_mouse_button
+            // This method just updates position
+            return true;
+        }
+        false
+    }
+
+    /// Send a mouse button event to the guest.
+    ///
+    /// # Arguments
+    /// * `button` - Button number (0 = left, 1 = right, 2 = middle)
+    /// * `pressed` - true for press, false for release
+    pub fn send_mouse_button(&self, button: u32, pressed: bool) -> bool {
+        use crate::devices::virtio::input::{BTN_LEFT, BTN_RIGHT, BTN_MIDDLE};
+        
+        if let Some(ref input) = self.input_device {
+            let btn_code = match button {
+                0 => BTN_LEFT,
+                1 => BTN_RIGHT,
+                2 => BTN_MIDDLE,
+                _ => return false,
+            };
+            input.push_mouse_button(btn_code, pressed);
+            return true;
+        }
+        false
+    }
+
     /// Check if there's a GPU frame ready for rendering.
     ///
     /// With direct memory framebuffer, this always returns true when GPU is enabled.

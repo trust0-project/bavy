@@ -27,6 +27,15 @@ pub const EV_KEY: u16 = 0x01;
 pub const EV_REL: u16 = 0x02;
 pub const EV_ABS: u16 = 0x03;
 
+// Absolute position codes (for mouse/tablet)
+pub const ABS_X: u16 = 0x00;
+pub const ABS_Y: u16 = 0x01;
+
+// Mouse button codes
+pub const BTN_LEFT: u16 = 0x110;
+pub const BTN_RIGHT: u16 = 0x111;
+pub const BTN_MIDDLE: u16 = 0x112;
+
 // Common Linux key codes (subset)
 pub const KEY_ESC: u16 = 1;
 pub const KEY_1: u16 = 2;
@@ -213,6 +222,52 @@ impl VirtioInput {
         if state.debug {
             log::debug!("[VirtIO Input] Key event: code={} pressed={}", code, pressed);
         }
+    }
+
+    /// Push a mouse movement event (absolute position)
+    /// x, y: absolute position in pixels (e.g., 0-799, 0-599)
+    pub fn push_mouse_move(&self, x: u16, y: u16) {
+        let mut state = self.state.lock().unwrap();
+        
+        // Add EV_ABS events for X and Y position
+        state.event_queue.push_back(InputEvent {
+            event_type: EV_ABS,
+            code: ABS_X,
+            value: x as i32,
+        });
+        state.event_queue.push_back(InputEvent {
+            event_type: EV_ABS,
+            code: ABS_Y,
+            value: y as i32,
+        });
+        
+        // Add SYN event
+        state.event_queue.push_back(InputEvent {
+            event_type: EV_SYN,
+            code: 0,
+            value: 0,
+        });
+    }
+
+    /// Push a mouse button event
+    /// button: BTN_LEFT, BTN_RIGHT, or BTN_MIDDLE
+    /// pressed: true for press, false for release
+    pub fn push_mouse_button(&self, button: u16, pressed: bool) {
+        let mut state = self.state.lock().unwrap();
+        
+        // Mouse buttons use EV_KEY with button codes
+        state.event_queue.push_back(InputEvent {
+            event_type: EV_KEY,
+            code: button,
+            value: if pressed { 1 } else { 0 },
+        });
+        
+        // Add SYN event
+        state.event_queue.push_back(InputEvent {
+            event_type: EV_SYN,
+            code: 0,
+            value: 0,
+        });
     }
 
     /// Check if there are pending events
