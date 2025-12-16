@@ -150,8 +150,6 @@ pub struct WasmVm {
     external_net: Option<Arc<crate::net::external::ExternalNetworkBackend>>,
     /// VirtIO Input device reference (for sending key events)
     input_device: Option<Arc<crate::devices::virtio::VirtioInput>>,
-    /// VirtIO GPU device reference (for framebuffer access)
-    gpu_device: Option<Arc<crate::devices::virtio::VirtioGpu>>,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -285,13 +283,44 @@ impl WasmVm {
         // Set hart count in CLINT (native CLINT in bus)
         bus.set_num_harts(num_harts);
 
-        // Create primary CPU (hart 0)
-        let cpu = cpu::Cpu::new(entry_pc, 0);
+        // Generate and write DTB to DRAM for OpenSBI compliance
+        // D1 EMAC is always enabled for kernel probing
+        let d1_config = crate::dtb::D1DeviceConfig {
+            has_display: false, // Will be updated via enable_gpu()
+            has_mmc: false,     // Will be updated via load_disk()
+            has_emac: true,     // Always enabled for kernel probing
+            has_touch: true,    // Touch input always enabled
+        };
+        let dtb = crate::dtb::generate_dtb(num_harts, DRAM_SIZE as u64, &d1_config);
+        let dtb_address = crate::dtb::write_dtb_to_dram(&bus.dram, &dtb);
 
         web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
-            "[VM] Created {} harts, entry PC=0x{:x}, SMP={}",
-            num_harts, entry_pc, sab_available
+            "[VM] Generated DTB ({} bytes) at 0x{:x}",
+            dtb.len(), dtb_address
         )));
+
+        // Create primary CPU (hart 0)
+        let mut cpu = cpu::Cpu::new(entry_pc, 0);
+        cpu.setup_smode_boot_with_dtb(dtb_address); // Enable S-mode with DTB address
+
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+            "[VM] Created {} harts, entry PC=0x{:x}, dtb=0x{:x}, SMP={}",
+            num_harts, entry_pc, dtb_address, sab_available
+        )));
+
+        // Always initialize D1 EMAC so kernel can probe it (regardless of network connection)
+        {
+            use crate::devices::d1_emac::D1EmacEmulated;
+            let emac = D1EmacEmulated::new();
+            *bus.d1_emac.write().unwrap() = Some(emac);
+        }
+
+        // Always initialize D1 Touch for input events
+        {
+            use crate::devices::d1_touch::D1TouchEmulated;
+            let touch = D1TouchEmulated::new();
+            *bus.d1_touch.write().unwrap() = Some(touch);
+        }
 
         Ok(WasmVm {
             bus,
@@ -314,43 +343,42 @@ impl WasmVm {
             workers_signaled: false,
             external_net: None,
             input_device: None,
-            gpu_device: None,
+
         })
     }
 
-    /// Load a disk image and attach it as a VirtIO block device.
+    /// Load a disk image and attach it as a D1 MMC device.
     /// This should be called before starting execution if the kernel needs a filesystem.
     pub fn load_disk(&mut self, disk_image: &[u8]) {
-        let vblk = crate::devices::virtio::VirtioBlock::new(disk_image.to_vec());
-        self.bus.virtio_devices.push(Box::new(vblk));
+        use crate::devices::d1_mmc::D1MmcEmulated;
+        
+        let mmc = D1MmcEmulated::new(disk_image.to_vec());
+        *self.bus.d1_mmc.write().unwrap() = Some(mmc);
+        
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+            "[VM] D1 MMC loaded with {} byte disk image",
+            disk_image.len()
+        )));
     }
 
-    /// Enable VirtIO GPU device for graphics rendering.
+    /// Enable D1 Display device for graphics rendering.
     ///
-    /// The GPU device allows the kernel to render to a framebuffer which can
+    /// The display device allows the kernel to render to a framebuffer which can
     /// then be displayed in a Canvas element. Use `get_gpu_frame()` to retrieve
     /// the rendered frame pixels.
     ///
     /// # Arguments
-    /// * `width` - Display width in pixels (default 800 if 0)
-    /// * `height` - Display height in pixels (default 600 if 0)
-    pub fn enable_gpu(&mut self, width: u32, height: u32) {
-        use crate::devices::virtio::VirtioGpu;
+    /// * `width` - Display width in pixels (ignored, uses 1024x768)
+    /// * `height` - Display height in pixels (ignored, uses 1024x768)
+    pub fn enable_gpu(&mut self, _width: u32, _height: u32) {
+        use crate::devices::d1_display::D1DisplayEmulated;
         
-        let w = if width == 0 { 800 } else { width };
-        let h = if height == 0 { 600 } else { height };
+        let display = D1DisplayEmulated::new();
+        *self.bus.d1_display.write().unwrap() = Some(display);
         
-        let vgpu = Arc::new(VirtioGpu::with_size(w, h));
-        self.gpu_device = Some(Arc::clone(&vgpu));
-        
-        // Also add to bus for MMIO access
-        let vgpu_for_bus = VirtioGpu::with_size(w, h);
-        self.bus.virtio_devices.push(Box::new(vgpu_for_bus));
-        
-        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
-            "[VM] VirtIO GPU enabled: {}x{}",
-            w, h
-        )));
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
+            "[VM] D1 Display enabled (1024x768)"
+        ));
     }
 
     /// Enable VirtIO Input device for keyboard input.
@@ -446,18 +474,55 @@ impl WasmVm {
         false
     }
 
+    /// Send a touch event to the D1 GT911 touchscreen controller.
+    ///
+    /// # Arguments
+    /// * `x` - X position (0 to display width)
+    /// * `y` - Y position (0 to display height)
+    /// * `pressed` - true for touch down/move, false for touch up
+    ///
+    /// Returns true if the event was sent successfully.
+    pub fn send_touch_event(&self, x: u32, y: u32, pressed: bool) -> bool {
+        if let Ok(mut touch) = self.bus.d1_touch.write() {
+            if let Some(ref mut dev) = *touch {
+                dev.push_touch(x as u16, y as u16, pressed);
+                return true;
+            }
+        }
+        false
+    }
+
     /// Check if there's a GPU frame ready for rendering.
     ///
     /// With direct memory framebuffer, this always returns true when GPU is enabled.
     /// The framebuffer at FRAMEBUFFER_ADDR always contains the current frame.
     pub fn has_gpu_frame(&self) -> bool {
-        self.gpu_device.is_some()
+        if let Ok(display) = self.bus.d1_display.read() {
+            display.is_some()
+        } else {
+            false
+        }
+    }
+
+    /// Get the current frame version from kernel memory.
+    /// Returns a u32 that increments each time the kernel flushes dirty pixels.
+    /// Browser can compare this to skip fetching unchanged frames.
+    pub fn get_gpu_frame_version(&self) -> u32 {
+        // Frame version is stored at 0x80FF_FFFC by the kernel
+        const FRAME_VERSION_PHYS_ADDR: u64 = 0x80FF_FFFC;
+        
+        let dram_offset = FRAME_VERSION_PHYS_ADDR - crate::bus::DRAM_BASE;
+        
+        match self.bus.dram.load_32(dram_offset) {
+            Ok(version) => version,
+            Err(_) => 0,
+        }
     }
 
     /// Get GPU frame data as RGBA pixels.
     /// Returns a Uint8Array of pixel data, or null if no frame is available.
     ///
-    /// The frame data is in RGBA format with 4 bytes per pixel (800x600 = 1,920,000 bytes).
+    /// The frame data is in RGBA format with 4 bytes per pixel (1024×768 = 3,145,728 bytes).
     /// 
     /// This reads from a fixed framebuffer address in guest memory (0x8100_0000).
     /// The kernel GPU driver writes pixels there, and we read them here.
@@ -465,8 +530,8 @@ impl WasmVm {
         // Fixed framebuffer address in guest memory (after heap at 0x8080_0000)
         // This must match the address used by the kernel's GPU driver
         const FRAMEBUFFER_PHYS_ADDR: u64 = 0x8100_0000;
-        const FB_WIDTH: u32 = 800;
-        const FB_HEIGHT: u32 = 600;
+        const FB_WIDTH: u32 = 1024;
+        const FB_HEIGHT: u32 = 768;
         const FB_SIZE: usize = (FB_WIDTH * FB_HEIGHT * 4) as usize; // RGBA = 4 bytes/pixel
         
         // Try to read from guest DRAM at the fixed framebuffer address
@@ -491,14 +556,47 @@ impl WasmVm {
     /// Get GPU display dimensions.
     /// Returns [width, height] or null if GPU is not enabled.
     pub fn get_gpu_size(&self) -> Option<js_sys::Uint32Array> {
-        if let Some(ref gpu) = self.gpu_device {
-            let (width, height) = gpu.display_size();
-            let arr = js_sys::Uint32Array::new_with_length(2);
-            arr.set_index(0, width);
-            arr.set_index(1, height);
-            return Some(arr);
+        if let Ok(display) = self.bus.d1_display.read() {
+            if let Some(ref d) = *display {
+                let arr = js_sys::Uint32Array::new_with_length(2);
+                arr.set_index(0, d.width());
+                arr.set_index(1, d.height());
+                return Some(arr);
+            }
         }
         None
+    }
+
+    /// Get a direct zero-copy view into the framebuffer in SharedArrayBuffer.
+    /// 
+    /// This eliminates all memory copies by creating a Uint8Array view directly
+    /// into the SharedArrayBuffer at the framebuffer offset. The browser can
+    /// pass this directly to WebGPU's writeTexture for zero-copy rendering.
+    /// 
+    /// Returns None if SharedArrayBuffer is not available (single-threaded mode).
+    pub fn get_framebuffer_view(&self) -> Option<js_sys::Uint8Array> {
+        // Get the SharedArrayBuffer
+        let sab = self.shared_buffer.as_ref()?;
+        
+        // Calculate framebuffer offset within SharedArrayBuffer
+        // DRAM starts at HEADER_SIZE (control + clint + uart regions)
+        // Framebuffer is at physical 0x8100_0000, DRAM base is 0x8000_0000
+        // So framebuffer offset within DRAM = 0x100_0000 (16MB)
+        const FRAMEBUFFER_DRAM_OFFSET: usize = 0x0100_0000;
+        const FB_SIZE: usize = 1024 * 768 * 4; // 3,145,728 bytes
+        
+        let dram_offset = crate::shared_mem::dram_offset();
+        let fb_sab_offset = dram_offset + FRAMEBUFFER_DRAM_OFFSET;
+        
+        // Create a Uint8Array view directly into SharedArrayBuffer at the fb offset
+        // This is zero-copy - the Uint8Array points to the same memory
+        let view = js_sys::Uint8Array::new_with_byte_offset_and_length(
+            sab,
+            fb_sab_offset as u32,
+            FB_SIZE as u32,
+        );
+        
+        Some(view)
     }
 
 
@@ -509,29 +607,29 @@ impl WasmVm {
         url: &str,
         cert_hash: Option<String>,
     ) -> Result<(), JsValue> {
-        use crate::devices::virtio::VirtioNet;
-        use crate::net::webtransport::WebTransportBackend;
+        use crate::devices::d1_emac::D1EmacEmulated;
 
         // Status stays as Connecting until we can verify the connection is established
-        // (when IP is assigned, the connection is confirmed)
         self.net_status = NetworkStatus::Connecting;
 
-        let backend = WebTransportBackend::new(url, cert_hash);
-        // Note: WebTransport connect is async, so backend.init() will start connection
-        // but actual connection happens in background.
-        let vnet = VirtioNet::new(Box::new(backend));
-        // debug defaults to false in VirtioNet
+        // Create D1 EMAC device
+        let emac = D1EmacEmulated::new();
+        *self.bus.d1_emac.write().unwrap() = Some(emac);
 
-        self.bus.virtio_devices.push(Box::new(vnet));
-        // Don't set to Connected here - let network_status() check the actual state
+        // TODO: Store backend and poll it to bridge packets to/from D1 EMAC
+        // For now, just log that D1 EMAC is enabled
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+            "[VM] D1 EMAC enabled for network: {}",
+            url
+        )));
 
         Ok(())
     }
 
     /// Disconnect from the network.
     pub fn disconnect_network(&mut self) {
-        // Remove VirtioNet devices (device_id == 1)
-        self.bus.virtio_devices.retain(|dev| dev.device_id() != 1);
+        // Clear D1 EMAC device
+        *self.bus.d1_emac.write().unwrap() = None;
         self.net_status = NetworkStatus::Disconnected;
         self.external_net = None;
     }
@@ -546,8 +644,8 @@ impl WasmVm {
     ///
     /// @param mac_bytes - MAC address as 6 bytes [0x52, 0x54, 0x00, 0x12, 0x34, 0x56]
     pub fn setup_external_network(&mut self, mac_bytes: js_sys::Uint8Array) -> Result<(), JsValue> {
-        use crate::devices::virtio::VirtioNet;
-        use crate::net::external::{ExternalBackendWrapper, ExternalNetworkBackend};
+        use crate::devices::d1_emac::D1EmacEmulated;
+        use crate::net::external::ExternalNetworkBackend;
 
         // Parse MAC address
         let mac_vec = mac_bytes.to_vec();
@@ -561,18 +659,15 @@ impl WasmVm {
         let backend = Arc::new(ExternalNetworkBackend::new(mac));
         self.external_net = Some(backend.clone());
 
-        // Create a wrapper that implements NetworkBackend
-        let wrapper = ExternalBackendWrapper { inner: backend };
-
-        // Create VirtIO network device
-        let vnet = VirtioNet::new(Box::new(wrapper));
-        self.bus.virtio_devices.push(Box::new(vnet));
+        // Create D1 EMAC device with MAC address
+        let emac = D1EmacEmulated::with_mac(mac);
+        *self.bus.d1_emac.write().unwrap() = Some(emac);
 
         self.net_status = NetworkStatus::Connecting;
 
         // Log to console (works in both browser and Node.js with WASM)
         let msg = format!(
-            "[VM] External network setup, MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            "[VM] D1 EMAC setup, MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
         );
         web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&msg));
@@ -621,20 +716,56 @@ impl WasmVm {
 
     /// Set the assigned IP address for the external network.
     /// Called when the native WebTransport addon receives an IP assignment.
-    pub fn set_external_network_ip(&self, ip_bytes: js_sys::Uint8Array) -> bool {
+    pub fn set_external_network_ip(&mut self, ip_bytes: js_sys::Uint8Array) -> bool {
         let ip_vec = ip_bytes.to_vec();
         if ip_vec.len() != 4 {
             return false;
         }
+        
+        let mut ip = [0u8; 4];
+        ip.copy_from_slice(&ip_vec);
+        
+        // Log the IP assignment
+        let msg = format!(
+            "[VM] set_external_network_ip: {}.{}.{}.{}",
+            ip[0], ip[1], ip[2], ip[3]
+        );
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&msg));
+        
+        // Set IP on external backend
         if let Some(ref backend) = self.external_net {
-            let mut ip = [0u8; 4];
-            ip.copy_from_slice(&ip_vec);
             backend.set_assigned_ip(ip);
             backend.set_connected(true);
-            true
-        } else {
-            false
         }
+        
+        // Also set IP on D1 EMAC device so kernel can read it via MMIO
+        if let Ok(mut emac) = self.bus.d1_emac.write() {
+            if let Some(ref mut dev) = *emac {
+                dev.set_ip(ip);
+                let msg = format!(
+                    "[VM] D1 EMAC IP set to {}.{}.{}.{}",
+                    ip[0], ip[1], ip[2], ip[3]
+                );
+                web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&msg));
+            } else {
+                web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
+                    "[VM] Warning: D1 EMAC device not initialized!"
+                ));
+            }
+        }
+        
+        // Also write to shared memory so workers can access it
+        if let Some(ref ctrl) = self.bus.shared_control {
+            ctrl.set_d1_emac_ip(ip);
+            let msg = format!(
+                "[VM] D1 EMAC IP written to shared memory: {}.{}.{}.{}",
+                ip[0], ip[1], ip[2], ip[3]
+            );
+            web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&msg));
+        }
+        
+        self.net_status = NetworkStatus::Connected;
+        true
     }
 
     /// Check if external network is connected (has IP assigned).
@@ -665,35 +796,21 @@ impl WasmVm {
     }
 
     /// Get the current network connection status.
-    /// This checks the actual connection state by seeing if an IP was assigned.
+    /// This checks the actual connection state by seeing if D1 EMAC is enabled.
     pub fn network_status(&mut self) -> NetworkStatus {
-        // If we think we're connecting, check if we've actually connected
-        // by seeing if we can read an assigned IP from the VirtIO config space
+        // If we think we're connecting, check if D1 EMAC is available
         if self.net_status == NetworkStatus::Connecting {
-            // Look for a VirtioNet device (device_id == 1) and check if IP is assigned
-            for device in self.bus.virtio_devices.iter_mut() {
-                let dev_id = device.device_id();
-                if dev_id == 1 {
-                    // First check if the backend is still connecting (not failed)
-                    if !device.is_backend_connected() {
-                        // Backend has failed or disconnected - stop polling
-                        // Don't log here to avoid spam; the backend already logged the failure
-                        self.net_status = NetworkStatus::Disconnected;
-                        break;
-                    }
-                    
-                    // Read config space offset 8 (IP address)
-                    // IP is at config offset 0x108 - 0x100 = 8
-                    if let Ok(ip_val) = device.read(0x108) {
-                        if ip_val != 0 {
-                            web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
-                                "[network_status] IP assigned: {}.{}.{}.{}",
-                                ip_val & 0xff, (ip_val >> 8) & 0xff, 
-                                (ip_val >> 16) & 0xff, (ip_val >> 24) & 0xff
-                            )));
+            // Check if D1 EMAC device is present
+            if let Ok(emac) = self.bus.d1_emac.read() {
+                if emac.is_some() {
+                    // Check if external backend is connected (if using external network)
+                    if let Some(ref backend) = self.external_net {
+                        if backend.is_connected() {
                             self.net_status = NetworkStatus::Connected;
-                            break;
                         }
+                    } else {
+                        // No external backend - assume connected for now
+                        self.net_status = NetworkStatus::Connected;
                     }
                 }
             }
@@ -750,10 +867,6 @@ impl WasmVm {
             if control.is_halted() {
                 self.halted = true;
                 self.halt_code = control.halt_code();
-                web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
-                    "[VM] Worker signaled halt (code: {:#x})",
-                    self.halt_code
-                )));
                 return false;
             }
         }
@@ -765,20 +878,19 @@ impl WasmVm {
         // NOTE: The kernel is responsible for synchronizing harts - this is just
         // a small buffer to ensure workers aren't trying to execute before the
         // first few instructions of hart 0 have run.
-        const BOOT_STEPS_THRESHOLD: u64 = 1_000; // ~1K instructions - minimal delay
-        if !self.workers_signaled {
-            self.boot_steps += 1;
-            if self.boot_steps >= BOOT_STEPS_THRESHOLD {
-                if let Some(ref control) = self.shared_control {
-                    control.allow_workers_to_start();
-                    self.workers_signaled = true;
-                    web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
-                        "[VM] Workers signaled to start after {} boot steps",
-                        self.boot_steps
-                    )));
-                }
-            }
-        }
+        //
+        // NOTE: This automatic boot_steps-based trigger has been REMOVED because it
+        // caused race conditions with 9+ harts. The worker start signal is now
+        // controlled by cli.ts which waits for ALL workers to report ready before
+        // calling allow_workers_to_start(). This prevents workers from starting
+        // before they've all spawned.
+        //
+        // The old logic was:
+        // - After 1000 boot steps, set CTRL_WORKERS_CAN_START = 1
+        // - But with 9+ workers, some workers hadn't spawned yet when this fired
+        // - Those workers would see the flag = 1 and immediately start executing
+        //
+        // Now cli.ts waits for all workers to report "ready" before setting the flag.
 
         // Poll VirtIO devices periodically for incoming network packets
         // Poll every 100 instructions for good network responsiveness
@@ -788,6 +900,31 @@ impl WasmVm {
 
             // Process VirtIO requests from workers (SMP mode only)
             self.process_virtio_requests();
+            
+            // Poll D1 EMAC for DMA (if enabled) and bridge with external network
+            if let Ok(mut emac) = self.bus.d1_emac.write() {
+                if let Some(ref mut emac) = *emac {
+                    if let Some(ref backend) = self.external_net {
+                        // Step 1: Inject RX packets from relay into D1 EMAC RX queue
+                        // (so poll_dma can deliver them to the kernel)
+                        while let Some(packet) = backend.extract_rx_packet() {
+                            emac.queue_rx_packet(packet);
+                        }
+                    }
+                    
+                    // Step 2: Poll DMA - this reads TX from kernel DRAM and delivers RX to kernel
+                    emac.poll_dma(&self.bus.dram);
+                    
+                    // Step 3: Extract TX packets that poll_dma just read from kernel
+                    // and forward them to the relay via external_net
+                    if let Some(ref backend) = self.external_net {
+                        let tx_packets = emac.get_tx_packets();
+                        for packet in tx_packets {
+                            backend.queue_tx_packet(packet);
+                        }
+                    }
+                }
+            }
 
             // Update CLINT timer - use shared CLINT if available, otherwise local
             if let Some(ref clint) = self.shared_clint {
@@ -827,8 +964,56 @@ impl WasmVm {
                 }
                 return false;
             }
+            Err(Trap::Wfi) => {
+                // WFI: Advance PC and sleep if no interrupts pending
+                self.cpu.pc = self.cpu.pc.wrapping_add(4);
+                
+                // Check for pending interrupts via shared CLINT if available
+                if let Some(ref clint) = self.shared_clint {
+                    let (msip, timer) = clint.check_interrupts(0);
+                    if msip || timer {
+                        // Deliver interrupts via MIP CSR so CPU can take the trap
+                        if let Ok(mut mip) = self.cpu.read_csr(0x344) { // MIP
+                            if msip { mip |= 1 << 3; } // MSIP
+                            if timer { mip |= 1 << 7; } // MTIP
+                            let _ = self.cpu.write_csr(0x344, mip);
+                        }
+                        
+                        // Check if the CPU can actually take this interrupt (not masked)
+                        if self.cpu.check_pending_interrupt().is_some() {
+                            // Interrupt is enabled - return immediately to take trap
+                            return true;
+                        } else {
+                            // Interrupt is pending but masked - yield host briefly
+                            // to avoid busy-spin when guest is polling with interrupts disabled
+                            let view = &clint.view;
+                            let index = clint.msip_index(0);
+                            let _ = js_sys::Atomics::wait_with_timeout(view, index, 0, 1.0);
+                            return true;
+                        }
+                    }
+                    
+                    // Calculate timeout based on timer
+                    let now = clint.mtime();
+                    let trigger = clint.get_mtimecmp(0);
+                    let timeout_ms = if trigger > now {
+                        let diff = trigger - now;
+                        let ms = diff / 10_000; // 10MHz CLINT
+                        if ms > 100 { 100 } else { ms.max(1) as i32 }
+                    } else {
+                        1 // Minimum sleep to prevent spin
+                    };
+                    // Use Atomics.wait to sleep
+                    let view = &clint.view;
+                    let index = clint.msip_index(0);
+                    let _ = js_sys::Atomics::wait_with_timeout(view, index, 0, timeout_ms.into());
+                } else {
+                    // No shared CLINT - just yield briefly
+                    // This shouldn't happen in SMP mode, but fallback for safety
+                }
+            }
             Err(_trap) => {
-                // Architectural traps handled by CPU
+                // Other architectural traps handled by CPU
             }
         }
 
@@ -976,7 +1161,6 @@ impl WasmVm {
         if let Some(ref control) = self.shared_control {
             control.allow_workers_to_start();
             self.workers_signaled = true;
-            web_sys::console::log_1(&JsValue::from_str("[VM] Workers signaled to start"));
         }
     }
 

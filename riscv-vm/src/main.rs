@@ -3,6 +3,7 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
+use riscv_vm::sdboot;
 use riscv_vm::vm::native::NativeVm;
 
 #[derive(Parser, Debug)]
@@ -10,13 +11,9 @@ use riscv_vm::vm::native::NativeVm;
 #[command(about = "RISCV emulator with SMP support")]
 #[command(version)]
 struct Args {
-    /// Path to kernel ELF or binary
+    /// Path to SD card image (contains kernel + filesystem)
     #[arg(short, long)]
-    kernel: PathBuf,
-
-    /// Path to disk image (optional)
-    #[arg(short, long)]
-    disk: Option<PathBuf>,
+    sdcard: PathBuf,
 
     /// Number of harts (CPUs), 0 for auto-detect
     #[arg(short = 'n', long, default_value = "0")]
@@ -68,47 +65,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     }
 
-    // Load kernel
-    let kernel_data = fs::read(&args.kernel)
-        .map_err(|e| format!("Failed to read kernel '{}': {}", args.kernel.display(), e))?;
+    // Load SD card image
+    let sdcard_data = fs::read(&args.sdcard)
+        .map_err(|e| format!("Failed to read SD card image '{}': {}", args.sdcard.display(), e))?;
 
-    // Determine hart count - use half available cores or user-specified count
+    // Parse SD card: find kernel on boot partition
+    let boot_info = sdboot::parse_sdcard(&sdcard_data)
+        .map_err(|e| format!("Failed to parse SD card: {}", e))?;
+
+    // Determine hart count
     let num_harts = if args.harts == 0 {
-        let cpus = std::thread::available_parallelism()
+        // Auto-detect: use all available CPUs since idle harts sleep via WFI
+        std::thread::available_parallelism()
             .map(|n| n.get())
-            .unwrap_or(2);
-        (cpus / 2).max(1) // Use half the CPUs, ensure at least 1
+            .unwrap_or(4)
     } else {
         args.harts
     }
-    .max(1); // Ensure at least 1
+    .max(1);
 
     // Print banner
     uart_println!();
+    uart_println!("╔══════════════════════════════════════════════════════════════╗");
+    uart_println!("║  RISCV-VM with OpenSBI                                       ║");
+    uart_println!("╠══════════════════════════════════════════════════════════════╣");
     uart_println!(
-        "║  Kernel: {:50} ║",
-        args.kernel
+        "║  SD Card: {:52} ║",
+        args.sdcard
             .file_name()
             .unwrap_or_default()
             .to_string_lossy()
     );
-    uart_println!("║  Harts:  {:50} ║", num_harts);
+    uart_println!("║  Kernel:  {} bytes @ {:#x}{:>23} ║", 
+        boot_info.kernel_data.len(),
+        boot_info.kernel_load_addr,
+        ""
+    );
+    uart_println!("║  Harts:   {:52} ║", num_harts);
     if let Some(relay) = &args.net_webtransport {
-        uart_println!("║  Network: {:49} ║", relay);
+        uart_println!("║  Network: {:52} ║", relay);
     }
     uart_println!("╚══════════════════════════════════════════════════════════════╝");
     uart_println!();
 
-    // Create VM
-    let mut vm = NativeVm::new(&kernel_data, num_harts)?;
+    // Create VM with kernel from SD card
+    let mut vm = NativeVm::new(&boot_info.kernel_data, num_harts)?;
 
-    // Load disk if specified
-    if let Some(disk_path) = &args.disk {
-        let disk_data = fs::read(disk_path)
-            .map_err(|e| format!("Failed to read disk '{}': {}", disk_path.display(), e))?;
-        vm.load_disk(disk_data);
-        uart_println!("[VM] Loaded disk: {}", disk_path.display());
-    }
+    // Load entire SD card as block device (for filesystem partition)
+    vm.load_disk(sdcard_data);
+    uart_println!("[VM] SD card mounted (fs partition at sector {})", boot_info.fs_partition_start);
 
     // Connect to WebTransport relay if specified
     if let Some(relay_url) = &args.net_webtransport {
@@ -130,3 +135,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     }
 }
+

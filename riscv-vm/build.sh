@@ -27,4 +27,4 @@ npx tsup --config tsup/tsup.core.esm.ts
 npx tsup --config tsup/tsup.core.cjs.ts --dts-only
 npx tsup --config tsup/tsup.worker.ts
 npx tsup --config tsup/tsup.node-worker.ts
-
+yarn build:native

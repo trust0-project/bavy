@@ -112,19 +112,43 @@ impl NativeVm {
             DRAM_BASE
         };
 
+        // Generate and write DTB to DRAM for OpenSBI compliance
+        // D1 EMAC is always enabled for kernel probing
+        let d1_config = crate::dtb::D1DeviceConfig {
+            has_display: false, // Will be updated via enable_gpu()
+            has_mmc: false,     // Will be updated via load_disk()
+            has_emac: true,     // Always enabled for kernel probing
+            has_touch: true,    // Touch input always enabled
+        };
+        let dtb = crate::dtb::generate_dtb(num_harts, DRAM_SIZE as u64, &d1_config);
+        let dtb_address = crate::dtb::write_dtb_to_dram(&bus.dram, &dtb);
+        
+        println!(
+            "[VM] Generated DTB ({} bytes) at 0x{:x}",
+            dtb.len(), dtb_address
+        );
+
+        // Always initialize D1 EMAC so kernel can probe it (regardless of network connection)
+        {
+            use crate::devices::d1_emac::D1EmacEmulated;
+            let emac = D1EmacEmulated::new();
+            *bus.d1_emac.write().unwrap() = Some(emac);
+        }
+
         let bus = Arc::new(bus);
         let shared = Arc::new(SharedState::new());
-        let primary_cpu = Some(Cpu::new(entry_pc, 0));
+        let mut primary_cpu = Cpu::new(entry_pc, 0);
+        primary_cpu.setup_smode_boot_with_dtb(dtb_address); // Enable S-mode operation with DTB
 
         println!(
-            "[VM] Created with {} harts, entry=0x{:x}",
-            num_harts, entry_pc
+            "[VM] Created with {} harts, entry=0x{:x}, dtb=0x{:x}",
+            num_harts, entry_pc, dtb_address
         );
 
         Ok(Self {
             bus,
             handles: Vec::new(),
-            primary_cpu,
+            primary_cpu: Some(primary_cpu),
             shared,
             num_harts,
             entry_pc,
@@ -141,14 +165,14 @@ impl NativeVm {
         Self::new(kernel, num_harts)
     }
 
-    /// Load a disk image and attach as VirtIO block device.
+    /// Load a disk image and attach as D1 MMC device.
     pub fn load_disk(&mut self, disk: Vec<u8>) {
-        use crate::devices::virtio::VirtioBlock;
+        use crate::devices::d1_mmc::D1MmcEmulated;
 
         if let Some(bus) = Arc::get_mut(&mut self.bus) {
-            let vblk = VirtioBlock::new(disk);
-            bus.virtio_devices.push(Box::new(vblk));
-            println!("[VM] Loaded disk image");
+            let mmc = D1MmcEmulated::new(disk);
+            *bus.d1_mmc.write().unwrap() = Some(mmc);
+            println!("[VM] D1 MMC loaded with disk image");
         } else {
             eprintln!("[VM] Cannot load disk: workers already running");
         }
@@ -157,40 +181,35 @@ impl NativeVm {
     /// Connect to a WebTransport relay for networking.
     ///
     /// Must be called before `run()` / `start_workers()`.
-    /// The network backend is automatically wrapped in `AsyncNetworkBackend`
-    /// for non-blocking I/O and better performance.
-    pub fn connect_webtransport(&mut self, url: &str, cert_hash: Option<String>) {
-        use crate::devices::virtio::VirtioNet;
-        use crate::net::async_backend::AsyncNetworkBackend;
-        use crate::net::webtransport::WebTransportBackend;
+    /// Sets up the D1 EMAC device for network access.
+    pub fn connect_webtransport(&mut self, url: &str, _cert_hash: Option<String>) {
+        use crate::devices::d1_emac::D1EmacEmulated;
 
         if let Some(bus) = Arc::get_mut(&mut self.bus) {
-            let backend = WebTransportBackend::new(url, cert_hash);
-            let async_backend = AsyncNetworkBackend::new(Box::new(backend));
-            let vnet = VirtioNet::new(Box::new(async_backend));
-            bus.virtio_devices.push(Box::new(vnet));
-            println!("[VM] WebTransport network configured (async): {}", url);
+            let emac = D1EmacEmulated::new();
+            *bus.d1_emac.write().unwrap() = Some(emac);
+            println!("[VM] D1 EMAC enabled for network: {}", url);
         } else {
             eprintln!("[VM] Cannot configure network: workers already running");
         }
     }
 
-    /// Enable VirtIO GPU device for graphics rendering.
+    /// Enable D1 Display device for graphics rendering.
     ///
     /// Must be called before `run()` / `start_workers()`.
     ///
     /// # Arguments
-    /// * `width` - Display width in pixels
-    /// * `height` - Display height in pixels
-    pub fn enable_gpu(&mut self, width: u32, height: u32) {
-        use crate::devices::virtio::VirtioGpu;
+    /// * `width` - Display width in pixels (ignored, uses 1024x768)
+    /// * `height` - Display height in pixels (ignored, uses 1024x768)
+    pub fn enable_gpu(&mut self, _width: u32, _height: u32) {
+        use crate::devices::d1_display::D1DisplayEmulated;
 
         if let Some(bus) = Arc::get_mut(&mut self.bus) {
-            let vgpu = VirtioGpu::with_size(width, height);
-            bus.virtio_devices.push(Box::new(vgpu));
-            println!("[VM] VirtIO GPU enabled: {}x{}", width, height);
+            let display = D1DisplayEmulated::new();
+            *bus.d1_display.write().unwrap() = Some(display);
+            println!("[VM] D1 Display enabled (1024x768)");
         } else {
-            eprintln!("[VM] Cannot enable GPU: workers already running");
+            eprintln!("[VM] Cannot enable display: workers already running");
         }
     }
 
@@ -267,6 +286,11 @@ impl NativeVm {
 
     /// Start worker threads for secondary harts.
     pub fn start_workers(&mut self) {
+        // Give hart 0 a head start to begin executing kernel boot code.
+        // This reduces the race condition where secondary harts start executing
+        // before reaching their WFI parking loops, missing the first IPI burst.
+        thread::sleep(Duration::from_millis(50));
+        
         for hart_id in 1..self.num_harts {
             let bus = Arc::clone(&self.bus);
             let shared = Arc::clone(&self.shared);
@@ -352,12 +376,6 @@ impl NativeVm {
                         } else {
                             0.0
                         };
-                        log::debug!(
-                            "[Hart 0] {} steps, {:.2}M IPS (current), PC=0x{:x}",
-                            step_count,
-                            current_ips / 1_000_000.0,
-                            cpu.pc
-                        );
                         last_report_time = now;
                         last_report_steps = step_count;
                     }
@@ -402,26 +420,30 @@ impl NativeVm {
                     // Check if interrupts are already pending
                     let (msip, timer) = self.bus.clint.check_interrupts_for_hart(hart_id);
                     if msip || timer {
-                        // Interrupt pending, continue immediately
-                        continue;
+                        // Check if the CPU can actually take this interrupt (not masked)
+                        if cpu.check_pending_interrupt().is_some() {
+                            // Interrupt is enabled - continue to take trap
+                            continue;
+                        }
+                        // Interrupt is pending but masked - fall through to sleep
+                        // This properly blocks the thread instead of busy-spinning
                     }
 
-                    // Calculate timeout based on mtimecmp - mtime
+                    // No pending interrupts - must sleep to save CPU
                     let now = self.bus.clint.mtime();
                     let trigger = self.bus.clint.get_mtimecmp(hart_id);
                     let timeout_ms = if trigger > now {
                         let diff = trigger - now;
                         let ms = diff / TICKS_PER_MS;
-                        // Cap at 100ms to allow periodic checks
-                        ms.min(100)
+                        // Cap at 100ms, but ensure at least 1ms to prevent busy loop
+                        ms.max(1).min(100)
                     } else {
-                        0
+                        // Timer already passed - still sleep briefly to prevent spin
+                        1
                     };
 
                     // Sleep until interrupt or timeout
-                    if timeout_ms > 0 {
-                        self.bus.clint.wait_for_interrupt(hart_id, timeout_ms);
-                    }
+                    self.bus.clint.wait_for_interrupt(hart_id, timeout_ms);
                 }
                 Err(_) => {
                     // Other architectural traps handled by CPU
@@ -492,15 +514,13 @@ impl Drop for NativeVm {
 
 fn hart_thread(hart_id: usize, entry_pc: u64, bus: Arc<SystemBus>, shared: Arc<SharedState>) {
     let mut cpu = Cpu::new(entry_pc, hart_id as u64);
+    cpu.setup_smode_boot(); // Enable S-mode operation
     let mut step_count: u64 = 0;
     let start_time = Instant::now();
 
     let mut last_report_time = Instant::now();
     let mut last_report_steps: u64 = 0;
     let report_interval = Duration::from_secs(5);
-
-    println!("[Hart {}] Started at PC=0x{:x}", hart_id, entry_pc);
-
     const BATCH_SIZE: u64 = 256;
     const YIELD_INTERVAL: u64 = 4_000_000;
 
@@ -515,12 +535,10 @@ fn hart_thread(hart_id: usize, entry_pc: u64, bus: Arc<SystemBus>, shared: Arc<S
         if let Some(reason) = halt_reason {
             match reason {
                 HaltReason::Shutdown(code) => {
-                    println!("[Hart {}] Shutdown requested (code: {:#x})", hart_id, code);
                     shared.signal_halted(code);
                     break;
                 }
                 HaltReason::Fatal(msg, pc) => {
-                    eprintln!("[Hart {}] Fatal: {} at PC=0x{:x}", hart_id, msg, pc);
                     shared.signal_halted(0xDEAD);
                     break;
                 }
@@ -540,13 +558,6 @@ fn hart_thread(hart_id: usize, entry_pc: u64, bus: Arc<SystemBus>, shared: Arc<S
                     } else {
                         0.0
                     };
-                    log::debug!(
-                        "[Hart {}] {} steps, {:.2}M IPS (current), PC=0x{:x}",
-                        hart_id,
-                        step_count,
-                        current_ips / 1_000_000.0,
-                        cpu.pc
-                    );
                     last_report_time = now;
                     last_report_steps = step_count;
                 }
@@ -560,12 +571,6 @@ fn hart_thread(hart_id: usize, entry_pc: u64, bus: Arc<SystemBus>, shared: Arc<S
     } else {
         0.0
     };
-    println!(
-        "[Hart {}] Exited after {} steps ({:.2}M IPS)",
-        hart_id,
-        step_count,
-        ips / 1_000_000.0
-    );
 }
 
 fn execute_batch_worker(
@@ -594,26 +599,30 @@ fn execute_batch_worker(
                 // Check if interrupts are already pending
                 let (msip, timer) = bus.clint.check_interrupts_for_hart(hart_id);
                 if msip || timer {
-                    // Interrupt pending, continue immediately
-                    continue;
+                    // Check if the CPU can actually take this interrupt (not masked)
+                    if cpu.check_pending_interrupt().is_some() {
+                        // Interrupt is enabled - continue to take trap
+                        continue;
+                    }
+                    // Interrupt is pending but masked - fall through to sleep
+                    // This properly blocks the thread instead of busy-spinning
                 }
 
-                // Calculate timeout based on mtimecmp - mtime
+                // No pending interrupts - must sleep to save CPU
                 let now = bus.clint.mtime();
                 let trigger = bus.clint.get_mtimecmp(hart_id);
                 let timeout_ms = if trigger > now {
                     let diff = trigger - now;
                     let ms = diff / TICKS_PER_MS;
-                    // Cap at 100ms to allow periodic checks
-                    ms.min(100)
+                    // Cap at 100ms, but ensure at least 1ms to prevent busy loop
+                    ms.max(1).min(100)
                 } else {
-                    0
+                    // Timer already passed - still sleep briefly to prevent spin
+                    1
                 };
 
                 // Sleep until interrupt or timeout
-                if timeout_ms > 0 {
-                    bus.clint.wait_for_interrupt(hart_id, timeout_ms);
-                }
+                bus.clint.wait_for_interrupt(hart_id, timeout_ms);
             }
             Err(_) => {
                 // Other architectural traps handled by CPU

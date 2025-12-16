@@ -31,6 +31,7 @@ const WorkerStepResult = {
   Halted: 1,
   Shutdown: 2,
   Error: 3,
+  Wfi: 4,  // WFI executed - yield to save CPU
 } as const;
 
 // ============================================================================
@@ -87,6 +88,14 @@ function postMessage(msg: WorkerOutboundMessage): void {
 }
 
 /**
+ * Log a message to main thread via postMessage (more reliable than console.log).
+ * This ensures logs are visible even when workers are blocking.
+ */
+function logToMain(hartId: number, message: string): void {
+  parentPort?.postMessage({ type: "log", hartId, message });
+}
+
+/**
  * Run loop using optimized blocking execution with periodic yields.
  */
 function runLoop(hartId: number): void {
@@ -97,13 +106,26 @@ function runLoop(hartId: number): void {
 
   let shouldContinue = true;
   let batchCount = 0;
+  let totalBatches = 0; // Persistent counter that doesn't reset
 
   while (shouldContinue) {
+    // Log before first batch to see if we're even entering the loop
+    if (totalBatches === 0) {
+      logToMain(hartId, "About to call first step_batch...");
+    }
+
     const result = workerState.step_batch(BATCH_SIZE);
+
+    // Log after first batch returns
+    if (totalBatches === 0) {
+      logToMain(hartId, `First step_batch returned: ${result}, steps=${workerState.step_count()}`);
+    }
 
     switch (result) {
       case WorkerStepResult.Continue:
         batchCount++;
+        totalBatches++;
+
 
         // Yield periodically to allow halt signals to be processed
         if (batchCount >= BATCHES_PER_YIELD) {
@@ -119,24 +141,32 @@ function runLoop(hartId: number): void {
         break;
 
       case WorkerStepResult.Halted:
-        console.log(`[Worker ${hartId}] Halted after ${workerState.step_count()} steps`);
         postMessage({ type: "halted", hartId, stepCount: Number(workerState.step_count()) });
         cleanup();
         shouldContinue = false;
         break;
 
       case WorkerStepResult.Shutdown:
-        console.log(`[Worker ${hartId}] Shutdown after ${workerState.step_count()} steps`);
         postMessage({ type: "halted", hartId, stepCount: Number(workerState.step_count()) });
         cleanup();
         shouldContinue = false;
         break;
 
       case WorkerStepResult.Error:
-        console.error(`[Worker ${hartId}] Error after ${workerState.step_count()} steps`);
         postMessage({ type: "error", hartId, error: "Execution error" });
         cleanup();
         shouldContinue = false;
+        break;
+
+      case WorkerStepResult.Wfi:
+        // WFI executed - yield to save CPU when idle
+        // The Rust code already slept via Atomics.wait for up to 100ms,
+        // so we add a smaller additional yield here
+        try {
+          Atomics.wait(controlView, CTRL_HALT_REQUESTED, 0, 50);
+        } catch {
+          // Fall back gracefully
+        }
         break;
     }
   }
@@ -150,13 +180,20 @@ function cleanup(): void {
 async function main(): Promise<void> {
   const { hartId, sharedMem, entryPc } = workerData as WorkerData;
 
-  console.log(`[Worker ${hartId}] Starting with bundled WASM`);
+  logToMain(hartId, "Starting with bundled WASM");
 
   try {
+    // Stagger WASM initialization to prevent concurrent compilation
+    // from overwhelming the host. Each hart waits (hartId * 10ms).
+    const staggerDelay = hartId * 10;
+    if (staggerDelay > 0) {
+      await new Promise(resolve => setTimeout(resolve, staggerDelay));
+    }
+
     // Initialize WASM with the bundled buffer
     initSync(wasmBuffer);
-    
-    console.log(`[Worker ${hartId}] WASM initialized`);
+
+    logToMain(hartId, "WASM initialized");
 
     // Verify SharedArrayBuffer
     if (!(sharedMem instanceof SharedArrayBuffer)) {
@@ -168,18 +205,26 @@ async function main(): Promise<void> {
 
     // Convert entryPc to BigInt for u64
     const pc = BigInt(Math.floor(entryPc));
-    console.log(`[Worker ${hartId}] Starting execution at PC=0x${pc.toString(16)}`);
+    logToMain(hartId, `Starting execution at PC=0x${pc.toString(16)}`);
 
     // Set up control view for Atomics
     controlView = new Int32Array(sharedMem);
 
+    logToMain(hartId, "Creating WorkerState...");
+
     // Create worker state
     workerState = new WorkerState(hartId, sharedMem, pc);
+
+    // Log a0 register value to verify hart_id is correctly passed to kernel
+    const a0 = workerState.get_a0();
+    const msipPending = workerState.is_msip_pending();
+    const timerPending = workerState.is_timer_pending();
+    logToMain(hartId, `WorkerState created, a0=${a0}, msip=${msipPending}, timer=${timerPending}`);
 
     // Start the run loop
     runLoop(hartId);
   } catch (e) {
-    console.error(`[Worker ${hartId}] Error:`, e);
+    logToMain(hartId, `Error: ${e}`);
     postMessage({
       type: "error",
       hartId,

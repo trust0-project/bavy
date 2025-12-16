@@ -404,7 +404,15 @@ impl Dram {
         if off >= self.size() {
             return Err(MemoryError::OutOfBounds(offset));
         }
-        Ok(self.data_view.get_uint8(off))
+        // CRITICAL: For cross-worker visibility (e.g., AtomicBool), we must use
+        // Atomics.load() on the containing 32-bit word, then extract the byte.
+        // Regular DataView reads may be cached by JavaScript engines.
+        let word_offset = off & !3; // Align to 4-byte boundary
+        let byte_in_word = off & 3;  // Position within the word
+        let idx = self.atomic_index(word_offset);
+        let word = Atomics::load(&self.atomic_view, idx).unwrap_or(0) as u32;
+        let shift = byte_in_word * 8;
+        Ok(((word >> shift) & 0xFF) as u8)
     }
 
     #[inline(always)]
@@ -416,8 +424,14 @@ impl Dram {
         if off + 2 > self.size() {
             return Err(MemoryError::OutOfBounds(offset));
         }
-        // DataView with little_endian=true for direct u16 read
-        Ok(self.data_view.get_uint16_endian(off, true))
+        // CRITICAL: For cross-worker visibility, use Atomics.load() on the
+        // containing 32-bit word, then extract the u16.
+        let word_offset = off & !3; // Align to 4-byte boundary
+        let halfword_in_word = (off >> 1) & 1;  // 0 for low halfword, 1 for high
+        let idx = self.atomic_index(word_offset);
+        let word = Atomics::load(&self.atomic_view, idx).unwrap_or(0) as u32;
+        let shift = halfword_in_word * 16;
+        Ok(((word >> shift) & 0xFFFF) as u16)
     }
 
     #[inline(always)]
@@ -462,7 +476,31 @@ impl Dram {
         if off >= self.size() {
             return Err(MemoryError::OutOfBounds(offset));
         }
-        self.data_view.set_uint8(off, (value & 0xff) as u8);
+        // CRITICAL: For cross-worker visibility (e.g., AtomicBool), we must use
+        // Atomics operations on the containing 32-bit word.
+        // Use compare-and-exchange loop to atomically update a single byte.
+        let word_offset = off & !3; // Align to 4-byte boundary  
+        let byte_in_word = off & 3;  // Position within the word
+        let idx = self.atomic_index(word_offset);
+        let shift = byte_in_word * 8;
+        let byte_mask = 0xFF_u32 << shift;
+        let new_byte = ((value & 0xFF) as u32) << shift;
+        
+        // CAS loop to atomically update just the byte
+        loop {
+            let old_word = Atomics::load(&self.atomic_view, idx).unwrap_or(0) as u32;
+            let new_word = (old_word & !byte_mask) | new_byte;
+            let result = Atomics::compare_exchange(
+                &self.atomic_view, 
+                idx, 
+                old_word as i32, 
+                new_word as i32
+            ).unwrap_or(0) as u32;
+            if result == old_word {
+                break; // Success
+            }
+            // Otherwise retry
+        }
         Ok(())
     }
 
@@ -475,8 +513,30 @@ impl Dram {
         if off + 2 > self.size() {
             return Err(MemoryError::OutOfBounds(offset));
         }
-        // DataView with little_endian=true for direct u16 write
-        self.data_view.set_uint16_endian(off, value as u16, true);
+        // CRITICAL: For cross-worker visibility, use Atomics operations
+        // on the containing 32-bit word via CAS loop.
+        let word_offset = off & !3; // Align to 4-byte boundary
+        let halfword_in_word = (off >> 1) & 1;  // 0 for low halfword, 1 for high
+        let idx = self.atomic_index(word_offset);
+        let shift = halfword_in_word * 16;
+        let halfword_mask = 0xFFFF_u32 << shift;
+        let new_halfword = ((value & 0xFFFF) as u32) << shift;
+        
+        // CAS loop to atomically update just the halfword
+        loop {
+            let old_word = Atomics::load(&self.atomic_view, idx).unwrap_or(0) as u32;
+            let new_word = (old_word & !halfword_mask) | new_halfword;
+            let result = Atomics::compare_exchange(
+                &self.atomic_view, 
+                idx, 
+                old_word as i32, 
+                new_word as i32
+            ).unwrap_or(0) as u32;
+            if result == old_word {
+                break; // Success
+            }
+            // Otherwise retry
+        }
         Ok(())
     }
 

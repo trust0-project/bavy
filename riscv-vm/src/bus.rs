@@ -6,6 +6,13 @@ use crate::devices::uart::{UART_BASE, UART_SIZE, Uart};
 use crate::devices::virtio::VirtioDevice;
 use crate::dram::Dram;
 
+// D1 (Allwinner) device emulation for unified kernel support
+use crate::devices::d1_mmc::{D1MmcEmulated, D1_MMC0_BASE, D1_MMC0_SIZE};
+use crate::devices::d1_display::{D1DisplayEmulated, D1_DE_BASE, D1_DE_SIZE, D1_MIPI_DSI_BASE, D1_MIPI_DSI_SIZE, D1_DPHY_BASE, D1_DPHY_SIZE, D1_TCON_LCD0, D1_TCON_SIZE};
+use crate::devices::d1_emac::{D1EmacEmulated, D1_EMAC_BASE, D1_EMAC_SIZE};
+use crate::devices::d1_touch::{D1TouchEmulated, D1_I2C2_BASE, D1_I2C2_SIZE};
+use std::sync::RwLock;
+
 #[cfg(target_arch = "wasm32")]
 use js_sys::SharedArrayBuffer;
 
@@ -289,6 +296,13 @@ pub struct SystemBus {
     pub uart: Uart,
     pub sysinfo: SysInfo,
     pub virtio_devices: Vec<Box<dyn VirtioDevice>>,
+    
+    // D1 (Allwinner) emulated devices for unified kernel support
+    pub d1_mmc: RwLock<Option<D1MmcEmulated>>,
+    pub d1_display: RwLock<Option<D1DisplayEmulated>>,
+    pub d1_emac: RwLock<Option<D1EmacEmulated>>,
+    pub d1_touch: RwLock<Option<D1TouchEmulated>>,
+    
     /// Shared CLINT for WASM workers (routes CLINT accesses to SharedArrayBuffer)
     #[cfg(target_arch = "wasm32")]
     shared_clint: Option<crate::shared_mem::wasm::SharedClint>,
@@ -301,6 +315,9 @@ pub struct SystemBus {
     /// Shared VirtIO MMIO proxy for workers (routes VirtIO accesses to main thread)
     #[cfg(target_arch = "wasm32")]
     shared_virtio: Option<crate::shared_mem::wasm::SharedVirtioMmio>,
+    /// Shared control region for D1 EMAC IP and other shared state
+    #[cfg(target_arch = "wasm32")]
+    pub shared_control: Option<crate::shared_mem::wasm::SharedControl>,
 }
 
 impl SystemBus {
@@ -312,6 +329,10 @@ impl SystemBus {
             uart: Uart::new(),
             sysinfo: SysInfo::new(),
             virtio_devices: Vec::new(),
+            d1_mmc: RwLock::new(None),
+            d1_display: RwLock::new(None),
+            d1_emac: RwLock::new(None),
+            d1_touch: RwLock::new(None),
             #[cfg(target_arch = "wasm32")]
             shared_clint: None,
             #[cfg(target_arch = "wasm32")]
@@ -320,6 +341,8 @@ impl SystemBus {
             shared_uart_input: None,
             #[cfg(target_arch = "wasm32")]
             shared_virtio: None,
+            #[cfg(target_arch = "wasm32")]
+            shared_control: None,
         }
     }
 
@@ -369,6 +392,10 @@ impl SystemBus {
             None
         };
 
+        // Create shared control for D1 EMAC IP and other shared state
+        // Both main thread and workers need this
+        let shared_control = crate::shared_mem::wasm::SharedControl::new(&buffer);
+
         Self {
             dram: Dram::from_shared(DRAM_BASE, buffer, dram_offset),
             clint,
@@ -376,10 +403,15 @@ impl SystemBus {
             uart: Uart::new(),
             sysinfo: SysInfo::new(),
             virtio_devices: Vec::new(),
+            d1_mmc: RwLock::new(None),
+            d1_display: RwLock::new(None),
+            d1_emac: RwLock::new(None),
+            d1_touch: RwLock::new(None),
             shared_clint: Some(shared_clint),
             shared_uart_output: Some(shared_uart_output),
             shared_uart_input,
             shared_virtio,
+            shared_control: Some(shared_control),
         }
     }
 
@@ -572,9 +604,21 @@ impl SystemBus {
     #[cfg(target_arch = "wasm32")]
     #[inline]
     fn clint_load(&self, offset: u64, size: u64) -> u64 {
+        // Debug: Log first few MSIP reads to trace the path
+        let is_msip = offset < (crate::devices::clint::MAX_HARTS as u64 * 4) && size == 4;
+        
+        // DEBUG: Log all CLINT loads to verify routing
+        static LOAD_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let count = LOAD_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(ref shared) = self.shared_clint {
-            shared.load(offset, size)
+            let result = shared.load(offset, size);
+            result
         } else {
+            // Fallback to local CLINT
+            static LOGGED_LOCAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if is_msip && !LOGGED_LOCAL.load(std::sync::atomic::Ordering::Relaxed) {
+                LOGGED_LOCAL.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             self.clint.load(offset, size)
         }
     }
@@ -798,6 +842,90 @@ impl SystemBus {
             return Ok(val as u32);
         }
 
+        // D1 MMC Controller (0x0402_0000 - 0x0402_0FFF)
+        if addr >= D1_MMC0_BASE && addr < D1_MMC0_BASE + D1_MMC0_SIZE {
+            if let Ok(mut mmc) = self.d1_mmc.write() {
+                if let Some(ref mut dev) = *mmc {
+                    return Ok(dev.mmio_read32(addr));
+                }
+            }
+            return Ok(0); // Device not initialized
+        }
+
+        // D1 EMAC Controller (0x0450_0000 - 0x0450_0FFF)
+        if addr >= D1_EMAC_BASE && addr < D1_EMAC_BASE + D1_EMAC_SIZE {
+            // Try local D1 EMAC device first (main thread)
+            if let Ok(emac) = self.d1_emac.read() {
+                if let Some(ref dev) = *emac {
+                    return Ok(dev.mmio_read32(addr));
+                }
+            }
+            
+            // For workers without local D1 EMAC: use shared memory for IP config
+            #[cfg(target_arch = "wasm32")]
+            {
+                let offset = addr & 0xFFF;
+                // IP config register at offset 0x100
+                if offset == 0x100 {
+                    if let Some(ref ctrl) = self.shared_control {
+                        return Ok(ctrl.get_d1_emac_ip_packed());
+                    }
+                }
+            }
+            
+            return Ok(0);
+        }
+
+        // D1 I2C2 / Touch Controller (0x0250_2000 - 0x0250_23FF)
+        if addr >= D1_I2C2_BASE && addr < D1_I2C2_BASE + D1_I2C2_SIZE {
+            if let Ok(mut touch) = self.d1_touch.write() {
+                if let Some(ref mut dev) = *touch {
+                    return Ok(dev.mmio_read32(addr));
+                }
+            }
+            return Ok(0);
+        }
+
+        // D1 Display Engine (0x0510_0000 - 0x051F_FFFF)
+        if addr >= D1_DE_BASE && addr < D1_DE_BASE + D1_DE_SIZE {
+            if let Ok(disp) = self.d1_display.read() {
+                if let Some(ref dev) = *disp {
+                    return Ok(dev.mmio_read32(addr));
+                }
+            }
+            return Ok(0);
+        }
+
+        // D1 TCON LCD (0x0546_1000 - 0x0546_1FFF)
+        if addr >= D1_TCON_LCD0 && addr < D1_TCON_LCD0 + D1_TCON_SIZE {
+            if let Ok(disp) = self.d1_display.read() {
+                if let Some(ref dev) = *disp {
+                    return Ok(dev.mmio_read32(addr));
+                }
+            }
+            return Ok(0);
+        }
+
+        // D1 MIPI DSI (0x0545_0000 - 0x0545_0FFF) - stub
+        if addr >= D1_MIPI_DSI_BASE && addr < D1_MIPI_DSI_BASE + D1_MIPI_DSI_SIZE {
+            if let Ok(disp) = self.d1_display.read() {
+                if let Some(ref dev) = *disp {
+                    return Ok(dev.mmio_read32(addr));
+                }
+            }
+            return Ok(0);
+        }
+
+        // D1 D-PHY (0x0545_1000 - 0x0545_1FFF) - stub
+        if addr >= D1_DPHY_BASE && addr < D1_DPHY_BASE + D1_DPHY_SIZE {
+            if let Ok(disp) = self.d1_display.read() {
+                if let Some(ref dev) = *disp {
+                    return Ok(dev.mmio_read32(addr));
+                }
+            }
+            return Ok(0);
+        }
+
         if let Some((idx, offset)) = self.get_virtio_device(addr) {
             let val = self.virtio_devices[idx]
                 .read(offset)
@@ -1015,6 +1143,83 @@ impl SystemBus {
             self.uart
                 .store(offset, 4, val as u64)
                 .map_err(|_| Trap::StoreAccessFault(addr))?;
+            return Ok(());
+        }
+
+        // D1 MMC Controller (0x0402_0000 - 0x0402_0FFF)
+        if addr >= D1_MMC0_BASE && addr < D1_MMC0_BASE + D1_MMC0_SIZE {
+            if let Ok(mut mmc) = self.d1_mmc.write() {
+                if let Some(ref mut dev) = *mmc {
+                    dev.mmio_write32(addr, val);
+                    return Ok(());
+                }
+            }
+            return Ok(()); // Device not initialized - ignore write
+        }
+
+        // D1 EMAC Controller (0x0450_0000 - 0x0450_0FFF)
+        if addr >= D1_EMAC_BASE && addr < D1_EMAC_BASE + D1_EMAC_SIZE {
+            if let Ok(mut emac) = self.d1_emac.write() {
+                if let Some(ref mut dev) = *emac {
+                    dev.mmio_write32(addr, val);
+                    return Ok(());
+                }
+            }
+            return Ok(());
+        }
+
+        // D1 I2C2 / Touch Controller (0x0250_2000 - 0x0250_23FF)
+        if addr >= D1_I2C2_BASE && addr < D1_I2C2_BASE + D1_I2C2_SIZE {
+            if let Ok(mut touch) = self.d1_touch.write() {
+                if let Some(ref mut dev) = *touch {
+                    dev.mmio_write32(addr, val);
+                    return Ok(());
+                }
+            }
+            return Ok(());
+        }
+
+        // D1 Display Engine (0x0510_0000 - 0x051F_FFFF)
+        if addr >= D1_DE_BASE && addr < D1_DE_BASE + D1_DE_SIZE {
+            if let Ok(mut disp) = self.d1_display.write() {
+                if let Some(ref mut dev) = *disp {
+                    dev.mmio_write32(addr, val);
+                    return Ok(());
+                }
+            }
+            return Ok(());
+        }
+
+        // D1 TCON LCD (0x0546_1000 - 0x0546_1FFF)
+        if addr >= D1_TCON_LCD0 && addr < D1_TCON_LCD0 + D1_TCON_SIZE {
+            if let Ok(mut disp) = self.d1_display.write() {
+                if let Some(ref mut dev) = *disp {
+                    dev.mmio_write32(addr, val);
+                    return Ok(());
+                }
+            }
+            return Ok(());
+        }
+
+        // D1 MIPI DSI (0x0545_0000 - 0x0545_0FFF) - stub
+        if addr >= D1_MIPI_DSI_BASE && addr < D1_MIPI_DSI_BASE + D1_MIPI_DSI_SIZE {
+            if let Ok(mut disp) = self.d1_display.write() {
+                if let Some(ref mut dev) = *disp {
+                    dev.mmio_write32(addr, val);
+                    return Ok(());
+                }
+            }
+            return Ok(());
+        }
+
+        // D1 D-PHY (0x0545_1000 - 0x0545_1FFF) - stub
+        if addr >= D1_DPHY_BASE && addr < D1_DPHY_BASE + D1_DPHY_SIZE {
+            if let Ok(mut disp) = self.d1_display.write() {
+                if let Some(ref mut dev) = *disp {
+                    dev.mmio_write32(addr, val);
+                    return Ok(());
+                }
+            }
             return Ok(());
         }
 

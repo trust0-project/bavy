@@ -878,6 +878,15 @@ impl Cpu {
                                 }
                                 0x0000_0073 => {
                                     // ECALL - route based on current privilege mode
+                                    // For S-mode, try SBI call first before trapping
+                                    if self.mode == Mode::Supervisor {
+                                        if crate::sbi::handle_sbi_call(self, bus) {
+                                            // SBI handled the call, advance PC and continue
+                                            next_pc = pc.wrapping_add(insn_len as u64);
+                                            self.pc = next_pc;
+                                            return Ok(());
+                                        }
+                                    }
                                     let trap = match self.mode {
                                         Mode::User => Trap::EnvironmentCallFromU,
                                         Mode::Supervisor => Trap::EnvironmentCallFromS,
@@ -885,6 +894,7 @@ impl Cpu {
                                     };
                                     return self.handle_trap(trap, pc, Some(insn_raw));
                                 }
+
                                 0x3020_0073 => {
                                     // MRET
                                     if self.mode != Mode::Machine {

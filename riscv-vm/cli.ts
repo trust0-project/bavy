@@ -3,8 +3,7 @@
 /**
  * RISC-V VM CLI
  * This CLI mirrors the native Rust VM CLI interface:
- * - loads a kernel image (ELF or raw binary) via --kernel/-k
- * - optionally loads a VirtIO block disk image (e.g. xv6 `fs.img`) via --disk/-d
+ * - loads an SD card image via --sdcard/-s (contains kernel + filesystem)
  * - optionally specifies number of harts via --harts/-n (0 = auto-detect as CPU/2)
  * - can optionally connect to a network relay via --net-webtransport
  * - runs the VM in a tight loop
@@ -32,11 +31,118 @@ const DEFAULT_CERT_HASH =
 
 /**
  * Auto-detect the number of harts based on CPU cores.
- * Uses half of available cores, minimum 1.
+ * Uses all available cores since idle harts sleep via WFI (no CPU waste).
  */
 function detectHartCount(): number {
-  const cpus = os.cpus().length;
-  return Math.max(1, Math.floor(cpus / 2));
+  return os.cpus().length;
+}
+
+/**
+ * SD Card boot info parsed from MBR + FAT32
+ */
+interface SDBootInfo {
+  kernelData: Uint8Array;
+  fsPartitionStart: number;
+}
+
+/**
+ * Parse SD card image (MBR + FAT32 boot partition)
+ * Returns kernel data and filesystem partition offset
+ */
+function parseSDCard(sdcard: Uint8Array): SDBootInfo {
+  if (sdcard.length < 512) {
+    throw new Error('SD card image too small');
+  }
+
+  // Check MBR signature
+  if (sdcard[510] !== 0x55 || sdcard[511] !== 0xAA) {
+    throw new Error('Invalid MBR signature');
+  }
+
+  // Parse partition table (4 entries at offset 446)
+  let bootPartStart = 0;
+  let bootPartType = 0;
+  let fsPartStart = 0;
+
+  for (let i = 0; i < 4; i++) {
+    const offset = 446 + i * 16;
+    const partType = sdcard[offset + 4];
+    const startLba = sdcard[offset + 8] | (sdcard[offset + 9] << 8) |
+      (sdcard[offset + 10] << 16) | (sdcard[offset + 11] << 24);
+
+    // FAT32: 0x0B (CHS) or 0x0C (LBA)
+    if ((partType === 0x0B || partType === 0x0C) && bootPartStart === 0) {
+      bootPartStart = startLba;
+      bootPartType = partType;
+    } else if (partType !== 0 && fsPartStart === 0 && startLba !== bootPartStart) {
+      fsPartStart = startLba;
+    }
+  }
+
+  if (bootPartStart === 0) {
+    throw new Error('No FAT32 boot partition found');
+  }
+
+  // Parse FAT32 boot sector
+  const bootSectorOffset = bootPartStart * 512;
+  if (bootSectorOffset + 512 > sdcard.length) {
+    throw new Error('Boot partition beyond disk');
+  }
+
+  const bytesPerSector = sdcard[bootSectorOffset + 11] | (sdcard[bootSectorOffset + 12] << 8);
+  const sectorsPerCluster = sdcard[bootSectorOffset + 13];
+  const reservedSectors = sdcard[bootSectorOffset + 14] | (sdcard[bootSectorOffset + 15] << 8);
+  const numFats = sdcard[bootSectorOffset + 16];
+  const sectorsPerFat = sdcard[bootSectorOffset + 36] | (sdcard[bootSectorOffset + 37] << 8) |
+    (sdcard[bootSectorOffset + 38] << 16) | (sdcard[bootSectorOffset + 39] << 24);
+  const rootCluster = sdcard[bootSectorOffset + 44] | (sdcard[bootSectorOffset + 45] << 8) |
+    (sdcard[bootSectorOffset + 46] << 16) | (sdcard[bootSectorOffset + 47] << 24);
+
+  // Calculate data start sector
+  const dataStartSector = reservedSectors + (numFats * sectorsPerFat);
+  const rootDirSector = dataStartSector + (rootCluster - 2) * sectorsPerCluster;
+  const rootDirOffset = bootSectorOffset + (rootDirSector * bytesPerSector);
+
+  // Search for KERNEL.BIN in root directory
+  const clusterBytes = sectorsPerCluster * bytesPerSector;
+  let kernelData: Uint8Array | null = null;
+
+  for (let i = 0; i < clusterBytes; i += 32) {
+    const entryOffset = rootDirOffset + i;
+    if (entryOffset + 32 > sdcard.length) break;
+
+    const firstByte = sdcard[entryOffset];
+    if (firstByte === 0x00) break; // End of directory
+    if (firstByte === 0xE5) continue; // Deleted
+    if (sdcard[entryOffset + 11] === 0x0F) continue; // Long name entry
+
+    // Check for KERNEL  BIN (8.3 format, space-padded)
+    const name = String.fromCharCode(...sdcard.slice(entryOffset, entryOffset + 11));
+    if (name === 'KERNEL  BIN') {
+      const clusterHigh = sdcard[entryOffset + 20] | (sdcard[entryOffset + 21] << 8);
+      const clusterLow = sdcard[entryOffset + 26] | (sdcard[entryOffset + 27] << 8);
+      const fileSize = sdcard[entryOffset + 28] | (sdcard[entryOffset + 29] << 8) |
+        (sdcard[entryOffset + 30] << 16) | (sdcard[entryOffset + 31] << 24);
+
+      const fileCluster = (clusterHigh << 16) | clusterLow;
+      const fileSector = dataStartSector + (fileCluster - 2) * sectorsPerCluster;
+      const fileOffset = bootSectorOffset + (fileSector * bytesPerSector);
+
+      if (fileOffset + fileSize <= sdcard.length) {
+        kernelData = sdcard.slice(fileOffset, fileOffset + fileSize);
+      }
+      break;
+    }
+  }
+
+  if (!kernelData) {
+    throw new Error('kernel.bin not found on boot partition');
+  }
+
+  return {
+    kernelData,
+    fsPartitionStart: fsPartStart,
+  };
 }
 
 /**
@@ -67,43 +173,52 @@ async function loadNativeWebTransport(): Promise<any | null> {
 
 /**
  * Create and initialize a Wasm VM instance with multi-hart support:
- * - initializes the WASM module once via `WasmInternal`
+ * - loads SD card image and parses MBR/FAT32 to find kernel
  * - constructs `WasmVm` with the kernel bytes and specified hart count
- * - optionally attaches a VirtIO block device from a disk image
+ * - loads entire SD card as block device (for filesystem partition)
  * - optionally connects to a network relay (WebTransport/WebSocket)
  * - starts worker threads for secondary harts
  */
 async function createVm(
-  kernelPath: string,
+  sdcardPath: string,
   options?: {
-    disk?: string;
     harts?: number;
     netWebtransport?: string;
     certHash?: string;
     debug?: boolean;
   },
 ) {
-  let kernelBytes: Uint8Array;
+  let sdcardBytes: Uint8Array;
 
-  if (kernelPath.startsWith('http://') || kernelPath.startsWith('https://')) {
+  // Load SD card image
+  if (sdcardPath.startsWith('http://') || sdcardPath.startsWith('https://')) {
     if (options?.debug) {
-      console.error(`[CLI] Downloading kernel from ${kernelPath}...`);
+      console.error(`[CLI] Downloading SD card from ${sdcardPath}...`);
     }
-    const response = await fetch(kernelPath);
+    const response = await fetch(sdcardPath);
     if (!response.ok) {
       throw new Error(
-        `Failed to fetch kernel from ${kernelPath}: ${response.statusText}`,
+        `Failed to fetch SD card from ${sdcardPath}: ${response.statusText}`,
       );
     }
     const arrayBuffer = await response.arrayBuffer();
-    kernelBytes = new Uint8Array(arrayBuffer);
+    sdcardBytes = new Uint8Array(arrayBuffer);
   } else {
-    const resolvedKernel = path.resolve(kernelPath);
-    if (!fs.existsSync(resolvedKernel)) {
-      throw new Error(`Kernel file not found at ${resolvedKernel}`);
+    const resolvedPath = path.resolve(sdcardPath);
+    if (!fs.existsSync(resolvedPath)) {
+      throw new Error(`SD card image not found at ${resolvedPath}`);
     }
-    const kernelBuf = fs.readFileSync(resolvedKernel);
-    kernelBytes = new Uint8Array(kernelBuf);
+    const sdcardBuf = fs.readFileSync(resolvedPath);
+    sdcardBytes = new Uint8Array(sdcardBuf);
+  }
+
+  // Parse SD card to find kernel on boot partition
+  const bootInfo = parseSDCard(sdcardBytes);
+  const kernelBytes = bootInfo.kernelData;
+
+  if (options?.debug) {
+    console.error(`[CLI] Found kernel: ${kernelBytes.length} bytes`);
+    console.error(`[CLI] Filesystem partition at sector ${bootInfo.fsPartitionStart}`);
   }
 
   const { WasmInternal } = await import('./');
@@ -114,23 +229,16 @@ async function createVm(
   }
 
   // Create VM with requested number of harts
-  // If harts is specified and >= 1, use new_with_harts
-  // Otherwise use default constructor which auto-detects (cpu/2)
   const requestedHarts = options?.harts;
   const vm = (requestedHarts !== undefined && requestedHarts >= 1 && VmCtor.new_with_harts)
     ? VmCtor.new_with_harts(kernelBytes, requestedHarts)
     : new VmCtor(kernelBytes);
 
-  if (options?.disk) {
-    const resolvedDisk = path.resolve(options.disk);
-    const diskBuf = fs.readFileSync(resolvedDisk);
-    const diskBytes = new Uint8Array(diskBuf);
-
-    if (typeof vm.load_disk === 'function') {
-      vm.load_disk(diskBytes);
-      if (options?.debug) {
-        console.error(`[VM] Loaded disk: ${resolvedDisk}`);
-      }
+  // Load entire SD card as block device (for filesystem partition access)
+  if (typeof vm.load_disk === 'function') {
+    vm.load_disk(sdcardBytes);
+    if (options?.debug) {
+      console.error(`[VM] Loaded SD card as block device`);
     }
   }
 
@@ -150,6 +258,11 @@ async function createVm(
 
       console.error(`[VM] Starting ${actualHarts - 1} worker threads...`);
 
+      // Track ready workers - allow start only after ALL workers are ready
+      // This fixes: with 9+ harts, workers take longer to spawn than the 100ms timeout
+      let readyWorkers = 0;
+      const expectedWorkers = actualHarts - 1;
+
       for (let hartId = 1; hartId < actualHarts; hartId++) {
         const worker = new Worker(workerPath, {
           workerData: {
@@ -162,6 +275,18 @@ async function createVm(
         worker.on('message', (msg: any) => {
           if (msg.type === 'ready') {
             console.error(`[VM] Worker ${msg.hartId} ready`);
+            readyWorkers++;
+            // When all workers are ready AND main thread says it's OK, allow workers to start
+            // The workers are blocked in wait_brief() until we set the start signal
+            if (readyWorkers === expectedWorkers) {
+              // Give a tiny bit more time for hart 0 to get ahead in boot
+              setTimeout(() => {
+                if (typeof (vm as any).allow_workers_to_start === 'function') {
+                  (vm as any).allow_workers_to_start();
+                  // Note: wasm.rs logs 'Workers signaled to start', we log 'allowed' here
+                }
+              }, 10);
+            }
           } else if (msg.type === 'halted') {
             console.error(`[VM] Worker ${msg.hartId} halted (${msg.stepCount} steps)`);
           } else if (msg.type === 'error') {
@@ -337,7 +462,8 @@ function runVmLoop(vm: any, nativeNetClient: any | null, workers: Worker[] = [])
       // Set IP in VM's external network backend
       const ipBytes = nativeNetClient.assignedIpBytes();
       if (ipBytes && typeof vm.set_external_network_ip === 'function') {
-        vm.set_external_network_ip(new Uint8Array(ipBytes));
+        const result = vm.set_external_network_ip(new Uint8Array(ipBytes));
+        console.error(`[Network] set_external_network_ip called, result: ${result}`);
       }
     }
 
@@ -408,17 +534,17 @@ function runVmLoop(vm: any, nativeNetClient: any | null, workers: Worker[] = [])
 /**
  * Print banner matching native VM output
  */
-function printBanner(kernelPath: string, numHarts: number, netWebtransport?: string) {
-  const kernelName = path.basename(kernelPath);
+function printBanner(sdcardPath: string, numHarts: number, netWebtransport?: string) {
+  const sdcardName = path.basename(sdcardPath);
 
   console.log();
   console.log('╔══════════════════════════════════════════════════════════════╗');
-  console.log('║              RISC-V Emulator (WASM + Worker Threads)         ║');
+  console.log('║            RISC-V Emulator with OpenSBI                      ║');
   console.log('╠══════════════════════════════════════════════════════════════╣');
-  console.log(`║  Kernel: ${kernelName.padEnd(50)} ║`);
-  console.log(`║  Harts:  ${String(numHarts).padEnd(50)} ║`);
+  console.log(`║  SD Card: ${sdcardName.padEnd(50)} ║`);
+  console.log(`║  Harts:   ${String(numHarts).padEnd(50)} ║`);
   if (netWebtransport) {
-    console.log(`║  Network: ${netWebtransport.padEnd(49)} ║`);
+    console.log(`║  Network: ${netWebtransport.padEnd(50)} ║`);
   }
   console.log('╚══════════════════════════════════════════════════════════════╝');
   console.log();
@@ -426,16 +552,11 @@ function printBanner(kernelPath: string, numHarts: number, netWebtransport?: str
 
 const argv = (yargs(hideBin(process.argv)) as any)
   .usage('Usage: $0 [options]')
-  .option('kernel', {
-    alias: 'k',
+  .option('sdcard', {
+    alias: 's',
     type: 'string',
-    describe: 'Path to kernel ELF or binary',
+    describe: 'Path to SD card image (contains kernel + filesystem)',
     demandOption: true,
-  })
-  .option('disk', {
-    alias: 'd',
-    type: 'string',
-    describe: 'Path to disk image (optional)',
   })
   .option('harts', {
     alias: 'n',
@@ -460,8 +581,7 @@ const argv = (yargs(hideBin(process.argv)) as any)
   .parseSync();
 
 (async () => {
-  const kernelPath = argv.kernel as string;
-  const diskPath = argv.disk as string | undefined;
+  const sdcardPath = argv.sdcard as string;
   const hartsArg = argv.harts as number | undefined;
   const netWebtransport = argv['net-webtransport'] as string | undefined;
   const certHash = argv['cert-hash'] as string | undefined;
@@ -487,26 +607,18 @@ const argv = (yargs(hideBin(process.argv)) as any)
   }
 
   // Print banner
-  printBanner(kernelPath, numHarts, netWebtransport);
+  printBanner(sdcardPath, numHarts, netWebtransport);
 
   try {
-    const { vm, nativeNetClient, workers } = await createVm(kernelPath, {
-      disk: diskPath,
+    const { vm, nativeNetClient, workers } = await createVm(sdcardPath, {
       harts: numHarts,
       netWebtransport,
       certHash,
       debug,
     });
 
-    // Signal workers that they can start executing
-    // This is done after the main hart has had a chance to initialize
-    if (typeof (vm as any).allow_workers_to_start === 'function') {
-      // Give hart 0 a head start to initialize kernel data structures
-      setTimeout(() => {
-        (vm as any).allow_workers_to_start();
-        console.error('[VM] Workers allowed to start');
-      }, 100);
-    }
+    // NOTE: Worker start signal is now triggered inside the worker 'ready' message handler
+    // when all workers have reported ready. This replaced the old 100ms setTimeout approach.
 
     runVmLoop(vm, nativeNetClient, workers);
   } catch (err) {
@@ -514,3 +626,4 @@ const argv = (yargs(hideBin(process.argv)) as any)
     process.exit(1);
   }
 })();
+

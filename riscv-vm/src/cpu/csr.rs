@@ -158,3 +158,19 @@ pub const CSR_MVENDORID: u16 = 0xF11; // Vendor ID
 pub const CSR_MARCHID: u16 = 0xF12; // Architecture ID
 pub const CSR_MIMPID: u16 = 0xF13; // Implementation ID
 pub const CSR_MHARTID: u16 = 0xF14; // Hardware thread ID
+
+// PMP (Physical Memory Protection) CSRs
+pub const CSR_PMPCFG0: u16 = 0x3A0;
+pub const CSR_PMPCFG1: u16 = 0x3A1; // RV32 only
+pub const CSR_PMPCFG2: u16 = 0x3A2;
+pub const CSR_PMPCFG3: u16 = 0x3A3; // RV32 only
+pub const CSR_PMPADDR0: u16 = 0x3B0;
+pub const CSR_PMPADDR1: u16 = 0x3B1;
+pub const CSR_PMPADDR2: u16 = 0x3B2;
+pub const CSR_PMPADDR3: u16 = 0x3B3;
+pub const CSR_PMPADDR4: u16 = 0x3B4;
+pub const CSR_PMPADDR5: u16 = 0x3B5;
+pub const CSR_PMPADDR6: u16 = 0x3B6;
+pub const CSR_PMPADDR7: u16 = 0x3B7;
+// Additional pmpaddr8-15 available at 0x3B8-0x3BF
+

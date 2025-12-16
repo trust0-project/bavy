@@ -105,9 +105,8 @@ pub const VIRTIO_MMIO_REGION_OFFSET: usize = CONTROL_REGION_SIZE
 ///   0x1C: value_hi (i32) - value high 32 bits
 pub const VIRTIO_SLOT_SIZE: usize = 32;
 
-/// Maximum number of VirtIO request slots (one per hart, up to MAX_HARTS).
-/// We allocate fewer slots since we won't have 128 active workers typically.
-pub const VIRTIO_MAX_SLOTS: usize = 16;
+/// Maximum number of VirtIO request slots (one per hart, up to MAX_HARTS)
+pub const VIRTIO_MAX_SLOTS: usize = 128;
 
 /// VirtIO slot field offsets (in i32 units from slot start)
 pub const VIRTIO_SLOT_STATUS: u32 = 0;
@@ -145,6 +144,14 @@ pub const CTRL_EPOCH: u32 = 5;
 /// Control region: workers can start executing (i32 index 6)
 /// Workers poll this flag; they park until main thread sets it.
 pub const CTRL_WORKERS_CAN_START: u32 = 6;
+/// Control region: VM start time in milliseconds (i32 indices 7-8 for 64-bit)
+/// Used to compute wall-clock based mtime.
+pub const CTRL_START_TIME_MS_LO: u32 = 7;
+pub const CTRL_START_TIME_MS_HI: u32 = 8;
+/// Control region: D1 EMAC assigned IP address (i32 index 9)
+/// Packed as big-endian: [IP0 << 24 | IP1 << 16 | IP2 << 8 | IP3]
+/// 0 means no IP assigned yet.
+pub const CTRL_D1_EMAC_IP: u32 = 9;
 
 // ============================================================================
 // CLINT Region Offsets (relative to CLINT region start at CONTROL_REGION_SIZE)
@@ -238,24 +245,26 @@ pub mod wasm {
             (byte_offset / 4) as u32
         }
 
-        /// Load mtime (64-bit).
+        /// Load mtime (64-bit) - now wall-clock based.
+        /// Computes mtime from elapsed time since VM start at 10MHz tick rate.
         pub fn mtime(&self) -> u64 {
-            let offset = mtime_offset();
-            let lo = self.load_i32(offset) as u32 as u64;
-            let hi = self.load_i32(offset + 4) as u32 as u64;
-            lo | (hi << 32)
+            // Get current time in milliseconds
+            let now_ms = js_sys::Date::now() as u64;
+            
+            // Get start time from shared memory
+            let start_lo = Atomics::load(&self.view, CTRL_START_TIME_MS_LO).unwrap_or(0) as u32 as u64;
+            let start_hi = Atomics::load(&self.view, CTRL_START_TIME_MS_HI).unwrap_or(0) as u32 as u64;
+            let start_ms = start_lo | (start_hi << 32);
+            
+            // Calculate elapsed time and convert to 10MHz ticks
+            // 10MHz = 10_000 ticks per millisecond
+            let elapsed_ms = now_ms.saturating_sub(start_ms);
+            elapsed_ms * 10_000
         }
 
-        /// Increment mtime (called by hart 0 only).
-        pub fn tick(&self, increment: u64) {
-            let offset = mtime_offset();
-            // Read-modify-write using atomics
-            // Note: In WASM, we use Atomics.add for 32-bit values
-            // For 64-bit, we need two operations (potential race, but mtime only updated by hart 0)
-            let current = self.mtime();
-            let new_val = current.wrapping_add(increment);
-            self.store_i32(offset, new_val as i32);
-            self.store_i32(offset + 4, (new_val >> 32) as i32);
+        /// Increment mtime - now a no-op since mtime is wall-clock based.
+        pub fn tick(&self, _increment: u64) {
+            // No-op: mtime is now wall-clock based
         }
 
         /// Get the i32 index for the MSIP word of a specific hart.
@@ -271,7 +280,23 @@ pub mod wasm {
                 return 0;
             }
             let offset = msip_offset(hart_id);
-            (self.load_i32(offset) & 1) as u32
+            let val = (self.load_i32(offset) & 1) as u32;
+
+            // DEBUG: Log first few MSIP reads for Hart 8 to verify visibility
+            // We use a shared counter hack or just check logic
+            if hart_id == 8 {
+                 static HART8_READ_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                 let count = HART8_READ_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                 // Log transitions (0->1 or 1->0) or just first few
+                 // This is tricky because this is called frequently
+                 if count < 50 || (count % 1000 == 0 && val == 1) {
+                     web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+                        "[SharedClint] get_msip(8) #{}: val={}",
+                        count, val
+                    )));
+                 }
+            }
+            val
         }
 
         /// Set MSIP for a hart (IPI).
@@ -279,6 +304,15 @@ pub mod wasm {
             if hart_id >= MAX_HARTS {
                 return;
             }
+            
+            // DEBUG: Log Hart 8 MSIP writes to confirm IPI delivery
+            if hart_id == 8 {
+                web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+                    "[SharedClint] set_msip(8, {}) - IPI SENT TO HART 8",
+                    value
+                )));
+            }
+            
             let offset = msip_offset(hart_id);
             self.store_i32(offset, (value & 1) as i32);
             // Wake up the hart if it's sleeping in WFI (waiting on this MSIP word)
@@ -336,8 +370,26 @@ pub mod wasm {
 
         /// Load a CLINT register (MMIO-style).
         pub fn load(&self, offset: u64, size: u64) -> u64 {
+            // Check if this is an mtime read (offset 0xBFF8, 8 bytes)
+            // Return wall-clock based mtime instead of reading from buffer
+            if offset as usize == CLINT_MTIME_OFFSET && size == 8 {
+                return self.mtime();
+            }
+            // Also handle 4-byte reads from mtime offset (low word)
+            if offset as usize == CLINT_MTIME_OFFSET && size == 4 {
+                return self.mtime() as u32 as u64;
+            }
+            // Handle 4-byte reads from mtime offset + 4 (high word)
+            if offset as usize == CLINT_MTIME_OFFSET + 4 && size == 4 {
+                return (self.mtime() >> 32) as u32 as u64;
+            }
+            
             let byte_offset = self.clint_base + offset as usize;
-            match size {
+            
+            // Check if this is an MSIP read (offsets 0x0000 to 0x01FC, 4 bytes each)
+            let is_msip_read = offset < (MAX_HARTS as u64 * 4) && size == 4;
+            
+            let result = match size {
                 4 => self.load_i32(byte_offset) as u32 as u64,
                 8 => {
                     let lo = self.load_i32(byte_offset) as u32 as u64;
@@ -345,14 +397,38 @@ pub mod wasm {
                     lo | (hi << 32)
                 }
                 _ => 0,
-            }
+            };
+            
+            
+            
+            result
         }
 
         /// Store to a CLINT register (MMIO-style).
+        /// 
+        /// This handles stores that come through the bus (e.g., from SBI send_ipi).
+        /// IMPORTANT: For MSIP writes, we must call Atomics.notify to wake workers
+        /// that are blocking in WFI using Atomics.wait on the MSIP slot.
         pub fn store(&self, offset: u64, size: u64, value: u64) {
             let byte_offset = self.clint_base + offset as usize;
+            
+            // Check if this is an MSIP write (offsets 0x0000 to 0x01FC, 4 bytes each)
+            // MSIP region: hart N is at offset N*4
+            let is_msip_write = offset < (MAX_HARTS as u64 * 4) && size == 4;
+
+            
             match size {
-                4 => self.store_i32(byte_offset, value as i32),
+                4 => {
+                    self.store_i32(byte_offset, value as i32);
+                    
+                    // If writing to MSIP with a non-zero value, wake the target hart
+                    // This is critical for IPI delivery from the main thread to workers
+                    if is_msip_write && (value & 1) != 0 {
+                        let idx = self.i32_index(byte_offset);
+                        // Wake the target worker via Atomics.notify
+                        let _ = Atomics::notify(&self.view, idx);
+                    }
+                }
                 8 => {
                     self.store_i32(byte_offset, value as i32);
                     self.store_i32(byte_offset + 4, (value >> 32) as i32);
@@ -380,6 +456,13 @@ pub mod wasm {
     pub struct SharedControl {
         view: Int32Array,
     }
+
+    // SAFETY: SharedControl uses SharedArrayBuffer and JavaScript Atomics for
+    // thread-safe access. In WASM, each worker has its own isolated memory space,
+    // so the Int32Array view is not actually shared between Rust threads.
+    // All cross-worker synchronization goes through SharedArrayBuffer + Atomics.
+    unsafe impl Send for SharedControl {}
+    unsafe impl Sync for SharedControl {}
 
     impl SharedControl {
         /// Create from SharedArrayBuffer.
@@ -465,20 +548,55 @@ pub mod wasm {
         /// Called by hart 0 after initial boot is complete.
         pub fn allow_workers_to_start(&self) {
             let _ = Atomics::store(&self.view, CTRL_WORKERS_CAN_START, 1);
-            // Wake any workers waiting on this flag
-            let _ = Atomics::notify(&self.view, CTRL_WORKERS_CAN_START);
+            // Wake ALL workers waiting on this flag (u32::MAX = wake all)
+            let _ = Atomics::notify_with_count(&self.view, CTRL_WORKERS_CAN_START, u32::MAX);
         }
 
         /// Wait for workers_can_start signal.
         /// Workers call this to park until main thread allows execution.
         pub fn wait_for_start_signal(&self) {
-            // Poll-wait with yield - Atomics.wait may not work in workers
-            // depending on browser, so we use a simple poll loop
+            // Use Atomics.wait to efficiently block until signaled
+            // Value 0 means "workers not started yet" - we wait for it to change
+            // Use 10ms timeout to ensure missed notifications don't cause long delays
             while !self.can_workers_start() {
-                // Yield to prevent busy-spin from starving other threads
-                // This is a hint to the JS runtime
-                std::hint::spin_loop();
+                // Short 10ms wait - if notification was missed, we'll quickly retry
+                let _ = Atomics::wait_with_timeout(&self.view, CTRL_WORKERS_CAN_START, 0, 10.0);
             }
+        }
+
+        /// Wait briefly (up to timeout_ms) on the workers_can_start flag.
+        /// Returns immediately if the flag changes or timeout expires.
+        /// Unlike wait_for_start_signal, this doesn't loop.
+        pub fn wait_brief(&self, timeout_ms: f64) {
+            let _ = Atomics::wait_with_timeout(&self.view, CTRL_WORKERS_CAN_START, 0, timeout_ms);
+        }
+
+        /// Get D1 EMAC assigned IP address from shared memory.
+        /// Returns the IP as [a, b, c, d] or [0, 0, 0, 0] if not assigned.
+        pub fn get_d1_emac_ip(&self) -> [u8; 4] {
+            let packed = Atomics::load(&self.view, CTRL_D1_EMAC_IP).unwrap_or(0) as u32;
+            [
+                ((packed >> 24) & 0xFF) as u8,
+                ((packed >> 16) & 0xFF) as u8,
+                ((packed >> 8) & 0xFF) as u8,
+                (packed & 0xFF) as u8,
+            ]
+        }
+
+        /// Set D1 EMAC assigned IP address in shared memory.
+        /// Called by main thread when IP is assigned.
+        pub fn set_d1_emac_ip(&self, ip: [u8; 4]) {
+            let packed = ((ip[0] as u32) << 24)
+                | ((ip[1] as u32) << 16)
+                | ((ip[2] as u32) << 8)
+                | (ip[3] as u32);
+            let _ = Atomics::store(&self.view, CTRL_D1_EMAC_IP, packed as i32);
+        }
+
+        /// Get D1 EMAC IP as packed u32 for MMIO reads.
+        /// Returns 0 if no IP assigned.
+        pub fn get_d1_emac_ip_packed(&self) -> u32 {
+            Atomics::load(&self.view, CTRL_D1_EMAC_IP).unwrap_or(0) as u32
         }
     }
 
@@ -996,6 +1114,11 @@ pub mod wasm {
         let _ = Atomics::store(&view, CTRL_EPOCH, 0);
         // Workers start parked - main thread will set this after boot
         let _ = Atomics::store(&view, CTRL_WORKERS_CAN_START, 0);
+
+        // Initialize start time for wall-clock based mtime
+        let now_ms = js_sys::Date::now() as u64;
+        let _ = Atomics::store(&view, CTRL_START_TIME_MS_LO, now_ms as i32);
+        let _ = Atomics::store(&view, CTRL_START_TIME_MS_HI, (now_ms >> 32) as i32);
 
         // Initialize CLINT region
         let clint = SharedClint::new(buffer);

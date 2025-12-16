@@ -119,26 +119,26 @@ function runLoop() {
     console.error('[Worker] runLoop called without workerState, hartId, or controlView');
     return;
   }
-  
+
   const hartId = currentHartId; // Capture for type narrowing
-  
+
   // Number of batches to execute before yielding
   const BATCHES_PER_YIELD = 10;
-  
+
   let shouldContinue = true;
   let batchCount = 0;
-  
+
   while (shouldContinue) {
     const result = workerState.step_batch(BATCH_SIZE);
-    
+
     switch (result) {
       case WorkerStepResult.Continue:
         batchCount++;
-        
+
         // Yield periodically to allow halt signals to be processed
         if (batchCount >= BATCHES_PER_YIELD) {
           batchCount = 0;
-          
+
           // Use Atomics.wait with 0ms timeout for efficient yielding
           // This is much faster than setTimeout(0) which has ~4ms minimum delay
           // Returns immediately but allows the thread to check for updates
@@ -149,23 +149,20 @@ function runLoop() {
           }
         }
         break;
-        
+
       case WorkerStepResult.Halted:
-        console.log(`[Worker ${hartId}] Halted after ${workerState.step_count()} steps`);
         self.postMessage({ type: "halted", hartId });
         cleanup();
         shouldContinue = false;
         break;
-        
+
       case WorkerStepResult.Shutdown:
-        console.log(`[Worker ${hartId}] Shutdown after ${workerState.step_count()} steps`);
         self.postMessage({ type: "halted", hartId });
         cleanup();
         shouldContinue = false;
         break;
-        
+
       case WorkerStepResult.Error:
-        console.error(`[Worker ${hartId}] Error after ${workerState.step_count()} steps`);
         self.postMessage({ type: "error", hartId, error: "Execution error" });
         cleanup();
         shouldContinue = false;
@@ -181,32 +178,28 @@ function cleanup() {
 
 self.onmessage = async (event: MessageEvent<WorkerInitMessage>) => {
   const data = event.data;
-  
+
   // Ignore messages from browser extensions (React DevTools, etc.)
   if (!data || typeof data !== 'object' || 'source' in data) {
     return;
   }
-  
+
   const { hartId, sharedMem, entryPc } = data;
-  
+
   // Validate required fields
   if (hartId === undefined || !sharedMem || entryPc === undefined) {
     console.warn('[Worker] Invalid init message, missing fields');
     return;
   }
-  
+
   currentHartId = hartId;
-  console.log(`[Worker ${hartId}] Received init message`);
 
   if (!initialized) {
     try {
       // Initialize WASM module with embedded buffer
-      console.log(`[Worker ${hartId}] Initializing WASM...`);
       initSync(wasmBuffer);
       initialized = true;
-      console.log(`[Worker ${hartId}] WASM initialized`);
     } catch (e) {
-      console.error(`[Worker ${hartId}] WASM init failed:`, e);
       const msg: WorkerErrorMessage = {
         type: "error",
         hartId,
@@ -235,18 +228,15 @@ self.onmessage = async (event: MessageEvent<WorkerInitMessage>) => {
   try {
     // Convert entryPc (number/float64) to BigInt for u64
     const pc = BigInt(Math.floor(entryPc));
-    console.log(`[Worker ${hartId}] Starting execution at PC=0x${pc.toString(16)}`);
-    
     // Set up control view for efficient Atomics.wait-based yielding
     controlView = new Int32Array(sharedMem);
-    
+
     // Create worker state for cooperative scheduling
     workerState = new WorkerState(hartId, sharedMem, pc);
-    
+
     // Start the optimized blocking run loop
     runLoop();
   } catch (e) {
-    console.error(`[Worker ${hartId}] Execution error:`, e);
     const msg: WorkerErrorMessage = {
       type: "error",
       hartId,

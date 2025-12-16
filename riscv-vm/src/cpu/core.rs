@@ -91,6 +91,111 @@ impl Cpu {
         }
     }
 
+    /// Configure the CPU for S-mode kernel boot.
+    ///
+    /// This sets up the necessary CSRs so that the kernel will run in S-mode
+    /// with proper trap delegation. Call this before starting execution.
+    ///
+    /// # Arguments
+    /// * `dtb_address` - Physical address of the Device Tree Blob (for `a1` register)
+    ///                   Pass 0 if no DTB is available.
+    ///
+    /// # What it does:
+    /// 1. Sets `medeleg` to delegate exceptions to S-mode (page faults, etc.)
+    /// 2. Sets `mideleg` to delegate interrupts to S-mode (timer, software, external)
+    /// 3. Sets `mstatus.MPP = 01` (Supervisor) so MRET enters S-mode
+    /// 4. Enables S-mode access to time CSR via `mcounteren`
+    /// 5. Sets `a0` to hart ID (SBI convention for S-mode kernels)
+    /// 6. Sets `a1` to DTB address (SBI convention for S-mode kernels)
+    /// 7. Configures PMP to allow S-mode full memory access
+    /// 8. Initializes HSM state tracking for primary hart
+    pub fn setup_smode_boot_with_dtb(&mut self, dtb_address: u64) {
+        use super::csr::{
+            CSR_MCOUNTEREN, CSR_MEDELEG, CSR_MHARTID, CSR_MIDELEG, CSR_MSTATUS,
+            CSR_PMPCFG0, CSR_PMPADDR0,
+        };
+
+        // Delegate exceptions to S-mode:
+        // - Illegal instructions (2) - needed for S-mode exception handling
+        // - Page faults (12, 13, 15)
+        // - Environment calls from U-mode (8)
+        // - Breakpoints (3)
+        // - Access faults (1, 5, 7)
+        // - Misaligned faults (0, 4, 6)
+        let medeleg: u64 = (1 << 0)   // Instruction address misaligned
+                        | (1 << 1)   // Instruction access fault
+                        | (1 << 2)   // Illegal instruction
+                        | (1 << 3)   // Breakpoint
+                        | (1 << 4)   // Load address misaligned
+                        | (1 << 5)   // Load access fault
+                        | (1 << 6)   // Store address misaligned
+                        | (1 << 7)   // Store access fault
+                        | (1 << 8)   // Environment call from U-mode
+                        | (1 << 12)  // Instruction page fault
+                        | (1 << 13)  // Load page fault
+                        | (1 << 15); // Store page fault
+        self.csrs[CSR_MEDELEG as usize] = medeleg;
+
+        // Delegate interrupts to S-mode:
+        // - Supervisor software interrupt (1)
+        // - Supervisor timer interrupt (5)
+        // - Supervisor external interrupt (9)
+        let mideleg: u64 = (1 << 1)   // Supervisor software interrupt
+                        | (1 << 5)   // Supervisor timer interrupt
+                        | (1 << 9);  // Supervisor external interrupt
+        self.csrs[CSR_MIDELEG as usize] = mideleg;
+
+        // Set mstatus.MPP = 01 (Supervisor) so MRET enters S-mode
+        // Also set MPIE = 1 so interrupts are enabled after MRET
+        let mut mstatus = self.csrs[CSR_MSTATUS as usize];
+        mstatus &= !(0b11 << 11); // Clear MPP
+        mstatus |= 0b01 << 11;    // MPP = Supervisor (01)
+        mstatus |= 1 << 7;        // MPIE = 1 (enable interrupts on MRET)
+        self.csrs[CSR_MSTATUS as usize] = mstatus;
+
+        // Enable S-mode access to time/cycle/instret CSRs
+        self.csrs[CSR_MCOUNTEREN as usize] = 0b111; // TM, IR, CY
+
+        // Configure PMP to allow S-mode full memory access
+        // PMP entry 0: NAPOT mode covering entire 64-bit address space
+        // pmpaddr0 = 0x1FFFFFFF_FFFFFFFF (all 1s except top bits, NAPOT for max range)
+        // pmpcfg0 = L=0, A=NAPOT(3), X=1, W=1, R=1 => 0x1F for entry 0
+        // This gives S-mode full RWX access to all memory
+        self.csrs[CSR_PMPADDR0 as usize] = 0x003F_FFFF_FFFF_FFFF; // NAPOT covering 0-max
+        // pmpcfg0 byte 0: A=NAPOT(3), X=1, W=1, R=1 = 0b00011111 = 0x1F
+        self.csrs[CSR_PMPCFG0 as usize] = 0x1F;
+
+        // Set a0 (x10) to hart ID - SBI convention for S-mode kernel entry
+        // The kernel will use this instead of reading mhartid CSR
+        let hart_id = self.csrs[CSR_MHARTID as usize];
+        self.regs[10] = hart_id; // a0 = hart_id
+        
+        // Set a1 (x11) to DTB address - SBI convention for S-mode kernel entry
+        // This must be 8-byte aligned per OpenSBI protocol
+        self.regs[11] = dtb_address; // a1 = dtb_address
+
+        // Initialize HSM state tracking - mark primary hart as STARTED
+        if hart_id == 0 {
+            crate::sbi::hsm::init_primary_hart();
+        } else {
+            // Secondary harts start in STOPPED state (default)
+            // They will transition to STARTED when hart_start is called
+        }
+
+        // Set mode to Supervisor directly for emulator simplicity
+        // (In real hardware, you'd execute MRET to enter S-mode)
+        self.mode = Mode::Supervisor;
+    }
+    
+    /// Configure the CPU for S-mode kernel boot (legacy, no DTB).
+    ///
+    /// This is a convenience wrapper for backward compatibility.
+    /// For OpenSBI compliance, use `setup_smode_boot_with_dtb()` instead.
+    pub fn setup_smode_boot(&mut self) {
+        self.setup_smode_boot_with_dtb(0);
+    }
+
+
     /// Export the current CSR image into a compact map suitable for
     /// serialization in snapshots.
     pub fn export_csrs(&self) -> HashMap<u16, u64> {
@@ -1142,12 +1247,12 @@ impl Cpu {
                     return BlockExecResult::Exit { next_pc: pc };
                 }
 
-                MicroOp::Wfi { pc_offset: _ } => {
-                    // WFI: spin briefly and continue
-                    for _ in 0..10 {
-                        std::hint::spin_loop();
-                    }
-                    // Continue to next instruction in block
+                MicroOp::Wfi { pc_offset } => {
+                    // WFI: Exit block and let outer loop handle proper sleep
+                    // The outer loop will check for pending interrupts and use
+                    // Condvar to sleep the host thread, saving CPU cycles.
+                    let pc = base_pc.wrapping_add(pc_offset as u64);
+                    return BlockExecResult::Exit { next_pc: pc };
                 }
 
                 MicroOp::Fence => {
@@ -1260,7 +1365,7 @@ impl Cpu {
         }
     }
 
-    pub(super) fn check_pending_interrupt(&self) -> Option<Trap> {
+    pub fn check_pending_interrupt(&self) -> Option<Trap> {
         let mstatus = self.csrs[CSR_MSTATUS as usize];
         let mip = self.csrs[CSR_MIP as usize];
         let mie = self.csrs[CSR_MIE as usize];

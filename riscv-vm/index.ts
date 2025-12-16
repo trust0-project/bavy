@@ -85,6 +85,146 @@ export async function createVM(
   return vm;
 }
 
+// ============================================================================
+// SD Card Boot Support
+// ============================================================================
+
+interface SDBootInfo {
+  kernelData: Uint8Array;
+  sdcardData: Uint8Array;
+  fsPartitionStart: number;
+}
+
+/**
+ * Parse an SD card image to extract kernel from FAT32 boot partition.
+ * 
+ * SD Card layout:
+ * - MBR with partition table
+ * - Partition 1 (FAT32): kernel.bin
+ * - Partition 2: SFS filesystem
+ */
+export function parseSDCard(sdcard: Uint8Array): SDBootInfo {
+  if (sdcard.length < 512) {
+    throw new Error('SD card image too small');
+  }
+
+  // Check MBR signature
+  if (sdcard[510] !== 0x55 || sdcard[511] !== 0xAA) {
+    throw new Error('Invalid MBR signature');
+  }
+
+  // Parse partition table
+  let bootPartStart = 0;
+  let fsPartStart = 0;
+
+  for (let i = 0; i < 4; i++) {
+    const offset = 446 + i * 16;
+    const partType = sdcard[offset + 4];
+    const startLba = sdcard[offset + 8] | (sdcard[offset + 9] << 8) |
+      (sdcard[offset + 10] << 16) | (sdcard[offset + 11] << 24);
+
+    if ((partType === 0x0B || partType === 0x0C) && bootPartStart === 0) {
+      bootPartStart = startLba;
+    } else if (partType !== 0 && fsPartStart === 0 && startLba !== bootPartStart) {
+      fsPartStart = startLba;
+    }
+  }
+
+  if (bootPartStart === 0) {
+    throw new Error('No FAT32 boot partition found');
+  }
+
+  // Parse FAT32 boot sector
+  const bootOffset = bootPartStart * 512;
+  const bytesPerSector = sdcard[bootOffset + 11] | (sdcard[bootOffset + 12] << 8);
+  const sectorsPerCluster = sdcard[bootOffset + 13];
+  const reservedSectors = sdcard[bootOffset + 14] | (sdcard[bootOffset + 15] << 8);
+  const numFats = sdcard[bootOffset + 16];
+  const sectorsPerFat = sdcard[bootOffset + 36] | (sdcard[bootOffset + 37] << 8) |
+    (sdcard[bootOffset + 38] << 16) | (sdcard[bootOffset + 39] << 24);
+  const rootCluster = sdcard[bootOffset + 44] | (sdcard[bootOffset + 45] << 8) |
+    (sdcard[bootOffset + 46] << 16) | (sdcard[bootOffset + 47] << 24);
+
+  // Find kernel.bin in root directory
+  const dataStartSector = reservedSectors + (numFats * sectorsPerFat);
+  const rootDirSector = dataStartSector + (rootCluster - 2) * sectorsPerCluster;
+  const rootDirOffset = bootOffset + (rootDirSector * bytesPerSector);
+  const clusterBytes = sectorsPerCluster * bytesPerSector;
+
+  let kernelData: Uint8Array | null = null;
+
+  for (let i = 0; i < clusterBytes && (rootDirOffset + i + 32) <= sdcard.length; i += 32) {
+    const entryOffset = rootDirOffset + i;
+    if (sdcard[entryOffset] === 0x00) break;
+    if (sdcard[entryOffset] === 0xE5 || sdcard[entryOffset + 11] === 0x0F) continue;
+
+    const name = String.fromCharCode(...sdcard.slice(entryOffset, entryOffset + 11));
+    if (name === 'KERNEL  BIN') {
+      const clusterHigh = sdcard[entryOffset + 20] | (sdcard[entryOffset + 21] << 8);
+      const clusterLow = sdcard[entryOffset + 26] | (sdcard[entryOffset + 27] << 8);
+      const fileSize = sdcard[entryOffset + 28] | (sdcard[entryOffset + 29] << 8) |
+        (sdcard[entryOffset + 30] << 16) | (sdcard[entryOffset + 31] << 24);
+      const fileCluster = (clusterHigh << 16) | clusterLow;
+      const fileSector = dataStartSector + (fileCluster - 2) * sectorsPerCluster;
+      const fileOffset = bootOffset + (fileSector * bytesPerSector);
+
+      if (fileOffset + fileSize <= sdcard.length) {
+        kernelData = sdcard.slice(fileOffset, fileOffset + fileSize);
+      }
+      break;
+    }
+  }
+
+  if (!kernelData) {
+    throw new Error('kernel.bin not found on boot partition');
+  }
+
+  return { kernelData, sdcardData: sdcard, fsPartitionStart: fsPartStart };
+}
+
+/**
+ * Fetch an SD card image from a URL for browser use.
+ * 
+ * @param url - URL to fetch SD card image from
+ * @returns Parsed boot info with kernel and disk data
+ */
+export async function loadSDCardFromUrl(url: string): Promise<SDBootInfo> {
+  console.log(`[SDK] Fetching SD card from ${url}...`);
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Failed to fetch SD card: ${response.statusText}`);
+  }
+  const arrayBuffer = await response.arrayBuffer();
+  const sdcardData = new Uint8Array(arrayBuffer);
+  console.log(`[SDK] Loaded ${sdcardData.length} bytes`);
+  return parseSDCard(sdcardData);
+}
+
+/**
+ * Create a VM from an SD card image (fetched from URL).
+ * 
+ * This is the recommended way to boot the VM in browser.
+ * 
+ * @param sdcardUrl - URL to SD card image
+ * @param options - VM configuration options
+ * @returns WasmVm instance ready to run
+ */
+export async function createVMFromSDCard(
+  sdcardUrl: string,
+  options: VmOptions = {}
+): Promise<import("./pkg/riscv_vm").WasmVm> {
+  const bootInfo = await loadSDCardFromUrl(sdcardUrl);
+  const vm = await createVM(bootInfo.kernelData, options);
+
+  // Load entire SD card as block device for filesystem access
+  if (typeof vm.load_disk === 'function') {
+    vm.load_disk(bootInfo.sdcardData);
+    console.log(`[SDK] Mounted SD card (fs partition at sector ${bootInfo.fsPartitionStart})`);
+  }
+
+  return vm;
+}
+
 /**
  * Run the VM with an output callback for UART data.
  *

@@ -47,6 +47,9 @@ pub enum WorkerStepResult {
     Shutdown = 2,
     /// Fatal error occurred
     Error = 3,
+    /// WFI executed - worker should yield to prevent busy loop
+    /// TypeScript should add a small delay before calling step_batch again
+    Wfi = 4,
 }
 
 /// Worker state stored in JS (passed back to Rust on each step_batch call).
@@ -60,6 +63,10 @@ pub struct WorkerState {
     clint: SharedClint,
     hart_id: usize,
     step_count: u64,
+    /// Counter for WFI events (separate from step_count for throttled logging)
+    wfi_count: u64,
+    /// Counter for batch calls
+    batch_count: u64,
     /// Cached flag: have we received the "workers can start" signal?
     /// Once set to true, we never need to check again (reduces atomic ops).
     workers_started: bool,
@@ -85,13 +92,11 @@ impl WorkerState {
         let bus = SystemBus::from_shared_buffer(sab, dram_offset, shared_clint_for_bus, true, hart_id);
 
         // Create CPU for this hart
-        let cpu = Cpu::new(entry_pc, hart_id as u64);
+        let mut cpu = Cpu::new(entry_pc, hart_id as u64);
+        cpu.setup_smode_boot(); // Enable S-mode operation
 
-        web_sys::console::log_1(&JsValue::from_str(&format!(
-            "[Worker {}] Initialized at PC=0x{:x}",
-            hart_id, entry_pc
-        )));
-
+        // Verify a0 is set to hart_id (critical for kernel boot)
+        let a0_value = cpu.read_reg(crate::engine::decoder::Register::X10);
         WorkerState {
             cpu,
             bus,
@@ -99,6 +104,8 @@ impl WorkerState {
             clint,
             hart_id,
             step_count: 0,
+            wfi_count: 0,
+            batch_count: 0,
             workers_started: false, // Will be cached on first check
         }
     }
@@ -121,12 +128,12 @@ impl WorkerState {
         const HALT_CHECK_INTERVAL: u32 = 10_000;
         const INTERRUPT_CHECK_INTERVAL: u32 = 5_000;
 
+        // Increment and log batch count for debugging
+        self.batch_count += 1;
+        
+
         // Check for halt request first (one atomic check at batch start)
         if self.control.should_stop() {
-            web_sys::console::log_1(&JsValue::from_str(&format!(
-                "[Worker {}] Halt detected after {} steps",
-                self.hart_id, self.step_count
-            )));
             return WorkerStepResult::Halted;
         }
 
@@ -134,15 +141,24 @@ impl WorkerState {
         // This ensures hart 0 boots first and sets up memory before
         // secondary harts start executing kernel code.
         //
-        // Optimization: Cache the result once workers are allowed to start.
-        // This eliminates an atomic operation per batch after startup.
+        // CRITICAL: Don't execute ANY instructions until start signal is set.
+        // Return early so JS event loop can process messages and check again.
         if !self.workers_started {
             if !self.control.can_workers_start() {
-                // Still parked - return Continue to keep polling
+                // Just return immediately - don't execute any instructions yet
+                // This keeps the JS event loop responsive and prevents workers
+                // from executing kernel code before hart 0 finishes setup.
+                //
+                // Sleep briefly to avoid busy-spinning (10ms)
+                self.control.wait_brief(10.0);
                 return WorkerStepResult::Continue;
             }
             // Workers can start - cache this permanently
             self.workers_started = true;
+            
+            // DEBUG: Check MSIP right after start signal to verify SAB visibility
+            let msip_at_start = self.clint.get_msip(self.hart_id);
+            let (msip_check, timer_check) = self.clint.check_interrupts(self.hart_id);
         }
 
         // Execute batch of instructions with reduced atomic operation frequency
@@ -150,10 +166,6 @@ impl WorkerState {
             // Periodic halt check (much less frequent than per-instruction)
             if i > 0 && i % HALT_CHECK_INTERVAL == 0 {
                 if self.control.should_stop() {
-                    web_sys::console::log_1(&JsValue::from_str(&format!(
-                        "[Worker {}] Halt detected during batch after {} steps",
-                        self.hart_id, self.step_count
-                    )));
                     return WorkerStepResult::Halted;
                 }
             }
@@ -166,67 +178,101 @@ impl WorkerState {
             match self.cpu.step(&self.bus) {
                 Ok(()) => {
                     self.step_count += 1;
+                    
+                    // DEBUG: Log every 100k steps with MSIP status to verify IPI visibility
+                    if self.step_count % 100_000 == 0 {
+                        let msip_val = self.clint.get_msip(self.hart_id);
+                        let (msip_check, timer_check) = self.clint.check_interrupts(self.hart_id);
+                    }
                 }
                 Err(Trap::RequestedTrap(code)) => {
-                    web_sys::console::log_1(&JsValue::from_str(&format!(
-                        "[Worker {}] Shutdown requested (code: {:#x})",
-                        self.hart_id, code
-                    )));
                     self.control.signal_halted(code);
                     return WorkerStepResult::Shutdown;
                 }
                 Err(Trap::Wfi) => {
                     // WFI executed: advance PC (4 bytes) and check if we can sleep
                     self.cpu.pc = self.cpu.pc.wrapping_add(4);
+                    self.wfi_count += 1;
 
-                    // If interrupts are pending, don't sleep
+                    // If interrupts are pending, deliver them so the CPU can handle them
+                    // This is critical - without delivery, the guest loops on WFI forever
                     let (msip, timer) = self.clint.check_interrupts(self.hart_id);
                     if msip || timer {
-                        continue;
+                        // Deliver interrupts to the CPU so it can take the trap
+                        self.deliver_interrupts();
+                        
+                        // Check if the CPU can actually take this interrupt (not masked)
+                        if self.cpu.check_pending_interrupt().is_some() {
+                            // Interrupt is enabled - continue to take trap
+                            continue;
+                        } else {
+                            // Interrupt is pending but masked - yield host briefly
+                            // to avoid busy-spin when guest is polling with interrupts disabled
+                            let view = &self.clint.view;
+                            let index = self.clint.msip_index(self.hart_id);
+                            let _ = js_sys::Atomics::wait_with_timeout(view, index, 0, 1.0);
+                            continue;
+                        }
                     }
 
-                    // No pending interrupts - we can sleep.
+                    // No pending interrupts - we MUST sleep to save CPU.
                     // Calculate wait timeout based on next timer interrupt.
                     let now = self.clint.mtime();
                     let trigger = self.clint.get_mtimecmp(self.hart_id);
 
-                    // Default to indefinite wait if timer is far in future or disabled (u64::MAX)
+                    // Calculate timeout, defaulting to at least 1ms to prevent spin
+                    // Use 10,000 ticks per ms (10MHz CLINT frequency)
+                    //
+                    // Use 100ms timeout for idle harts to save CPU. If an IPI arrives,
+                    // Atomics.notify will wake us immediately, so long timeout is fine.
                     let timeout_ms = if trigger > now {
-                         // Time differs by ticks. We need to convert ticks to ms.
-                         // Assuming 10MHz (100ns per tick) like QEMU virt board?
-                         // Or 1MHz? The code doesn't specify tick rate.
-                         // Let's assume 10MHz for now (10,000 ticks = 1ms)
                          let diff = trigger - now;
                          let ms = diff / 10_000;
-                         // Cap at 100ms to allow periodic checks
-                         if ms > 100 { 100 } else { ms as i32 }
+                         // Cap at 100ms to balance responsiveness vs CPU usage
+                         if ms > 100 { 100 } else { ms.max(1) as i32 }
                     } else {
-                        // Timer already passed? Should have been caught by check_interrupts
-                        0
+                        // Timer already passed or disabled - sleep longer
+                        // to prevent spinning when truly idle
+                        100
                     };
-
-                    // Wait on MSIP word.
-                    // If MSIP becomes 1 (IPI), Atomics.wait returns "not-equal" immediately.
-                    // If MSIP stays 0, it returns "ok" (woken by notify) or "timed-out".
-                    if timeout_ms > 0 {
-                        // We need raw access to the Atomics API via js_sys
-                        let view = &self.clint.view;
-                        let index = self.clint.msip_index(self.hart_id);
-                        let _ = js_sys::Atomics::wait_with_timeout(view, index, 0, timeout_ms.into());
+                    // ========================================================
+                    // PRE-WAIT MSIP CHECK (Race Condition Fix)
+                    // ========================================================
+                    // Re-check MSIP immediately before sleeping. This handles the
+                    // race where Hart 0 sends an IPI after our check_interrupts()
+                    // call above but before we enter Atomics.wait().
+                    let pre_wait_msip = self.clint.get_msip(self.hart_id);
+                    if pre_wait_msip != 0 {
+                        // IPI arrived between check and wait - deliver immediately
+                        self.deliver_interrupts();
+                        continue;
                     }
 
-                    // After waking (or skipping wait), just continue the loop.
-                    // Next instruction will re-check interrupts.
+                    // Wait on MSIP word using Atomics.wait
+                    // If MSIP becomes 1 (IPI), returns "not-equal" immediately.
+                    // If MSIP stays 0, blocks until timeout.
+                    let view = &self.clint.view;
+                    let index = self.clint.msip_index(self.hart_id);
+                    let _ = js_sys::Atomics::wait_with_timeout(view, index, 0, timeout_ms.into());
+
+                    // Return Wfi to signal TypeScript to yield before next step_batch
+                    // This prevents busy-looping when the hart is idle
+                    return WorkerStepResult::Wfi;
                 }
                 Err(Trap::Fatal(msg)) => {
-                    web_sys::console::error_1(&JsValue::from_str(&format!(
-                        "[Worker {}] Fatal: {} at PC=0x{:x}",
-                        self.hart_id, msg, self.cpu.pc
-                    )));
                     self.control.signal_halted(0xDEAD);
                     return WorkerStepResult::Error;
                 }
-                Err(_trap) => {
+                Err(Trap::EnvironmentCallFromS) => {
+                    // CRITICAL FIX: Workers must invoke SBI handler for ecall instructions!
+                    if crate::sbi::handle_sbi_call(&mut self.cpu, &self.bus) {
+                        self.cpu.pc = self.cpu.pc.wrapping_add(4);
+                        self.step_count += 1;
+                    } else {
+                        self.step_count += 1;
+                    }
+                }
+                Err(trap) => {
                     // Architectural traps handled by CPU
                     self.step_count += 1;
                 }
@@ -267,6 +313,23 @@ impl WorkerState {
     pub fn hart_id(&self) -> usize {
         self.hart_id
     }
+
+    /// Get the a0 register value (for debugging hart ID passing).
+    pub fn get_a0(&self) -> u64 {
+        self.cpu.regs[10]
+    }
+
+    /// Check if MSIP is pending for this hart (for debugging).
+    pub fn is_msip_pending(&self) -> bool {
+        self.clint.get_msip(self.hart_id) != 0
+    }
+
+    /// Check if timer is pending for this hart (for debugging).
+    pub fn is_timer_pending(&self) -> bool {
+        let mtime = self.clint.mtime();
+        let mtimecmp = self.clint.get_mtimecmp(self.hart_id);
+        mtime >= mtimecmp
+    }
 }
 
 /// Legacy worker entry point - DEPRECATED.
@@ -288,11 +351,6 @@ pub fn worker_entry(hart_id: usize, shared_mem: JsValue, entry_pc: u64) {
             _ => break,
         }
     }
-
-    web_sys::console::log_1(&JsValue::from_str(&format!(
-        "[Worker {}] Exited after {} steps",
-        hart_id, state.step_count
-    )));
 }
 
 /// Check interrupts for this hart using the shared CLINT.

@@ -1,6 +1,21 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 
+/// Get current time in milliseconds (platform-specific).
+#[cfg(not(target_arch = "wasm32"))]
+fn now_millis() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn now_millis() -> u64 {
+    js_sys::Date::now() as u64
+}
+
 pub const CLINT_BASE: u64 = 0x0200_0000;
 pub const CLINT_SIZE: u64 = 0x10000;
 
@@ -25,10 +40,11 @@ const MTIME_INCREMENT: u64 = 256;
 pub const TICKS_PER_MS: u64 = 10_000;
 
 /// Per-hart WFI parking state.
-/// Contains a mutex/condvar pair for blocking on WFI.
+/// Contains a mutex/condvar pair for blocking on WFI, with an atomic flag
+/// to prevent lost wakeups when wake() is called before wait_for_interrupt().
 pub struct HartWakeup {
-    /// Mutex protecting the wakeup state (dummy, just for Condvar API).
-    lock: Mutex<()>,
+    /// Mutex protecting the wakeup state.
+    lock: Mutex<bool>,
     /// Condvar for blocking until interrupt arrives.
     cond: Condvar,
 }
@@ -36,26 +52,40 @@ pub struct HartWakeup {
 impl HartWakeup {
     pub const fn new() -> Self {
         Self {
-            lock: Mutex::new(()),
+            lock: Mutex::new(false),
             cond: Condvar::new(),
         }
     }
 
     /// Wait for an interrupt or timeout.
-    /// Returns immediately if an interrupt is already pending.
+    /// Returns immediately if a wakeup is already pending.
     pub fn wait_for_interrupt(&self, timeout_ms: u64) {
         if timeout_ms == 0 {
             return;
         }
-        let guard = self.lock.lock().unwrap();
+        
+        let mut guard = self.lock.lock().unwrap();
+        
+        // Check if a wakeup is already pending (set by wake() before we entered)
+        if *guard {
+            *guard = false; // Consume the pending wakeup
+            return;
+        }
+        
         let timeout = std::time::Duration::from_millis(timeout_ms);
-        let _ = self.cond.wait_timeout(guard, timeout);
+        let (guard, _result) = self.cond.wait_timeout(guard, timeout).unwrap();
+        // Clear the pending flag if it was set while we waited
+        drop(guard);
     }
 
     /// Wake up the hart (called when MSIP is set or timer fires).
+    /// Sets the pending flag to ensure the wakeup is not lost if called
+    /// before the hart enters wait_for_interrupt().
     pub fn wake(&self) {
-        // No need to hold the lock, just notify
+        let mut guard = self.lock.lock().unwrap();
+        *guard = true; // Mark wakeup as pending
         self.cond.notify_one();
+        drop(guard);
     }
 }
 
@@ -73,8 +103,9 @@ impl Default for HartWakeup {
 /// - mtime is shared but only incremented by hart 0
 /// - The weak memory ordering matches RISC-V's memory model
 pub struct Clint {
-    /// Machine timer counter - incremented by tick() every 256 CPU steps.
-    mtime: AtomicU64,
+    /// Start time in milliseconds for wall-clock based mtime.
+    /// mtime = (now_millis - start_time_ms) * 10_000 to get 10MHz tick rate.
+    start_time_ms: AtomicU64,
 
     /// Per-hart Machine Software Interrupt Pending bits.
     /// Only bit 0 is meaningful for each entry.
@@ -107,7 +138,7 @@ impl Clint {
         const WAKEUP: HartWakeup = HartWakeup::new();
 
         Self {
-            mtime: AtomicU64::new(0),
+            start_time_ms: AtomicU64::new(now_millis()),
             msip: [ZERO_U32; MAX_HARTS],
             mtimecmp: [MAX_U64; MAX_HARTS],
             num_harts: AtomicUsize::new(num_harts.min(MAX_HARTS)),
@@ -128,22 +159,32 @@ impl Clint {
     }
 
     /// Returns the current mtime value.
+    /// Wall-clock based: returns elapsed time at 10MHz tick rate.
     /// Lock-free for performance.
     #[inline]
     pub fn mtime(&self) -> u64 {
-        self.mtime.load(Ordering::Relaxed)
+        // Get elapsed milliseconds since start
+        let start = self.start_time_ms.load(Ordering::Relaxed);
+        let elapsed_ms = now_millis().saturating_sub(start);
+        // Convert to 10MHz ticks (10,000 ticks per millisecond)
+        elapsed_ms * 10_000
     }
 
     /// Sets mtime to a specific value (used for snapshot restore).
+    /// Adjusts start_time_ms so that mtime() returns the specified value.
     pub fn set_mtime(&self, val: u64) {
-        self.mtime.store(val, Ordering::Relaxed);
+        // val = elapsed_ms * 10_000, so elapsed_ms = val / 10_000
+        let target_elapsed_ms = val / 10_000;
+        // start_time_ms = now_millis - target_elapsed_ms
+        let new_start = now_millis().saturating_sub(target_elapsed_ms);
+        self.start_time_ms.store(new_start, Ordering::Relaxed);
     }
 
-    /// Advance mtime by one tick. Called once per CPU step.
-    /// Lock-free using atomic fetch_add.
+    /// Advance mtime by one tick. 
+    /// Now a no-op since mtime is wall-clock based.
     #[inline]
     pub fn tick(&self) {
-        self.mtime.fetch_add(MTIME_INCREMENT, Ordering::Relaxed);
+        // No-op: mtime is now wall-clock based
     }
 
     /// Backward compatibility: increment is now tick()
@@ -174,7 +215,7 @@ impl Clint {
             self.msip[hart].store(value & 1, Ordering::Release);
             // Wake the hart if setting MSIP (it may be sleeping in WFI)
             if value & 1 != 0 {
-                self.wakeups[hart].wake();
+                    self.wakeups[hart].wake();
             }
         }
     }
@@ -288,7 +329,7 @@ impl Clint {
         if hart_id >= MAX_HARTS {
             return false;
         }
-        let mtime = self.mtime.load(Ordering::Relaxed);
+        let mtime = self.mtime();
         let mtimecmp = self.mtimecmp[hart_id].load(Ordering::Relaxed);
         mtime >= mtimecmp
     }
@@ -311,7 +352,7 @@ impl Clint {
         if hart_id >= MAX_HARTS {
             return (false, false);
         }
-        let mtime = self.mtime.load(Ordering::Relaxed);
+        let mtime = self.mtime();
         let msip = (self.msip[hart_id].load(Ordering::Relaxed) & 1) != 0;
         let mtimecmp = self.mtimecmp[hart_id].load(Ordering::Relaxed);
         let timer = mtime >= mtimecmp;
@@ -329,14 +370,14 @@ impl Clint {
             // ============================================================
             // MTIME: 64-bit timer register
             // ============================================================
-            (MTIME_OFFSET, 8) => self.mtime.load(Ordering::Relaxed),
+            (MTIME_OFFSET, 8) => self.mtime(),
             (MTIME_OFFSET, 4) => {
                 // Low 32 bits
-                self.mtime.load(Ordering::Relaxed) & 0xFFFF_FFFF
+                self.mtime() & 0xFFFF_FFFF
             }
             (o, 4) if o == MTIME_OFFSET + 4 => {
                 // High 32 bits
-                self.mtime.load(Ordering::Relaxed) >> 32
+                self.mtime() >> 32
             }
 
             // ============================================================
@@ -457,8 +498,9 @@ impl Clint {
             (o, 4) if o >= MSIP_OFFSET && o < MSIP_OFFSET + (MAX_HARTS as u64 * 4) => {
                 let hart_idx = ((o - MSIP_OFFSET) / 4) as usize;
                 if hart_idx < MAX_HARTS {
-                    // Only bit 0 matters for MSIP (Machine Software Interrupt Pending)
-                    self.msip[hart_idx].store((value & 1) as u32, Ordering::Release);
+                    // Use set_msip which handles both storing the value AND
+                    // waking the hart if it's sleeping in WFI
+                    self.set_msip(hart_idx, value as u32);
                 }
             }
 

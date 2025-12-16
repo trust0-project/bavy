@@ -75,6 +75,7 @@ web-sys = { version = "0.3", features = [
 ] }
 js-sys = "0.3"
 wasm-bindgen-futures = "0.4"
+send_wrapper = "0.6"
 
 [build-dependencies]
 # napi-build is always included but only used when napi feature is enabled

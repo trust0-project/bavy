@@ -46,7 +46,33 @@ impl ExternalNetworkBackend {
     /// Called from JavaScript when the native addon receives a packet.
     pub fn inject_rx_packet(&self, packet: Vec<u8>) {
         if let Ok(mut state) = self.state.lock() {
+            // Log UDP packets (protocol 17) for DNS debugging
+            if packet.len() >= 24 && packet[23] == 17 {
+                let src_port = if packet.len() >= 36 {
+                    u16::from_be_bytes([packet[34], packet[35]])
+                } else { 0 };
+            }
             state.rx_queue.push_back(packet);
+        }
+    }
+
+    /// Queue a packet for transmission (from D1 EMAC bridging).
+    /// This is the same as NetworkBackend::send() but as an inherent method
+    /// so it can be called through Arc<Self>.
+    pub fn queue_tx_packet(&self, packet: Vec<u8>) {
+        if let Ok(mut state) = self.state.lock() {
+            // Log UDP packets (protocol 17) for DNS debugging
+            if packet.len() >= 24 && packet[23] == 17 {
+                let dst_port = if packet.len() >= 36 {
+                    u16::from_be_bytes([packet[36], packet[37]])
+                } else { 0 };
+                #[cfg(target_arch = "wasm32")]
+                web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+                    "[ExtBackend] TX: UDP packet {} bytes to port {}",
+                    packet.len(), dst_port
+                )));
+            }
+            state.tx_queue.push_back(packet);
         }
     }
 
@@ -55,6 +81,16 @@ impl ExternalNetworkBackend {
     pub fn extract_tx_packet(&self) -> Option<Vec<u8>> {
         if let Ok(mut state) = self.state.lock() {
             state.tx_queue.pop_front()
+        } else {
+            None
+        }
+    }
+
+    /// Extract a packet to be received by the guest.
+    /// Used for D1 EMAC bridging to get packets from the RX queue.
+    pub fn extract_rx_packet(&self) -> Option<Vec<u8>> {
+        if let Ok(mut state) = self.state.lock() {
+            state.rx_queue.pop_front()
         } else {
             None
         }
