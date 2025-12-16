@@ -41,6 +41,11 @@ pub const VIRTIO_BASE: u64 = 0x1000_1000;
 /// Size of each VirtIO MMIO region.
 pub const VIRTIO_STRIDE: u64 = 0x1000;
 
+/// RTC (Real-Time Clock) MMIO device base address.
+/// Provides host Unix timestamp to guest kernel.
+pub const RTC_BASE: u64 = 0x1010_0000;
+pub const RTC_SIZE: u64 = 0x8; // 8 bytes: low 32 bits + high 32 bits
+
 /// System bus trait for memory and MMIO access.
 ///
 /// All methods take `&self` to allow concurrent access from multiple harts.
@@ -318,6 +323,10 @@ pub struct SystemBus {
     /// Shared control region for D1 EMAC IP and other shared state
     #[cfg(target_arch = "wasm32")]
     pub shared_control: Option<crate::shared_mem::wasm::SharedControl>,
+    
+    /// RTC timestamp from host (Unix seconds since epoch)
+    /// Updated by the host each tick to provide wall-clock time to the guest
+    rtc_timestamp: std::sync::atomic::AtomicU64,
 }
 
 impl SystemBus {
@@ -343,6 +352,7 @@ impl SystemBus {
             shared_virtio: None,
             #[cfg(target_arch = "wasm32")]
             shared_control: None,
+            rtc_timestamp: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -412,6 +422,7 @@ impl SystemBus {
             shared_uart_input,
             shared_virtio,
             shared_control: Some(shared_control),
+            rtc_timestamp: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -427,6 +438,13 @@ impl SystemBus {
     /// This writes the hart count to a CLINT register so the kernel can read it.
     pub fn set_num_harts(&self, num_harts: usize) {
         self.clint.set_num_harts(num_harts);
+    }
+
+    /// Set the RTC timestamp from host.
+    /// Call this each tick with the current Unix timestamp (seconds since epoch).
+    /// The guest kernel can read this to display wall-clock time.
+    pub fn set_rtc_timestamp(&self, unix_secs: u64) {
+        self.rtc_timestamp.store(unix_secs, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Check interrupts for hart 0 (backward compatibility).
@@ -816,6 +834,17 @@ impl SystemBus {
             let offset = addr - SYSINFO_BASE;
             let val = self.sysinfo.load(offset, 4);
             return Ok(val as u32);
+        }
+
+        // RTC device - provides host timestamp to guest
+        if addr >= RTC_BASE && addr < RTC_BASE + RTC_SIZE {
+            let ts = self.rtc_timestamp.load(std::sync::atomic::Ordering::Relaxed);
+            let offset = addr - RTC_BASE;
+            return Ok(match offset {
+                0 => (ts & 0xFFFFFFFF) as u32,        // Low 32 bits
+                4 => ((ts >> 32) & 0xFFFFFFFF) as u32, // High 32 bits
+                _ => 0,
+            });
         }
 
         if addr >= CLINT_BASE && addr < CLINT_BASE + CLINT_SIZE {

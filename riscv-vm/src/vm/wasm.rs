@@ -997,6 +997,11 @@ impl WasmVm {
                 // Increment mtime in local CLINT (non-SAB single-hart mode)
                 self.bus.clint.tick();
             }
+            
+            // Update RTC with current host time
+            // js_sys::Date::now() returns milliseconds since Unix epoch
+            let unix_secs = (js_sys::Date::now() / 1000.0) as u64;
+            self.bus.set_rtc_timestamp(unix_secs);
         }
 
         // Execute one instruction on hart 0 only
