@@ -1,3 +1,13 @@
+## 0.3.4 (2025-12-16)
+
+### 🩹 Fixes
+
+- RTC clock exposed on VM Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([5569f84](https://github.com/trust0-project/bavy/commit/5569f84))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.3.3 (2025-12-16)
 
 ### 🩹 Fixes
