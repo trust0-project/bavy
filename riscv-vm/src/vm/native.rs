@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 /// Shared state between main thread and worker threads.
 ///
+/// 
 /// This struct is wrapped in Arc and shared across all threads.
 /// All fields use atomics for lock-free synchronization.
 ///
