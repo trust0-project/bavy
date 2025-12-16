@@ -1,3 +1,13 @@
+## 0.3.2 (2025-12-16)
+
+### 🩹 Fixes
+
+- changes wasm network Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([fce52f9](https://github.com/trust0-project/bavy/commit/fce52f9))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.3.1 (2025-12-16)
 
 ### 🩹 Fixes
