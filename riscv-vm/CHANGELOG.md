@@ -1,3 +1,13 @@
+## 0.3.1 (2025-12-16)
+
+### 🩹 Fixes
+
+- improve virtual machine Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([8303632](https://github.com/trust0-project/bavy/commit/8303632))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.3.0 (2025-12-12)
 
 ### 🚀 Features
