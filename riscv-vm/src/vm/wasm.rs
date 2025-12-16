@@ -150,6 +150,8 @@ pub struct WasmVm {
     external_net: Option<Arc<crate::net::external::ExternalNetworkBackend>>,
     /// VirtIO Input device reference (for sending key events)
     input_device: Option<Arc<crate::devices::virtio::VirtioInput>>,
+    /// WebTransport backend for browser-based networking (stores connection state)
+    wt_backend: Option<crate::net::webtransport::WebTransportBackend>,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -343,7 +345,7 @@ impl WasmVm {
             workers_signaled: false,
             external_net: None,
             input_device: None,
-
+            wt_backend: None,
         })
     }
 
@@ -608,19 +610,36 @@ impl WasmVm {
         cert_hash: Option<String>,
     ) -> Result<(), JsValue> {
         use crate::devices::d1_emac::D1EmacEmulated;
+        use crate::net::webtransport::WebTransportBackend;
+        use crate::net::NetworkBackend;
 
         // Status stays as Connecting until we can verify the connection is established
         self.net_status = NetworkStatus::Connecting;
 
-        // Create D1 EMAC device
-        let emac = D1EmacEmulated::new();
-        *self.bus.d1_emac.write().unwrap() = Some(emac);
+        // Create WebTransport backend - it auto-connects to the relay asynchronously
+        let mut backend = WebTransportBackend::new(url, cert_hash);
+        
+        // Initialize the backend (this starts the connection)
+        if let Err(e) = backend.init() {
+            web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(&format!(
+                "[VM] Failed to initialize WebTransport backend: {}",
+                e
+            )));
+        }
+        
+        // Get MAC from the WebTransport backend
+        let mac = backend.mac_address();
 
-        // TODO: Store backend and poll it to bridge packets to/from D1 EMAC
-        // For now, just log that D1 EMAC is enabled
+        // Create D1 EMAC device with the same MAC as the WebTransport backend
+        let emac = D1EmacEmulated::with_mac(mac);
+        *self.bus.d1_emac.write().unwrap() = Some(emac);
+        
+        // Store the backend for polling in step()
+        self.wt_backend = Some(backend);
+
         web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
-            "[VM] D1 EMAC enabled for network: {}",
-            url
+            "[VM] D1 EMAC enabled for network: {}, MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            url, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
         )));
 
         Ok(())
@@ -632,6 +651,7 @@ impl WasmVm {
         *self.bus.d1_emac.write().unwrap() = None;
         self.net_status = NetworkStatus::Disconnected;
         self.external_net = None;
+        self.wt_backend = None;
     }
 
     // ========================================================================
@@ -902,13 +922,47 @@ impl WasmVm {
             self.process_virtio_requests();
             
             // Poll D1 EMAC for DMA (if enabled) and bridge with external network
+            // First, handle WebTransport backend (browser mode)
+            if let Some(ref mut backend) = self.wt_backend {
+                use crate::net::NetworkBackend;
+                
+                // Check for IP assignment from the relay
+                if let Some(ip) = backend.get_assigned_ip() {
+                    if let Ok(mut emac) = self.bus.d1_emac.write() {
+                        if let Some(ref mut dev) = *emac {
+                            // Only set IP once (when it changes from None)
+                            if dev.get_ip().is_none() {
+                                dev.set_ip(ip);
+                                self.net_status = NetworkStatus::Connected;
+                                web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+                                    "[VM] IP assigned from relay: {}.{}.{}.{}",
+                                    ip[0], ip[1], ip[2], ip[3]
+                                )));
+                            }
+                        }
+                    }
+                }
+                
+                // Bridge RX packets from WebTransport relay to D1 EMAC
+                while let Ok(Some(packet)) = backend.recv() {
+                    if let Ok(mut emac) = self.bus.d1_emac.write() {
+                        if let Some(ref mut dev) = *emac {
+                            dev.queue_rx_packet(packet);
+                        }
+                    }
+                }
+            }
+            
             if let Ok(mut emac) = self.bus.d1_emac.write() {
                 if let Some(ref mut emac) = *emac {
-                    if let Some(ref backend) = self.external_net {
-                        // Step 1: Inject RX packets from relay into D1 EMAC RX queue
-                        // (so poll_dma can deliver them to the kernel)
-                        while let Some(packet) = backend.extract_rx_packet() {
-                            emac.queue_rx_packet(packet);
+                    // Bridge RX from external_net (Node.js mode) if not using wt_backend
+                    if self.wt_backend.is_none() {
+                        if let Some(ref backend) = self.external_net {
+                            // Step 1: Inject RX packets from relay into D1 EMAC RX queue
+                            // (so poll_dma can deliver them to the kernel)
+                            while let Some(packet) = backend.extract_rx_packet() {
+                                emac.queue_rx_packet(packet);
+                            }
                         }
                     }
                     
@@ -916,11 +970,20 @@ impl WasmVm {
                     emac.poll_dma(&self.bus.dram);
                     
                     // Step 3: Extract TX packets that poll_dma just read from kernel
-                    // and forward them to the relay via external_net
-                    if let Some(ref backend) = self.external_net {
-                        let tx_packets = emac.get_tx_packets();
-                        for packet in tx_packets {
-                            backend.queue_tx_packet(packet);
+                    // and forward them to the relay
+                    let tx_packets = emac.get_tx_packets();
+                    if !tx_packets.is_empty() {
+                        // Try WebTransport backend first (browser mode)
+                        if let Some(ref backend) = self.wt_backend {
+                            use crate::net::NetworkBackend;
+                            for packet in tx_packets {
+                                let _ = backend.send(&packet);
+                            }
+                        } else if let Some(ref backend) = self.external_net {
+                            // Fallback to external_net (Node.js mode)
+                            for packet in tx_packets {
+                                backend.queue_tx_packet(packet);
+                            }
                         }
                     }
                 }
