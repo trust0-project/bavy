@@ -254,10 +254,7 @@ impl Uart {
                     let mut tx = self.tx.lock().unwrap();
                     tx.thre_ip = false;
                     Self::update_interrupts_internal(&mut regs, &rx, &tx);
-                    log::trace!("[UART] IIR read cleared THRE ip");
-                } else {
-                    log::trace!("[UART] IIR read val={:x}", val);
-                }
+                } 
                 Ok(val as u64)
             }
             LCR => Ok(self.regs.lock().unwrap().lcr as u64),
@@ -281,16 +278,6 @@ impl Uart {
                 if (regs.lcr & 0x80) != 0 {
                     regs.dll = val;
                 } else {
-                    // Write to TX FIFO
-                    log::trace!(
-                        "[UART] TX '{}' (0x{:02x})",
-                        if val.is_ascii_graphic() {
-                            val as char
-                        } else {
-                            '.'
-                        },
-                        val
-                    );
                     let rx = self.rx.lock().unwrap();
                     let mut tx = self.tx.lock().unwrap();
                     tx.fifo.push_back(val);

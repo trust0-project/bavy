@@ -1288,11 +1288,6 @@ impl WasmVm {
 
         // Then check local UART (hart 0 output)
         let byte = self.bus.uart.pop_output();
-        // Uncomment for debugging UART output:
-        // if let Some(b) = byte {
-        //     web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
-        //         &format!("[UART] Output: {:02x} '{}'", b, if b.is_ascii_graphic() { b as char } else { '.' })));
-        // }
         byte
     }
 
