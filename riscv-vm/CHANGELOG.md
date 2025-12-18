@@ -1,3 +1,13 @@
+## 0.3.6 (2025-12-18)
+
+### 🩹 Fixes
+
+- expose get_gpu_ditrty_rect Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([0dd6a6e](https://github.com/trust0-project/bavy/commit/0dd6a6e))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.3.5 (2025-12-18)
 
 ### 🩹 Fixes
