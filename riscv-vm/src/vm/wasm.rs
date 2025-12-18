@@ -601,6 +601,35 @@ impl WasmVm {
         Some(view)
     }
 
+    /// Get the dirty rectangle from the last frame flush.
+    /// 
+    /// Returns [min_x, min_y, max_x, max_y] or None if no dirty region.
+    /// The kernel writes this to 0x80FF_FFE0 each time it flushes the framebuffer.
+    /// This allows the browser to do partial texture uploads for better performance.
+    pub fn get_gpu_dirty_rect(&self) -> Option<js_sys::Uint32Array> {
+        // Dirty rect is stored at 0x80FF_FFE0 by the kernel (4 x u32)
+        const DIRTY_RECT_PHYS_ADDR: u64 = 0x80FF_FFE0;
+        
+        let dram_offset = DIRTY_RECT_PHYS_ADDR - crate::bus::DRAM_BASE;
+        
+        // Read 4 u32 values: min_x, min_y, max_x, max_y
+        let min_x = self.bus.dram.load_32(dram_offset).ok()?;
+        let min_y = self.bus.dram.load_32(dram_offset + 4).ok()?;
+        let max_x = self.bus.dram.load_32(dram_offset + 8).ok()?;
+        let max_y = self.bus.dram.load_32(dram_offset + 12).ok()?;
+        
+        // Return None if dirty rect is invalid (max <= min means nothing dirty)
+        if max_x <= min_x || max_y <= min_y {
+            return None;
+        }
+        
+        let arr = js_sys::Uint32Array::new_with_length(4);
+        arr.set_index(0, min_x);
+        arr.set_index(1, min_y);
+        arr.set_index(2, max_x);
+        arr.set_index(3, max_y);
+        Some(arr)
+    }
 
     /// Connect to a WebTransport relay server.
     /// Note: Connection is asynchronous. Check network_status() to monitor connection state.
