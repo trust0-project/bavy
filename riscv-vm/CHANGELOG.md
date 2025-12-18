@@ -1,3 +1,13 @@
+## 0.3.5 (2025-12-18)
+
+### 🩹 Fixes
+
+- remove debug lines Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([5b2987f](https://github.com/trust0-project/bavy/commit/5b2987f))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.3.4 (2025-12-16)
 
 ### 🩹 Fixes

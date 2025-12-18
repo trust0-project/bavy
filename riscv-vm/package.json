@@ -1,6 +1,6 @@
 {
   "name": "virtual-machine",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "description": "RISCV Virtual Machine with WASM and Node.js native support",
   "bin": "build/cli.js",
   "publishConfig": {
