@@ -867,37 +867,7 @@ impl WasmVm {
         self.net_status
     }
 
-    /// Process pending VirtIO MMIO requests from workers.
-    /// 
-    /// Workers write VirtIO requests to shared memory slots.
-    /// This method processes those requests using local devices and writes responses.
-    fn process_virtio_requests(&mut self) {
-        // Skip if not in SMP mode - no workers to submit requests
-        // Also skip if no shared memory or no VirtIO devices
-        if self.num_harts <= 1 || self.shared_buffer.is_none() || self.bus.virtio_devices.is_empty() {
-            return;
-        }
 
-        let shared_buffer = self.shared_buffer.as_ref().unwrap();
-        let shared_virtio = crate::shared_mem::wasm::SharedVirtioMmio::new(shared_buffer, 0);
-
-        shared_virtio.process_pending(|device_idx, offset, is_write, value| {
-            let idx = device_idx as usize;
-            if idx >= self.bus.virtio_devices.len() {
-                // No device at this index - return 0 for unmapped reads
-                return 0;
-            }
-
-            if is_write {
-                // Handle write
-                let _ = self.bus.virtio_devices[idx].write(offset, value, &self.bus.dram);
-                0
-            } else {
-                // Handle read
-                self.bus.virtio_devices[idx].read(offset).unwrap_or(0)
-            }
-        });
-    }
 
     /// Execute one instruction on hart 0 (primary hart).
     ///
@@ -946,9 +916,6 @@ impl WasmVm {
         self.poll_counter = self.poll_counter.wrapping_add(1);
         if self.poll_counter % 100 == 0 {
             self.bus.poll_virtio();
-
-            // Process VirtIO requests from workers (SMP mode only)
-            self.process_virtio_requests();
             
             // Poll D1 EMAC for DMA (if enabled) and bridge with external network
             // First, handle WebTransport backend (browser mode)
@@ -1031,6 +998,24 @@ impl WasmVm {
             // js_sys::Date::now() returns milliseconds since Unix epoch
             let unix_secs = (js_sys::Date::now() / 1000.0) as u64;
             self.bus.set_rtc_timestamp(unix_secs);
+            
+            // Sync CLINT interrupt state to CPU's MIP during periodic poll.
+            // This ensures timer/software interrupts are visible when the kernel reads sip.
+            // Use direct CSR array access (bypassing privilege check - we're emulating hardware).
+            const CSR_MIP: usize = 0x344;
+            if let Some(ref clint) = self.shared_clint {
+                let (msip, timer) = clint.check_interrupts(0);
+                if msip || timer {
+                    let mut mip = self.cpu.csrs[CSR_MIP];
+                    if msip {
+                        mip |= 1 << 1; // SSIP
+                    }
+                    if timer {
+                        mip |= 1 << 5; // STIP
+                    }
+                    self.cpu.csrs[CSR_MIP] = mip;
+                }
+            }
         }
 
         // Execute one instruction on hart 0 only
@@ -1069,12 +1054,12 @@ impl WasmVm {
                 if let Some(ref clint) = self.shared_clint {
                     let (msip, timer) = clint.check_interrupts(0);
                     if msip || timer {
-                        // Deliver interrupts via MIP CSR so CPU can take the trap
-                        if let Ok(mut mip) = self.cpu.read_csr(0x344) { // MIP
-                            if msip { mip |= 1 << 3; } // MSIP
-                            if timer { mip |= 1 << 7; } // MTIP
-                            let _ = self.cpu.write_csr(0x344, mip);
-                        }
+                        // Deliver interrupts directly to MIP CSR
+                        const CSR_MIP: usize = 0x344;
+                        let mut mip = self.cpu.csrs[CSR_MIP];
+                        if msip { mip |= 1 << 1; } // SSIP
+                        if timer { mip |= 1 << 5; } // STIP
+                        self.cpu.csrs[CSR_MIP] = mip;
                         
                         // Check if the CPU can actually take this interrupt (not masked)
                         if self.cpu.check_pending_interrupt().is_some() {

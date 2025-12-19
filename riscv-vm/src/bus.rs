@@ -317,9 +317,6 @@ pub struct SystemBus {
     /// Shared UART input for WASM workers (receives keyboard input from main thread)
     #[cfg(target_arch = "wasm32")]
     shared_uart_input: Option<crate::shared_mem::wasm::SharedUartInput>,
-    /// Shared VirtIO MMIO proxy for workers (routes VirtIO accesses to main thread)
-    #[cfg(target_arch = "wasm32")]
-    shared_virtio: Option<crate::shared_mem::wasm::SharedVirtioMmio>,
     /// Shared control region for D1 EMAC IP and other shared state
     #[cfg(target_arch = "wasm32")]
     pub shared_control: Option<crate::shared_mem::wasm::SharedControl>,
@@ -348,8 +345,6 @@ impl SystemBus {
             shared_uart_output: None,
             #[cfg(target_arch = "wasm32")]
             shared_uart_input: None,
-            #[cfg(target_arch = "wasm32")]
-            shared_virtio: None,
             #[cfg(target_arch = "wasm32")]
             shared_control: None,
             rtc_timestamp: std::sync::atomic::AtomicU64::new(0),
@@ -395,15 +390,7 @@ impl SystemBus {
             None
         };
 
-        // Create shared VirtIO MMIO proxy for workers - main thread has local devices
-        let shared_virtio = if is_worker {
-            Some(crate::shared_mem::wasm::SharedVirtioMmio::new(&buffer, hart_id))
-        } else {
-            None
-        };
-
         // Create shared control for D1 EMAC IP and other shared state
-        // Both main thread and workers need this
         let shared_control = crate::shared_mem::wasm::SharedControl::new(&buffer);
 
         Self {
@@ -420,7 +407,6 @@ impl SystemBus {
             shared_clint: Some(shared_clint),
             shared_uart_output: Some(shared_uart_output),
             shared_uart_input,
-            shared_virtio,
             shared_control: Some(shared_control),
             rtc_timestamp: std::sync::atomic::AtomicU64::new(0),
         }
@@ -739,17 +725,7 @@ impl SystemBus {
             return Ok(((word >> shift) & 0xff) as u8);
         }
 
-        // For workers: Route VirtIO accesses through shared memory proxy
-        #[cfg(target_arch = "wasm32")]
-        if let Some(ref shared_virtio) = self.shared_virtio {
-            if let Some(offset) = self.is_virtio_region(addr) {
-                let device_idx = ((addr - VIRTIO_BASE) / VIRTIO_STRIDE) as u32;
-                let aligned = offset & !3;
-                let word = shared_virtio.virtio_read(device_idx, aligned);
-                let shift = ((offset & 3) * 8) as u64;
-                return Ok(((word >> shift) & 0xff) as u8);
-            }
-        }
+
 
         // Unmapped VirtIO slots return 0 (allows safe probing)
         if self.is_virtio_region(addr).is_some() {
@@ -804,17 +780,7 @@ impl SystemBus {
             return Ok(((word >> shift) & 0xffff) as u16);
         }
 
-        // For workers: Route VirtIO accesses through shared memory proxy
-        #[cfg(target_arch = "wasm32")]
-        if let Some(ref shared_virtio) = self.shared_virtio {
-            if let Some(offset) = self.is_virtio_region(addr) {
-                let device_idx = ((addr - VIRTIO_BASE) / VIRTIO_STRIDE) as u32;
-                let aligned = offset & !3;
-                let word = shared_virtio.virtio_read(device_idx, aligned);
-                let shift = ((offset & 3) * 8) as u64;
-                return Ok(((word >> shift) & 0xffff) as u16);
-            }
-        }
+
 
         // Unmapped VirtIO slots return 0 (allows safe probing)
         if self.is_virtio_region(addr).is_some() {
@@ -962,15 +928,7 @@ impl SystemBus {
             return Ok(val as u32);
         }
 
-        // For workers: Route VirtIO accesses through shared memory proxy
-        #[cfg(target_arch = "wasm32")]
-        if let Some(ref shared_virtio) = self.shared_virtio {
-            if let Some(offset) = self.is_virtio_region(addr) {
-                let device_idx = ((addr - VIRTIO_BASE) / VIRTIO_STRIDE) as u32;
-                let val = shared_virtio.virtio_read(device_idx, offset);
-                return Ok(val as u32);
-            }
-        }
+
 
         // Unmapped VirtIO slots return 0 (allows safe probing)
         if self.is_virtio_region(addr).is_some() {
@@ -1026,16 +984,7 @@ impl SystemBus {
             return Ok((low as u64) | ((high as u64) << 32));
         }
 
-        // For workers: Route VirtIO accesses through shared memory proxy
-        #[cfg(target_arch = "wasm32")]
-        if let Some(ref shared_virtio) = self.shared_virtio {
-            if let Some(offset) = self.is_virtio_region(addr) {
-                let device_idx = ((addr - VIRTIO_BASE) / VIRTIO_STRIDE) as u32;
-                let low = shared_virtio.virtio_read(device_idx, offset);
-                let high = shared_virtio.virtio_read(device_idx, offset + 4);
-                return Ok((low as u64) | ((high as u64) << 32));
-            }
-        }
+
 
         // Unmapped VirtIO slots return 0 (allows safe probing)
         if self.is_virtio_region(addr).is_some() {
@@ -1259,15 +1208,7 @@ impl SystemBus {
             return Ok(());
         }
 
-        // For workers: Route VirtIO writes through shared memory proxy
-        #[cfg(target_arch = "wasm32")]
-        if let Some(ref shared_virtio) = self.shared_virtio {
-            if let Some(offset) = self.is_virtio_region(addr) {
-                let device_idx = ((addr - VIRTIO_BASE) / VIRTIO_STRIDE) as u32;
-                shared_virtio.virtio_write(device_idx, offset, val as u64);
-                return Ok(());
-            }
-        }
+
 
         // Writes to unmapped VirtIO slots are silently ignored (allows safe probing)
         if self.is_virtio_region(addr).is_some() {

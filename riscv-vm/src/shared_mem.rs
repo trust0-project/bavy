@@ -39,16 +39,12 @@ pub const UART_OUTPUT_REGION_SIZE: usize = 4096;
 /// Size of the shared UART input region in bytes (4KB).
 pub const UART_INPUT_REGION_SIZE: usize = 4096;
 
-/// Size of the VirtIO MMIO proxy region in bytes (8KB).
-/// Provides request/response slots for workers to proxy VirtIO accesses through hart 0.
-pub const VIRTIO_MMIO_REGION_SIZE: usize = 8192;
 
 /// Total header size before DRAM starts.
 pub const HEADER_SIZE: usize = CONTROL_REGION_SIZE
     + CLINT_REGION_SIZE
     + UART_OUTPUT_REGION_SIZE
-    + UART_INPUT_REGION_SIZE
-    + VIRTIO_MMIO_REGION_SIZE;
+    + UART_INPUT_REGION_SIZE;
 
 // ============================================================================
 // Shared UART Output Region Offsets
@@ -83,45 +79,7 @@ pub const UART_INPUT_BUFFER_OFFSET: usize = 8;
 /// UART input: buffer capacity (region size minus header)
 pub const UART_INPUT_BUFFER_CAPACITY: usize = UART_INPUT_REGION_SIZE - UART_INPUT_BUFFER_OFFSET;
 
-// ============================================================================
-// VirtIO MMIO Proxy Region Offsets
-// ============================================================================
 
-/// Offset of the VirtIO MMIO proxy region from start of SharedArrayBuffer.
-pub const VIRTIO_MMIO_REGION_OFFSET: usize = CONTROL_REGION_SIZE
-    + CLINT_REGION_SIZE
-    + UART_OUTPUT_REGION_SIZE
-    + UART_INPUT_REGION_SIZE;
-
-/// Size of each VirtIO MMIO request slot (32 bytes).
-/// Layout:
-///   0x00: status (i32) - 0=empty, 1=pending, 2=complete
-///   0x04: hart_id (i32) - requesting hart (for debugging)
-///   0x08: is_write (i32) - 0=read, 1=write
-///   0x0C: device_idx (i32) - VirtIO device slot (0-7)
-///   0x10: offset_lo (i32) - register offset low 32 bits
-///   0x14: offset_hi (i32) - register offset high 32 bits
-///   0x18: value_lo (i32) - value low 32 bits (write input / read result)
-///   0x1C: value_hi (i32) - value high 32 bits
-pub const VIRTIO_SLOT_SIZE: usize = 32;
-
-/// Maximum number of VirtIO request slots (one per hart, up to MAX_HARTS)
-pub const VIRTIO_MAX_SLOTS: usize = 128;
-
-/// VirtIO slot field offsets (in i32 units from slot start)
-pub const VIRTIO_SLOT_STATUS: u32 = 0;
-pub const VIRTIO_SLOT_HART_ID: u32 = 1;
-pub const VIRTIO_SLOT_IS_WRITE: u32 = 2;
-pub const VIRTIO_SLOT_DEVICE_IDX: u32 = 3;
-pub const VIRTIO_SLOT_OFFSET_LO: u32 = 4;
-pub const VIRTIO_SLOT_OFFSET_HI: u32 = 5;
-pub const VIRTIO_SLOT_VALUE_LO: u32 = 6;
-pub const VIRTIO_SLOT_VALUE_HI: u32 = 7;
-
-/// VirtIO slot status values
-pub const VIRTIO_STATUS_EMPTY: i32 = 0;
-pub const VIRTIO_STATUS_PENDING: i32 = 1;
-pub const VIRTIO_STATUS_COMPLETE: i32 = 2;
 
 
 // ============================================================================
@@ -959,146 +917,6 @@ pub mod wasm {
         }
     }
 
-    /// Shared VirtIO MMIO proxy for workers to access VirtIO devices on hart 0.
-    ///
-    /// Workers use this to send VirtIO MMIO read/write requests to the main thread.
-    /// The main thread processes these requests and writes responses back.
-    pub struct SharedVirtioMmio {
-        /// View of the entire SharedArrayBuffer as Int32Array for Atomics
-        view: Int32Array,
-        /// Hart ID of this worker (used to select slot)
-        hart_id: usize,
-    }
-
-    // SAFETY: SharedVirtioMmio uses SharedArrayBuffer and JavaScript Atomics
-    unsafe impl Send for SharedVirtioMmio {}
-    unsafe impl Sync for SharedVirtioMmio {}
-
-    impl SharedVirtioMmio {
-        /// Create a new SharedVirtioMmio for a specific hart.
-        pub fn new(buffer: &SharedArrayBuffer, hart_id: usize) -> Self {
-            Self {
-                view: Int32Array::new(buffer),
-                hart_id,
-            }
-        }
-
-        /// Get the i32 index for a slot field.
-        #[inline]
-        fn slot_field_index(&self, slot: usize, field: u32) -> u32 {
-            let slot_byte_offset = VIRTIO_MMIO_REGION_OFFSET + slot * VIRTIO_SLOT_SIZE;
-            (slot_byte_offset / 4) as u32 + field
-        }
-
-        /// Perform a VirtIO MMIO read via shared memory proxy.
-        /// This blocks until the main thread processes the request.
-        pub fn virtio_read(&self, device_idx: u32, offset: u64) -> u64 {
-            let slot = self.hart_id % VIRTIO_MAX_SLOTS;
-            
-            // Write request to slot
-            let _ = Atomics::store(&self.view, self.slot_field_index(slot, VIRTIO_SLOT_HART_ID), self.hart_id as i32);
-            let _ = Atomics::store(&self.view, self.slot_field_index(slot, VIRTIO_SLOT_IS_WRITE), 0);
-            let _ = Atomics::store(&self.view, self.slot_field_index(slot, VIRTIO_SLOT_DEVICE_IDX), device_idx as i32);
-            let _ = Atomics::store(&self.view, self.slot_field_index(slot, VIRTIO_SLOT_OFFSET_LO), offset as i32);
-            let _ = Atomics::store(&self.view, self.slot_field_index(slot, VIRTIO_SLOT_OFFSET_HI), (offset >> 32) as i32);
-            let _ = Atomics::store(&self.view, self.slot_field_index(slot, VIRTIO_SLOT_VALUE_LO), 0);
-            let _ = Atomics::store(&self.view, self.slot_field_index(slot, VIRTIO_SLOT_VALUE_HI), 0);
-            
-            // Set status to pending (this signals the main thread)
-            let _ = Atomics::store(&self.view, self.slot_field_index(slot, VIRTIO_SLOT_STATUS), VIRTIO_STATUS_PENDING);
-            
-            // Poll until complete
-            let status_idx = self.slot_field_index(slot, VIRTIO_SLOT_STATUS);
-            loop {
-                let status = Atomics::load(&self.view, status_idx).unwrap_or(0);
-                if status == VIRTIO_STATUS_COMPLETE {
-                    break;
-                }
-                // Yield to prevent busy-spin from starving other threads
-                std::hint::spin_loop();
-            }
-            
-            // Read result
-            let lo = Atomics::load(&self.view, self.slot_field_index(slot, VIRTIO_SLOT_VALUE_LO)).unwrap_or(0) as u32 as u64;
-            let hi = Atomics::load(&self.view, self.slot_field_index(slot, VIRTIO_SLOT_VALUE_HI)).unwrap_or(0) as u32 as u64;
-            
-            // Release slot
-            let _ = Atomics::store(&self.view, status_idx, VIRTIO_STATUS_EMPTY);
-            
-            lo | (hi << 32)
-        }
-
-        /// Perform a VirtIO MMIO write via shared memory proxy.
-        /// This blocks until the main thread processes the request.
-        pub fn virtio_write(&self, device_idx: u32, offset: u64, value: u64) {
-            let slot = self.hart_id % VIRTIO_MAX_SLOTS;
-            
-            // Write request to slot
-            let _ = Atomics::store(&self.view, self.slot_field_index(slot, VIRTIO_SLOT_HART_ID), self.hart_id as i32);
-            let _ = Atomics::store(&self.view, self.slot_field_index(slot, VIRTIO_SLOT_IS_WRITE), 1);
-            let _ = Atomics::store(&self.view, self.slot_field_index(slot, VIRTIO_SLOT_DEVICE_IDX), device_idx as i32);
-            let _ = Atomics::store(&self.view, self.slot_field_index(slot, VIRTIO_SLOT_OFFSET_LO), offset as i32);
-            let _ = Atomics::store(&self.view, self.slot_field_index(slot, VIRTIO_SLOT_OFFSET_HI), (offset >> 32) as i32);
-            let _ = Atomics::store(&self.view, self.slot_field_index(slot, VIRTIO_SLOT_VALUE_LO), value as i32);
-            let _ = Atomics::store(&self.view, self.slot_field_index(slot, VIRTIO_SLOT_VALUE_HI), (value >> 32) as i32);
-            
-            // Set status to pending (this signals the main thread)
-            let _ = Atomics::store(&self.view, self.slot_field_index(slot, VIRTIO_SLOT_STATUS), VIRTIO_STATUS_PENDING);
-            
-            // Poll until complete
-            let status_idx = self.slot_field_index(slot, VIRTIO_SLOT_STATUS);
-            loop {
-                let status = Atomics::load(&self.view, status_idx).unwrap_or(0);
-                if status == VIRTIO_STATUS_COMPLETE {
-                    break;
-                }
-                std::hint::spin_loop();
-            }
-            
-            // Release slot
-            let _ = Atomics::store(&self.view, status_idx, VIRTIO_STATUS_EMPTY);
-        }
-
-        /// Process pending VirtIO requests (called by main thread).
-        /// Returns the number of requests processed.
-        pub fn process_pending<F>(&self, mut handler: F) -> usize
-        where
-            F: FnMut(u32, u64, bool, u64) -> u64,
-        {
-            let mut count = 0;
-            for slot in 0..VIRTIO_MAX_SLOTS {
-                let status_idx = self.slot_field_index(slot, VIRTIO_SLOT_STATUS);
-                let status = Atomics::load(&self.view, status_idx).unwrap_or(0);
-                
-                if status == VIRTIO_STATUS_PENDING {
-                    // Read request
-                    let device_idx = Atomics::load(&self.view, self.slot_field_index(slot, VIRTIO_SLOT_DEVICE_IDX)).unwrap_or(0) as u32;
-                    let is_write = Atomics::load(&self.view, self.slot_field_index(slot, VIRTIO_SLOT_IS_WRITE)).unwrap_or(0) != 0;
-                    let offset_lo = Atomics::load(&self.view, self.slot_field_index(slot, VIRTIO_SLOT_OFFSET_LO)).unwrap_or(0) as u32 as u64;
-                    let offset_hi = Atomics::load(&self.view, self.slot_field_index(slot, VIRTIO_SLOT_OFFSET_HI)).unwrap_or(0) as u32 as u64;
-                    let offset = offset_lo | (offset_hi << 32);
-                    let value_lo = Atomics::load(&self.view, self.slot_field_index(slot, VIRTIO_SLOT_VALUE_LO)).unwrap_or(0) as u32 as u64;
-                    let value_hi = Atomics::load(&self.view, self.slot_field_index(slot, VIRTIO_SLOT_VALUE_HI)).unwrap_or(0) as u32 as u64;
-                    let value = value_lo | (value_hi << 32);
-                    
-                    // Call handler
-                    let result = handler(device_idx, offset, is_write, value);
-                    
-                    // Write result (for reads)
-                    if !is_write {
-                        let _ = Atomics::store(&self.view, self.slot_field_index(slot, VIRTIO_SLOT_VALUE_LO), result as i32);
-                        let _ = Atomics::store(&self.view, self.slot_field_index(slot, VIRTIO_SLOT_VALUE_HI), (result >> 32) as i32);
-                    }
-                    
-                    // Mark complete
-                    let _ = Atomics::store(&self.view, status_idx, VIRTIO_STATUS_COMPLETE);
-                    count += 1;
-                }
-            }
-            count
-        }
-    }
-
     /// Initialize the shared memory region.
     ///
     /// Sets up the control region, CLINT, and shared UART output with default values.
@@ -1152,14 +970,6 @@ pub mod wasm {
         let uart_in_base_i32 = (UART_INPUT_REGION_OFFSET / 4) as u32;
         let _ = Atomics::store(&view, uart_in_base_i32 + UART_INPUT_WRITE_IDX, 0);
         let _ = Atomics::store(&view, uart_in_base_i32 + UART_INPUT_READ_IDX, 0);
-
-        // Initialize VirtIO MMIO proxy region
-        // All slots start empty
-        let virtio_base_i32 = (VIRTIO_MMIO_REGION_OFFSET / 4) as u32;
-        for slot in 0..VIRTIO_MAX_SLOTS {
-            let slot_offset = ((VIRTIO_SLOT_SIZE / 4) * slot) as u32;
-            let _ = Atomics::store(&view, virtio_base_i32 + slot_offset + VIRTIO_SLOT_STATUS, VIRTIO_STATUS_EMPTY);
-        }
     }
 }
 

@@ -156,10 +156,21 @@ impl WorkerState {
             // Workers can start - cache this permanently
             self.workers_started = true;
             
-            // DEBUG: Check MSIP right after start signal to verify SAB visibility
-            let msip_at_start = self.clint.get_msip(self.hart_id);
-            let (msip_check, timer_check) = self.clint.check_interrupts(self.hart_id);
+            // CRITICAL: Check for pending interrupts immediately!
+            // The kernel may have sent IPIs during boot (before workers started).
+            // We must deliver them now so the kernel's S-mode interrupt handler
+            // can run and secondary harts can enter their hart_loop.
+            let (msip_at_start, timer_at_start) = self.clint.check_interrupts(self.hart_id);
+            if msip_at_start || timer_at_start {
+                self.deliver_interrupts();
+            }
         }
+
+        // CRITICAL: Sync CLINT interrupt state to CPU's MIP at EVERY batch start.
+        // This ensures that when the kernel executes `csrr sip`, it immediately sees
+        // SSIP/STIP reflecting the current CLINT MSIP/MTIP state. Without this,
+        // the kernel may read an outdated SIP and miss interrupts (race condition).
+        self.deliver_interrupts();
 
         // Execute batch of instructions with reduced atomic operation frequency
         for i in 0..batch_size {
@@ -255,8 +266,18 @@ impl WorkerState {
                     let index = self.clint.msip_index(self.hart_id);
                     let _ = js_sys::Atomics::wait_with_timeout(view, index, 0, timeout_ms.into());
 
-                    // Return Wfi to signal TypeScript to yield before next step_batch
-                    // This prevents busy-looping when the hart is idle
+                    // After waking (IPI, timer, or timeout), check if an interrupt is pending
+                    // CRITICAL: We must check and deliver here, not just return Wfi!
+                    // Otherwise IPIs that arrived via Atomics.notify() get ignored.
+                    let (msip_after, timer_after) = self.clint.check_interrupts(self.hart_id);
+                    if msip_after || timer_after {
+                        // IPI or timer woke us - deliver the interrupt and continue
+                        self.deliver_interrupts();
+                        continue;
+                    }
+
+                    // No pending interrupts - return Wfi to signal TypeScript to yield briefly
+                    // This prevents busy-looping when the hart is truly idle
                     return WorkerStepResult::Wfi;
                 }
                 Err(Trap::Fatal(msg)) => {
@@ -291,16 +312,19 @@ impl WorkerState {
     fn deliver_interrupts(&mut self) {
         let (msip_pending, timer_pending) = self.clint.check_interrupts(self.hart_id);
         if msip_pending || timer_pending {
-            if let Ok(mut mip) = self.cpu.read_csr(0x344) {
-                // MIP
-                if msip_pending {
-                    mip |= 1 << 3; // MSIP
-                }
-                if timer_pending {
-                    mip |= 1 << 7; // MTIP
-                }
-                let _ = self.cpu.write_csr(0x344, mip);
+            // Access MIP CSR directly (bypassing privilege check since we're emulating
+            // hardware interrupt delivery, not guest code). MIP is at CSR address 0x344.
+            const CSR_MIP: usize = 0x344;
+            let mut mip = self.cpu.csrs[CSR_MIP];
+            
+            if msip_pending {
+                mip |= 1 << 1; // SSIP - Supervisor Software Interrupt
             }
+            if timer_pending {
+                mip |= 1 << 5; // STIP - Supervisor Timer Interrupt
+            }
+            
+            self.cpu.csrs[CSR_MIP] = mip;
         }
     }
 
@@ -368,10 +392,10 @@ pub fn worker_check_interrupts(hart_id: usize, shared_mem: JsValue) -> u64 {
     let (msip, timer) = clint.check_interrupts(hart_id);
 
     if msip {
-        mip |= 1 << 3; // MSIP
+        mip |= 1 << 1; // SSIP - Supervisor Software Interrupt (for S-mode kernel)
     }
     if timer {
-        mip |= 1 << 7; // MTIP
+        mip |= 1 << 5; // STIP - Supervisor Timer Interrupt (for S-mode kernel)
     }
 
     mip

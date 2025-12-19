@@ -403,6 +403,21 @@ impl NativeVm {
         let mut count = 0u64;
         let hart_id: usize = 0; // Hart 0 runs on main thread
 
+        // CRITICAL: Sync CLINT interrupt state to CPU's MIP at batch start.
+        // Access MIP directly (bypassing privilege check since this is hardware delivery).
+        const CSR_MIP: usize = 0x344;
+        let (msip, timer) = self.bus.clint.check_interrupts_for_hart(hart_id);
+        if msip || timer {
+            let mut mip = cpu.csrs[CSR_MIP];
+            if msip {
+                mip |= 1 << 1; // SSIP
+            }
+            if timer {
+                mip |= 1 << 5; // STIP
+            }
+            cpu.csrs[CSR_MIP] = mip;
+        }
+
         for _ in 0..max_steps {
             match cpu.step(&*self.bus) {
                 Ok(()) => {
@@ -418,9 +433,19 @@ impl NativeVm {
                     // WFI: Advance PC past the instruction
                     cpu.pc = cpu.pc.wrapping_add(4);
 
-                    // Check if interrupts are already pending
+                    // Check if interrupts are already pending from CLINT
                     let (msip, timer) = self.bus.clint.check_interrupts_for_hart(hart_id);
                     if msip || timer {
+                        // Deliver CLINT interrupts directly to MIP CSR
+                        let mut mip = cpu.csrs[CSR_MIP];
+                        if msip {
+                            mip |= 1 << 1; // SSIP
+                        }
+                        if timer {
+                            mip |= 1 << 5; // STIP
+                        }
+                        cpu.csrs[CSR_MIP] = mip;
+                        
                         // Check if the CPU can actually take this interrupt (not masked)
                         if cpu.check_pending_interrupt().is_some() {
                             // Interrupt is enabled - continue to take trap
@@ -582,6 +607,21 @@ fn execute_batch_worker(
 ) -> (u64, Option<HaltReason>) {
     let mut count = 0u64;
 
+    // CRITICAL: Sync CLINT interrupt state to CPU's MIP at batch start.
+    // Access MIP directly (bypassing privilege check since this is hardware delivery).
+    const CSR_MIP: usize = 0x344;
+    let (msip, timer) = bus.clint.check_interrupts_for_hart(hart_id);
+    if msip || timer {
+        let mut mip = cpu.csrs[CSR_MIP];
+        if msip {
+            mip |= 1 << 1; // SSIP
+        }
+        if timer {
+            mip |= 1 << 5; // STIP
+        }
+        cpu.csrs[CSR_MIP] = mip;
+    }
+
     for _ in 0..max_steps {
         match cpu.step(bus) {
             Ok(()) => {
@@ -597,9 +637,19 @@ fn execute_batch_worker(
                 // WFI: Advance PC past the instruction
                 cpu.pc = cpu.pc.wrapping_add(4);
 
-                // Check if interrupts are already pending
+                // Check if interrupts are already pending from CLINT
                 let (msip, timer) = bus.clint.check_interrupts_for_hart(hart_id);
                 if msip || timer {
+                    // Deliver CLINT interrupts directly to MIP CSR
+                    let mut mip = cpu.csrs[CSR_MIP];
+                    if msip {
+                        mip |= 1 << 1; // SSIP
+                    }
+                    if timer {
+                        mip |= 1 << 5; // STIP
+                    }
+                    cpu.csrs[CSR_MIP] = mip;
+                    
                     // Check if the CPU can actually take this interrupt (not masked)
                     if cpu.check_pending_interrupt().is_some() {
                         // Interrupt is enabled - continue to take trap

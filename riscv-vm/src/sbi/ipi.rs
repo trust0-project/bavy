@@ -63,10 +63,12 @@ fn send_ipi(cpu: &Cpu, bus: &dyn Bus) -> SbiRet {
     }
 
     // Set MSIP for each target hart
+    log::debug!("SBI_IPI: send_ipi hart_mask=0x{:x}, base={}", hart_mask, hart_mask_base);
     for bit in 0..64 {
         if (hart_mask & (1 << bit)) != 0 {
             let hart_id = hart_mask_base as u64 + bit;
             let msip_addr = CLINT_BASE + MSIP_OFFSET + hart_id * 4;
+            log::debug!("SBI_IPI: Setting MSIP for hart {}", hart_id);
             let _ = bus.write32(msip_addr, 1);
         }
     }
