@@ -9,3 +9,4 @@ pub mod d1_mmc;
 pub mod d1_display;
 pub mod d1_emac;
 pub mod d1_touch;
+pub mod d1_audio;

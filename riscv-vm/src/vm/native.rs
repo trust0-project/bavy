@@ -120,6 +120,7 @@ impl NativeVm {
             has_mmc: false,     // Will be updated via load_disk()
             has_emac: true,     // Always enabled for kernel probing
             has_touch: true,    // Touch input always enabled
+            has_audio: false,   // Will be updated via enable_audio()
         };
         let dtb = crate::dtb::generate_dtb(num_harts, DRAM_SIZE as u64, &d1_config);
         let dtb_address = crate::dtb::write_dtb_to_dram(&bus.dram, &dtb);

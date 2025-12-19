@@ -50,6 +50,8 @@ pub struct D1DeviceConfig {
     pub has_emac: bool,
     /// D1 I2C2 + GT911 touchscreen
     pub has_touch: bool,
+    /// D1 Audio Codec
+    pub has_audio: bool,
 }
 
 /// Generate a minimal DTB for the RISC-V VM.
@@ -228,6 +230,17 @@ pub fn generate_dtb(
         builder.end_node(); // i2c
     }
     
+    // D1 Audio Codec @ 0x0203_0000
+    if d1_config.has_audio {
+        builder.begin_node("codec@2030000");
+        builder.add_prop_string("compatible", "allwinner,sun20i-d1-codec");
+        builder.add_prop_reg64(0x0203_0000, 0x1000);
+        builder.add_prop_u32("interrupts", 32); // Audio codec interrupt
+        builder.add_prop_u32("interrupt-parent", 100);
+        builder.add_prop_string("status", "okay");
+        builder.end_node();
+    }
+    
     builder.end_node(); // /soc
     builder.end_node(); // /
     
@@ -403,6 +416,8 @@ mod tests {
             has_display: true,
             has_mmc: true,
             has_emac: true,
+            has_touch: true,
+            has_audio: true,
         };
         let dtb = generate_dtb(2, 512 * 1024 * 1024, &config);
         

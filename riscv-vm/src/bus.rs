@@ -11,6 +11,7 @@ use crate::devices::d1_mmc::{D1MmcEmulated, D1_MMC0_BASE, D1_MMC0_SIZE};
 use crate::devices::d1_display::{D1DisplayEmulated, D1_DE_BASE, D1_DE_SIZE, D1_MIPI_DSI_BASE, D1_MIPI_DSI_SIZE, D1_DPHY_BASE, D1_DPHY_SIZE, D1_TCON_LCD0, D1_TCON_SIZE};
 use crate::devices::d1_emac::{D1EmacEmulated, D1_EMAC_BASE, D1_EMAC_SIZE};
 use crate::devices::d1_touch::{D1TouchEmulated, D1_I2C2_BASE, D1_I2C2_SIZE};
+use crate::devices::d1_audio::{D1AudioEmulated, D1_AUDIO_BASE, D1_AUDIO_SIZE};
 use std::sync::RwLock;
 
 #[cfg(target_arch = "wasm32")]
@@ -307,6 +308,7 @@ pub struct SystemBus {
     pub d1_display: RwLock<Option<D1DisplayEmulated>>,
     pub d1_emac: RwLock<Option<D1EmacEmulated>>,
     pub d1_touch: RwLock<Option<D1TouchEmulated>>,
+    pub d1_audio: RwLock<Option<D1AudioEmulated>>,
     
     /// Shared CLINT for WASM workers (routes CLINT accesses to SharedArrayBuffer)
     #[cfg(target_arch = "wasm32")]
@@ -339,6 +341,7 @@ impl SystemBus {
             d1_display: RwLock::new(None),
             d1_emac: RwLock::new(None),
             d1_touch: RwLock::new(None),
+            d1_audio: RwLock::new(None),
             #[cfg(target_arch = "wasm32")]
             shared_clint: None,
             #[cfg(target_arch = "wasm32")]
@@ -404,6 +407,7 @@ impl SystemBus {
             d1_display: RwLock::new(None),
             d1_emac: RwLock::new(None),
             d1_touch: RwLock::new(None),
+            d1_audio: RwLock::new(None),
             shared_clint: Some(shared_clint),
             shared_uart_output: Some(shared_uart_output),
             shared_uart_input,
@@ -881,6 +885,16 @@ impl SystemBus {
             return Ok(0);
         }
 
+        // D1 Audio Codec (0x0203_0000 - 0x0203_0FFF)
+        if addr >= D1_AUDIO_BASE && addr < D1_AUDIO_BASE + D1_AUDIO_SIZE {
+            if let Ok(audio) = self.d1_audio.read() {
+                if let Some(ref dev) = *audio {
+                    return Ok(dev.mmio_read32(addr));
+                }
+            }
+            return Ok(0);
+        }
+
         // D1 Display Engine (0x0510_0000 - 0x051F_FFFF)
         if addr >= D1_DE_BASE && addr < D1_DE_BASE + D1_DE_SIZE {
             if let Ok(disp) = self.d1_display.read() {
@@ -1150,6 +1164,17 @@ impl SystemBus {
         if addr >= D1_I2C2_BASE && addr < D1_I2C2_BASE + D1_I2C2_SIZE {
             if let Ok(mut touch) = self.d1_touch.write() {
                 if let Some(ref mut dev) = *touch {
+                    dev.mmio_write32(addr, val);
+                    return Ok(());
+                }
+            }
+            return Ok(());
+        }
+
+        // D1 Audio Codec (0x0203_0000 - 0x0203_0FFF)
+        if addr >= D1_AUDIO_BASE && addr < D1_AUDIO_BASE + D1_AUDIO_SIZE {
+            if let Ok(mut audio) = self.d1_audio.write() {
+                if let Some(ref mut dev) = *audio {
                     dev.mmio_write32(addr, val);
                     return Ok(());
                 }

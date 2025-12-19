@@ -292,6 +292,7 @@ impl WasmVm {
             has_mmc: false,     // Will be updated via load_disk()
             has_emac: true,     // Always enabled for kernel probing
             has_touch: true,    // Touch input always enabled
+            has_audio: false,   // Will be updated via enable_audio()
         };
         let dtb = crate::dtb::generate_dtb(num_harts, DRAM_SIZE as u64, &d1_config);
         let dtb_address = crate::dtb::write_dtb_to_dram(&bus.dram, &dtb);
@@ -310,18 +311,9 @@ impl WasmVm {
             num_harts, entry_pc, dtb_address, sab_available
         )));
 
-        // Always initialize D1 EMAC so kernel can probe it (regardless of network connection)
-        {
-            use crate::devices::d1_emac::D1EmacEmulated;
-            let emac = D1EmacEmulated::new();
-            *bus.d1_emac.write().unwrap() = Some(emac);
-        }
-
         // Always initialize D1 Touch for input events
         {
-            use crate::devices::d1_touch::D1TouchEmulated;
-            let touch = D1TouchEmulated::new();
-            *bus.d1_touch.write().unwrap() = Some(touch);
+
         }
 
         Ok(WasmVm {
@@ -374,13 +366,99 @@ impl WasmVm {
     /// * `height` - Display height in pixels (ignored, uses 1024x768)
     pub fn enable_gpu(&mut self, _width: u32, _height: u32) {
         use crate::devices::d1_display::D1DisplayEmulated;
-        
+        use crate::devices::d1_touch::D1TouchEmulated;
+
         let display = D1DisplayEmulated::new();
+        let touch = D1TouchEmulated::new();
+
         *self.bus.d1_display.write().unwrap() = Some(display);
+        *self.bus.d1_touch.write().unwrap() = Some(touch);
         
         web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
             "[VM] D1 Display enabled (1024x768)"
         ));
+    }
+
+    /// Enable D1 Audio Codec device for audio playback.
+    ///
+    /// The audio device allows the kernel to write audio samples which can
+    /// then be played via WebAudio in the browser. Use `get_audio_samples()`
+    /// to retrieve buffered samples for playback.
+    pub fn enable_audio(&mut self) {
+        use crate::devices::d1_audio::D1AudioEmulated;
+        
+        let audio = D1AudioEmulated::new();
+        *self.bus.d1_audio.write().unwrap() = Some(audio);
+        
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
+            "[VM] D1 Audio Codec enabled"
+        ));
+    }
+
+    /// Enable D1 EMAC (Ethernet MAC) device for network hardware access.
+    ///
+    /// This initializes the D1 EMAC device so the kernel can probe and find
+    /// network hardware during boot. Should be called before the kernel starts
+    /// executing if network support is desired.
+    ///
+    /// Note: This only enables the EMAC hardware emulation. To actually connect
+    /// to a network, use `connect_webtransport()` or `setup_external_network()`.
+    pub fn enable_emac(&mut self) {
+        use crate::devices::d1_emac::D1EmacEmulated;
+        
+        let emac = D1EmacEmulated::new();
+        *self.bus.d1_emac.write().unwrap() = Some(emac);
+        
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
+            "[VM] D1 EMAC device enabled"
+        ));
+    }
+
+    /// Get buffered audio samples for playback.
+    ///
+    /// Returns a Float32Array of interleaved stereo samples (left, right, left, right, ...).
+    /// Sample values are in the range [-1.0, 1.0].
+    ///
+    /// Call this periodically (e.g., from an AudioWorklet) to drain the audio buffer.
+    /// Returns None if no audio device is enabled or no samples are available.
+    pub fn get_audio_samples(&self, max_samples: u32) -> Option<js_sys::Float32Array> {
+        if let Ok(audio) = self.bus.d1_audio.read() {
+            if let Some(ref dev) = *audio {
+                let samples = dev.extract_samples(max_samples as usize);
+                if samples.is_empty() {
+                    return None;
+                }
+                let arr = js_sys::Float32Array::new_with_length(samples.len() as u32);
+                arr.copy_from(&samples);
+                return Some(arr);
+            }
+        }
+        None
+    }
+
+    /// Get current audio buffer fill level.
+    ///
+    /// Returns the number of sample pairs (stereo frames) currently buffered.
+    /// Useful for monitoring buffer health in the JavaScript audio worklet.
+    pub fn get_audio_buffer_level(&self) -> u32 {
+        if let Ok(audio) = self.bus.d1_audio.read() {
+            if let Some(ref dev) = *audio {
+                return dev.buffer_level() as u32;
+            }
+        }
+        0
+    }
+
+    /// Get audio sample rate.
+    ///
+    /// Returns the sample rate configured by the kernel (default: 48000 Hz).
+    pub fn get_audio_sample_rate(&self) -> u32 {
+        if let Ok(audio) = self.bus.d1_audio.read() {
+            if let Some(ref dev) = *audio {
+                return dev.sample_rate();
+            }
+        }
+        48000 // Default
     }
 
     /// Enable VirtIO Input device for keyboard input.
