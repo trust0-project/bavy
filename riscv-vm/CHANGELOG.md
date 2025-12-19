@@ -1,3 +1,13 @@
+## 0.3.8 (2025-12-19)
+
+### 🩹 Fixes
+
+- vm threading Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([c9c7dd2](https://github.com/trust0-project/bavy/commit/c9c7dd2))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.3.7 (2025-12-19)
 
 ### 🩹 Fixes
