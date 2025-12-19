@@ -1,3 +1,13 @@
+## 0.3.7 (2025-12-19)
+
+### 🩹 Fixes
+
+- improve emulation and system bus for shared resources Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([b9195d4](https://github.com/trust0-project/bavy/commit/b9195d4))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.3.6 (2025-12-18)
 
 ### 🩹 Fixes
