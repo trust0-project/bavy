@@ -1,3 +1,13 @@
+## 0.4.0 (2025-12-20)
+
+### 🚀 Features
+
+- cross platform GUI system Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([e060a54](https://github.com/trust0-project/bavy/commit/e060a54))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.3.8 (2025-12-19)
 
 ### 🩹 Fixes
