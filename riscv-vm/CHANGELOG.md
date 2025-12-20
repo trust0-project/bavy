@@ -1,3 +1,13 @@
+## 0.4.1 (2025-12-20)
+
+### 🩹 Fixes
+
+- vm performance improvements Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([36b3cde](https://github.com/trust0-project/bavy/commit/36b3cde))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.4.0 (2025-12-20)
 
 ### 🚀 Features
