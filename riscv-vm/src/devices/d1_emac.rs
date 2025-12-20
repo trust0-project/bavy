@@ -331,19 +331,6 @@ impl D1EmacEmulated {
                 } else {
                     0  // No IP assigned yet
                 };
-                #[cfg(target_arch = "wasm32")]
-                {
-                    // Log when kernel reads IP config (first 3 times only to avoid spam)
-                    static READ_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                    let count = READ_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    if count < 3 {
-                        let msg = format!(
-                            "[D1 EMAC] mmio_read32(0x100) = 0x{:08x} (IP: {:?})",
-                            result, self.assigned_ip
-                        );
-                        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&msg));
-                    }
-                }
                 result
             }
             _ => 0,

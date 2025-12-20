@@ -238,23 +238,7 @@ pub mod wasm {
                 return 0;
             }
             let offset = msip_offset(hart_id);
-            let val = (self.load_i32(offset) & 1) as u32;
-
-            // DEBUG: Log first few MSIP reads for Hart 8 to verify visibility
-            // We use a shared counter hack or just check logic
-            if hart_id == 8 {
-                 static HART8_READ_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                 let count = HART8_READ_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                 // Log transitions (0->1 or 1->0) or just first few
-                 // This is tricky because this is called frequently
-                 if count < 50 || (count % 1000 == 0 && val == 1) {
-                     web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
-                        "[SharedClint] get_msip(8) #{}: val={}",
-                        count, val
-                    )));
-                 }
-            }
-            val
+            (self.load_i32(offset) & 1) as u32
         }
 
         /// Set MSIP for a hart (IPI).
@@ -262,15 +246,6 @@ pub mod wasm {
             if hart_id >= MAX_HARTS {
                 return;
             }
-            
-            // DEBUG: Log Hart 8 MSIP writes to confirm IPI delivery
-            if hart_id == 8 {
-                web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
-                    "[SharedClint] set_msip(8, {}) - IPI SENT TO HART 8",
-                    value
-                )));
-            }
-            
             let offset = msip_offset(hart_id);
             self.store_i32(offset, (value & 1) as i32);
             // Wake up the hart if it's sleeping in WFI (waiting on this MSIP word)

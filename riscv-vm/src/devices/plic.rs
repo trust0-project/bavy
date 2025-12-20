@@ -384,39 +384,46 @@ impl Plic {
     // ============================================================
 
     pub fn load(&self, offset: u64, size: u64) -> Result<u64, MemoryError> {
-        let mut state = self.state.lock().unwrap();
         if size != 4 {
             return Ok(0);
         }
 
+        // Fast path: use atomic caches for common read-only registers
+        // This avoids mutex acquisition for frequent polling
+        
         // Priority registers: 0x000000 .. 0x0000FC (4 bytes each)
         if offset < 0x001000 {
             let idx = (offset >> 2) as usize;
             if idx < NUM_SOURCES {
-                return Ok(state.priority[idx] as u64);
+                return Ok(self.priority_cached(idx) as u64);
             }
         }
+        
         // Pending bits: 0x001000
         if offset == 0x001000 {
-            return Ok(state.pending as u64);
+            return Ok(self.pending_cached() as u64);
         }
+        
         // Enable per context: 0x002000 + 0x80 * context
         if offset >= 0x002000 && offset < 0x002000 + 0x80 * (NUM_CONTEXTS as u64) {
             let ctx = ((offset - 0x002000) / 0x80) as usize;
             let inner = (offset - 0x002000) % 0x80;
             if ctx < NUM_CONTEXTS && inner == 0 {
-                return Ok(state.enable[ctx] as u64);
+                return Ok(self.enable_cached(ctx) as u64);
             }
         }
+        
         // Context registers: threshold @ 0x200000 + 0x1000 * ctx, claim @ +4
         if offset >= 0x200000 {
             let ctx = ((offset - 0x200000) / 0x1000) as usize;
             if ctx < NUM_CONTEXTS {
                 let base = 0x200000 + (0x1000 * ctx as u64);
                 if offset == base {
-                    return Ok(state.threshold[ctx] as u64);
+                    return Ok(self.threshold_cached(ctx) as u64);
                 }
+                // Claim requires mutex - modifies state
                 if offset == base + 4 {
+                    let mut state = self.state.lock().unwrap();
                     let claim = Self::claim_interrupt_for_internal(&mut state, ctx);
                     if Self::debug_trace() {
                         eprintln!("[PLIC] SCLAIM ctx={} -> {}", ctx, claim);

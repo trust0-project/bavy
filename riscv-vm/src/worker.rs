@@ -126,7 +126,8 @@ impl WorkerState {
         // Check intervals - reduce atomic operations overhead
         // Higher values = better performance, but less responsive to signals
         const HALT_CHECK_INTERVAL: u32 = 10_000;
-        const INTERRUPT_CHECK_INTERVAL: u32 = 5_000;
+        // Reduced from 5000 to 2000 for better IPI responsiveness
+        const INTERRUPT_CHECK_INTERVAL: u32 = 2_000;
 
         // Increment and log batch count for debugging
         self.batch_count += 1;

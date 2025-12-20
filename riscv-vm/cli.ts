@@ -337,19 +337,10 @@ async function createVm(
       const macBytes = nativeNetClient.macBytes();
       if (typeof vm.setup_external_network === 'function') {
         vm.setup_external_network(new Uint8Array(macBytes));
-        console.error(`[Network] External network setup with native WebTransport`);
-        console.error(`[Network] MAC: ${nativeNetClient.macAddress()}`);
-        console.error(`[Network] Connecting to ${relayUrl}...`);
       } else {
-        console.error('[Network] VM does not support external network (rebuild WASM)');
         nativeNetClient.shutdown();
         nativeNetClient = null;
       }
-    } else {
-      // Fall back to WASM WebTransport (won't work in Node.js but try anyway)
-      console.error('[Network] Warning: Native WebTransport addon not available');
-      console.error('[Network] WebTransport requires the native addon in Node.js');
-      console.error('[Network] Build the addon with: cd riscv-vm && npm run build:native');
     }
   }
 
@@ -464,13 +455,11 @@ function runVmLoop(vm: any, nativeNetClient: any | null, workers: Worker[] = [])
     if (!networkConnected && nativeNetClient.isRegistered()) {
       networkConnected = true;
       const ip = nativeNetClient.assignedIp();
-      console.error(`\r\n[Network] Connected! IP: ${ip}`);
 
       // Set IP in VM's external network backend
       const ipBytes = nativeNetClient.assignedIpBytes();
       if (ipBytes && typeof vm.set_external_network_ip === 'function') {
-        const result = vm.set_external_network_ip(new Uint8Array(ipBytes));
-        console.error(`[Network] set_external_network_ip called, result: ${result}`);
+        vm.set_external_network_ip(new Uint8Array(ipBytes));
       }
     }
 
@@ -658,9 +647,6 @@ async function runVmWithGui(vm: any, nativeNetClient: any | null, workers: Worke
     // Check connection status and propagate IP assignment
     if (!networkConnected && nativeNetClient.isRegistered && nativeNetClient.isRegistered()) {
       networkConnected = true;
-      const ip = nativeNetClient.assignedIp ? nativeNetClient.assignedIp() : 'unknown';
-      console.error(`\r\n[Network] Connected! IP: ${ip}`);
-
       const ipBytes = nativeNetClient.assignedIpBytes ? nativeNetClient.assignedIpBytes() : null;
       if (ipBytes && typeof vm.set_external_network_ip === 'function') {
         vm.set_external_network_ip(new Uint8Array(ipBytes));

@@ -87,7 +87,7 @@ impl Cpu {
             poll_counter: 0,
             decode_cache: [None; DECODE_CACHE_SIZE],
             block_cache: BlockCache::new(),
-            use_blocks: false, // Disabled by default; enable for production workloads
+            use_blocks: true, // Disabled by default; enable for production workloads
         }
     }
 

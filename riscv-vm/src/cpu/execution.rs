@@ -66,33 +66,33 @@ impl Cpu {
     fn try_execute_block(&mut self, bus: &dyn Bus) -> Option<Result<(), Trap>> {
         let pc = self.pc;
 
-        // Check block cache for existing block
-        if let Some(block) = self.block_cache.get(pc) {
-            // Clone needed values to avoid borrow issues
-            let block_start_pc = block.start_pc;
-            let block_len = block.len;
-            let block_byte_len = block.byte_len;
-            let block_ops: [MicroOp; MAX_BLOCK_SIZE] = block.ops;
+        // Check block cache for existing block (single lookup with exec_count update)
+        if let Some(block) = self.block_cache.get_and_touch(pc) {
+            // Execute directly from cached block - no cloning needed!
+            // We copy the block fields we need to avoid borrow checker issues
+            // with self.execute_block_inner needing &mut self
+            let start_pc = block.start_pc;
+            let start_pa = block.start_pa;
+            let len = block.len;
+            let byte_len = block.byte_len;
+            let generation = block.generation;
+            
+            // Copy only the ops slice we need, not the full array
+            // This is still a copy but unavoidable due to borrow checker
+            let mut ops_copy = [MicroOp::Fence; MAX_BLOCK_SIZE];
+            ops_copy[..len as usize].copy_from_slice(&block.ops[..len as usize]);
 
-            // Create a temporary block for execution
             let exec_block = Block {
-                start_pc: block_start_pc,
-                start_pa: block.start_pa,
-                len: block_len,
-                byte_len: block_byte_len,
-                ops: block_ops,
+                start_pc,
+                start_pa,
+                len,
+                byte_len,
+                ops: ops_copy,
                 exec_count: 0,
-                generation: block.generation,
+                generation,
             };
 
-            // Execute the block
             let result = self.execute_block_inner(&exec_block, bus);
-
-            // Update execution count
-            if let Some(cached_block) = self.block_cache.get_mut(pc) {
-                cached_block.exec_count = cached_block.exec_count.saturating_add(1);
-            }
-
             return Some(self.handle_block_result(result, bus));
         }
 

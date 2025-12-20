@@ -112,6 +112,22 @@ impl BlockCache {
         self.blocks.get_mut(&pc).map(|b| &mut **b)
     }
 
+    /// Look up a block and increment its exec_count in a single operation.
+    /// This is more efficient than separate get() + get_mut() calls.
+    /// Returns a reference to the block if found and valid.
+    #[inline]
+    pub fn get_and_touch(&mut self, pc: u64) -> Option<&Block> {
+        if let Some(block) = self.blocks.get_mut(&pc) {
+            if block.generation == self.generation {
+                self.hits += 1;
+                block.exec_count = block.exec_count.saturating_add(1);
+                return Some(&**block);
+            }
+        }
+        self.misses += 1;
+        None
+    }
+
     /// Clear the entire cache.
     pub fn clear(&mut self) {
         self.blocks.clear();
