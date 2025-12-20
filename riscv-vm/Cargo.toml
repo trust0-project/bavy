@@ -7,9 +7,11 @@ edition = "2024"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = []
+default = ["gui"]
 #  Enable Node.js native addon via napi-rs (for WebTransport in Node.js)
 napi = ["napi-rs", "napi-derive"]
+# Enable GUI window for framebuffer rendering
+gui = ["minifb"]
 
 [dependencies]
 log = "0.4"
@@ -41,6 +43,8 @@ futures = "0.3"
 # Windowing for native GPU rendering
 winit = "0.30"
 pollster = "0.4"
+# Simple framebuffer window (optional, for GUI feature)
+minifb = { version = "0.27", optional = true }
 
 # Unix-only dependencies (tun-tap doesn't support Windows)
 [target.'cfg(all(not(target_arch = "wasm32"), unix))'.dependencies]

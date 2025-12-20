@@ -6,6 +6,13 @@ use std::path::PathBuf;
 use riscv_vm::sdboot;
 use riscv_vm::vm::native::NativeVm;
 
+#[cfg(feature = "gui")]
+use std::sync::Arc;
+#[cfg(feature = "gui")]
+use std::thread;
+#[cfg(feature = "gui")]
+use minifb::{Key, MouseButton, MouseMode, Window, WindowOptions, Scale};
+
 #[derive(Parser, Debug)]
 #[command(name = "riscv-vm")]
 #[command(about = "RISCV emulator with SMP support")]
@@ -26,6 +33,14 @@ struct Args {
     /// Certificate hash for WebTransport (for self-signed certs)
     #[arg(long)]
     cert_hash: Option<String>,
+
+    /// Enable GPU display (opens a window)
+    #[arg(long)]
+    enable_gpu: bool,
+
+    /// Window scale factor (1, 2, or 4) - only with --enable-gpu
+    #[arg(long, default_value = "1")]
+    scale: u8,
 
     /// Enable debug output
     #[arg(long)]
@@ -58,6 +73,14 @@ macro_rules! uart_println {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
+    // Check if GUI is requested but feature not enabled
+    #[cfg(not(feature = "gui"))]
+    if args.enable_gpu {
+        eprintln!("Error: --enable-gpu requires the 'gui' feature.");
+        eprintln!("Rebuild with: cargo build --features gui");
+        std::process::exit(1);
+    }
+
     // Initialize logging
     if args.debug {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
@@ -87,7 +110,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Print banner
     uart_println!();
     uart_println!("╔══════════════════════════════════════════════════════════════╗");
-    uart_println!("║  RISCV-VM with OpenSBI                                       ║");
+    if args.enable_gpu {
+        uart_println!("║  RISCV-VM with OpenSBI (GUI)                                 ║");
+    } else {
+        uart_println!("║  RISCV-VM with OpenSBI                                       ║");
+    }
     uart_println!("╠══════════════════════════════════════════════════════════════╣");
     uart_println!(
         "║  SD Card: {:52} ║",
@@ -115,12 +142,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     vm.load_disk(sdcard_data);
     uart_println!("[VM] SD card mounted (fs partition at sector {})", boot_info.fs_partition_start);
 
+    // Enable GPU if requested
+    if args.enable_gpu {
+        vm.enable_gpu(1024, 768);
+    }
+
     // Connect to WebTransport relay if specified
     if let Some(relay_url) = &args.net_webtransport {
         vm.connect_webtransport(relay_url, args.cert_hash.clone());
     }
 
-    // Run VM
+    // Run VM - with or without GUI
+    #[cfg(feature = "gui")]
+    if args.enable_gpu {
+        run_with_gui(vm, args.scale)?;
+    } else {
+        run_headless(vm);
+    }
+
+    #[cfg(not(feature = "gui"))]
+    run_headless(vm);
+
+    Ok(())
+}
+
+/// Run VM in headless mode (no GUI)
+fn run_headless(mut vm: NativeVm) {
     vm.run();
 
     // Report exit status
@@ -128,11 +175,141 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if halt_code == 0x5555 {
         uart_println!();
         uart_println!("[VM] Clean shutdown (PASS)");
-        Ok(())
     } else {
         uart_println!();
         uart_println!("[VM] Shutdown with code: {:#x}", halt_code);
-        Ok(())
     }
 }
+
+/// Run VM with GUI window
+#[cfg(feature = "gui")]
+fn run_with_gui(mut vm: NativeVm, scale_factor: u8) -> Result<(), Box<dyn std::error::Error>> {
+    let (width, height) = (1024, 768);
+    let scale = match scale_factor {
+        2 => Scale::X2,
+        4 => Scale::X4,
+        _ => Scale::X1,
+    };
+    
+    let mut window = Window::new(
+        "RISC-V VM",
+        width,
+        height,
+        WindowOptions {
+            scale,
+            ..WindowOptions::default()
+        },
+    )?;
+
+    // Limit to ~60 FPS
+    window.set_target_fps(60);
+
+    uart_println!("[GUI] Window opened ({}x{}, scale {})", width, height, scale_factor);
+
+    // Get shared state and bus for GUI thread
+    let shared = Arc::clone(&vm.shared);
+    let bus = Arc::clone(vm.bus());
+
+    // Run the VM in a separate thread
+    let vm_thread = thread::spawn(move || {
+        vm.run();
+    });
+
+    // Main GUI loop - polls framebuffer and updates window
+    let mut last_frame_version: u32 = 0;
+    let mut last_mouse_pressed = false;
+
+    while window.is_open() && !window.is_key_down(Key::Escape) {
+        // Check for VM halt
+        if shared.is_halted() {
+            break;
+        }
+
+        // Handle mouse/touch input
+        let mouse_pressed = window.get_mouse_down(MouseButton::Left);
+        if let Some((mx, my)) = window.get_mouse_pos(MouseMode::Clamp) {
+            let x = mx as u32;
+            let y = my as u32;
+            
+            // Send touch events to the D1 touch controller
+            if mouse_pressed && !last_mouse_pressed {
+                // Mouse down
+                if let Ok(mut touch) = bus.d1_touch.write() {
+                    if let Some(ref mut dev) = *touch {
+                        dev.push_touch(x as u16, y as u16, true);
+                    }
+                }
+            } else if !mouse_pressed && last_mouse_pressed {
+                // Mouse up
+                if let Ok(mut touch) = bus.d1_touch.write() {
+                    if let Some(ref mut dev) = *touch {
+                        dev.push_touch(x as u16, y as u16, false);
+                    }
+                }
+            }
+        }
+        last_mouse_pressed = mouse_pressed;
+
+        // Drain UART output to console
+        for byte in bus.uart.drain_output() {
+            if byte == b'\n' {
+                print!("\r\n");
+            } else {
+                print!("{}", byte as char);
+            }
+        }
+        let _ = std::io::stdout().flush();
+
+        // Read frame version from guest memory
+        const FRAME_VERSION_PHYS_ADDR: u64 = 0x80FF_FFFC;
+        let dram_offset = FRAME_VERSION_PHYS_ADDR - riscv_vm::bus::DRAM_BASE;
+        let frame_version = bus.dram.load_32(dram_offset).unwrap_or(0);
+
+        // Update frame only if changed
+        if frame_version != last_frame_version {
+            last_frame_version = frame_version;
+            
+            // Read framebuffer from guest memory
+            const FRAMEBUFFER_PHYS_ADDR: u64 = 0x8100_0000;
+            const FB_SIZE_BYTES: usize = 1024 * 768 * 4;
+            let fb_offset = (FRAMEBUFFER_PHYS_ADDR - riscv_vm::bus::DRAM_BASE) as usize;
+            
+            if let Ok(bytes) = bus.dram.read_range(fb_offset, FB_SIZE_BYTES) {
+                // Convert RGBA u8 to ARGB u32 for minifb
+                let frame: Vec<u32> = bytes.chunks_exact(4).map(|c| {
+                    ((c[3] as u32) << 24) | ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | (c[2] as u32)
+                }).collect();
+                
+                if let Err(e) = window.update_with_buffer(&frame, width, height) {
+                    eprintln!("[GUI] Failed to update window: {}", e);
+                    break;
+                }
+            }
+        } else {
+            // Still need to update window to process events
+            window.update();
+        }
+    }
+
+    // Signal VM to stop
+    shared.request_halt();
+
+    // Wait for VM thread to finish
+    uart_println!();
+    uart_println!("[GUI] Window closed, waiting for VM to stop...");
+    
+    if let Err(e) = vm_thread.join() {
+        eprintln!("[GUI] VM thread panicked: {:?}", e);
+    }
+
+    let halt_code = shared.halt_code();
+    if halt_code == 0x5555 {
+        uart_println!("[VM] Clean shutdown (PASS)");
+    } else if halt_code != 0 {
+        uart_println!("[VM] Shutdown with code: {:#x}", halt_code);
+    }
+
+    Ok(())
+}
+
 

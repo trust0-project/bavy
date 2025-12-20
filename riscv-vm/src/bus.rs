@@ -1732,164 +1732,253 @@ impl Bus for SystemBus {
 
     // ========== Native Atomic Operations ==========
     //
-    // For native builds, we use a global lock to ensure atomicity of AMO operations.
-    // This is simpler than per-address locking and correct for RISC-V semantics.
+    // For native builds, use proper atomic operations via Dram's atomic methods.
+    // These use Rust's std::sync::atomic intrinsics for true atomicity.
 
     #[cfg(not(target_arch = "wasm32"))]
     fn atomic_swap(&self, addr: u64, value: u64, is_word: bool) -> Result<u64, Trap> {
-        let _guard = AMO_LOCK.lock().unwrap();
-        if is_word {
-            let old = self.read32(addr)? as i32 as i64 as u64;
-            self.write32(addr, value as u32)?;
-            Ok(old)
+        if let Some(off) = self.dram.offset(addr) {
+            if is_word {
+                let old = self
+                    .dram
+                    .atomic_swap_32(off as u64, value as u32)
+                    .map_err(|_| Trap::StoreAccessFault(addr))?;
+                Ok(old as i32 as i64 as u64)
+            } else {
+                let old = self
+                    .dram
+                    .atomic_swap_64(off as u64, value)
+                    .map_err(|_| Trap::StoreAccessFault(addr))?;
+                Ok(old)
+            }
         } else {
-            let old = self.read64(addr)?;
-            self.write64(addr, value)?;
-            Ok(old)
+            // Non-DRAM: use lock fallback
+            let _guard = AMO_LOCK.lock().unwrap();
+            if is_word {
+                let old = self.read32(addr)? as i32 as i64 as u64;
+                self.write32(addr, value as u32)?;
+                Ok(old)
+            } else {
+                let old = self.read64(addr)?;
+                self.write64(addr, value)?;
+                Ok(old)
+            }
         }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     fn atomic_add(&self, addr: u64, value: u64, is_word: bool) -> Result<u64, Trap> {
-        let _guard = AMO_LOCK.lock().unwrap();
-        if is_word {
-            let old = self.read32(addr)? as i32 as i64 as u64;
-            self.write32(addr, old.wrapping_add(value) as u32)?;
-            Ok(old)
+        if let Some(off) = self.dram.offset(addr) {
+            if is_word {
+                let old = self.dram.atomic_add_32(off as u64, value as u32)
+                    .map_err(|_| Trap::StoreAccessFault(addr))?;
+                Ok(old as i32 as i64 as u64)
+            } else {
+                let old = self.dram.atomic_add_64(off as u64, value)
+                    .map_err(|_| Trap::StoreAccessFault(addr))?;
+                Ok(old)
+            }
         } else {
-            let old = self.read64(addr)?;
-            self.write64(addr, old.wrapping_add(value))?;
-            Ok(old)
+            let _guard = AMO_LOCK.lock().unwrap();
+            if is_word {
+                let old = self.read32(addr)? as i32 as i64 as u64;
+                self.write32(addr, old.wrapping_add(value) as u32)?;
+                Ok(old)
+            } else {
+                let old = self.read64(addr)?;
+                self.write64(addr, old.wrapping_add(value))?;
+                Ok(old)
+            }
         }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     fn atomic_and(&self, addr: u64, value: u64, is_word: bool) -> Result<u64, Trap> {
-        let _guard = AMO_LOCK.lock().unwrap();
-        if is_word {
-            let old = self.read32(addr)? as i32 as i64 as u64;
-            self.write32(addr, (old & value) as u32)?;
-            Ok(old)
+        if let Some(off) = self.dram.offset(addr) {
+            if is_word {
+                let old = self.dram.atomic_and_32(off as u64, value as u32)
+                    .map_err(|_| Trap::StoreAccessFault(addr))?;
+                Ok(old as i32 as i64 as u64)
+            } else {
+                let old = self.dram.atomic_and_64(off as u64, value)
+                    .map_err(|_| Trap::StoreAccessFault(addr))?;
+                Ok(old)
+            }
         } else {
-            let old = self.read64(addr)?;
-            self.write64(addr, old & value)?;
-            Ok(old)
+            let _guard = AMO_LOCK.lock().unwrap();
+            if is_word {
+                let old = self.read32(addr)? as i32 as i64 as u64;
+                self.write32(addr, (old & value) as u32)?;
+                Ok(old)
+            } else {
+                let old = self.read64(addr)?;
+                self.write64(addr, old & value)?;
+                Ok(old)
+            }
         }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     fn atomic_or(&self, addr: u64, value: u64, is_word: bool) -> Result<u64, Trap> {
-        let _guard = AMO_LOCK.lock().unwrap();
-        if is_word {
-            let old = self.read32(addr)? as i32 as i64 as u64;
-            self.write32(addr, (old | value) as u32)?;
-            Ok(old)
+        if let Some(off) = self.dram.offset(addr) {
+            if is_word {
+                let old = self.dram.atomic_or_32(off as u64, value as u32)
+                    .map_err(|_| Trap::StoreAccessFault(addr))?;
+                Ok(old as i32 as i64 as u64)
+            } else {
+                let old = self.dram.atomic_or_64(off as u64, value)
+                    .map_err(|_| Trap::StoreAccessFault(addr))?;
+                Ok(old)
+            }
         } else {
-            let old = self.read64(addr)?;
-            self.write64(addr, old | value)?;
-            Ok(old)
+            let _guard = AMO_LOCK.lock().unwrap();
+            if is_word {
+                let old = self.read32(addr)? as i32 as i64 as u64;
+                self.write32(addr, (old | value) as u32)?;
+                Ok(old)
+            } else {
+                let old = self.read64(addr)?;
+                self.write64(addr, old | value)?;
+                Ok(old)
+            }
         }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     fn atomic_xor(&self, addr: u64, value: u64, is_word: bool) -> Result<u64, Trap> {
-        let _guard = AMO_LOCK.lock().unwrap();
-        if is_word {
-            let old = self.read32(addr)? as i32 as i64 as u64;
-            self.write32(addr, (old ^ value) as u32)?;
-            Ok(old)
+        if let Some(off) = self.dram.offset(addr) {
+            if is_word {
+                let old = self.dram.atomic_xor_32(off as u64, value as u32)
+                    .map_err(|_| Trap::StoreAccessFault(addr))?;
+                Ok(old as i32 as i64 as u64)
+            } else {
+                let old = self.dram.atomic_xor_64(off as u64, value)
+                    .map_err(|_| Trap::StoreAccessFault(addr))?;
+                Ok(old)
+            }
         } else {
-            let old = self.read64(addr)?;
-            self.write64(addr, old ^ value)?;
-            Ok(old)
+            let _guard = AMO_LOCK.lock().unwrap();
+            if is_word {
+                let old = self.read32(addr)? as i32 as i64 as u64;
+                self.write32(addr, (old ^ value) as u32)?;
+                Ok(old)
+            } else {
+                let old = self.read64(addr)?;
+                self.write64(addr, old ^ value)?;
+                Ok(old)
+            }
         }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     fn atomic_min(&self, addr: u64, value: u64, is_word: bool) -> Result<u64, Trap> {
-        let _guard = AMO_LOCK.lock().unwrap();
-        if is_word {
-            let old = self.read32(addr)? as i32 as i64 as u64;
-            let new = if (old as i64) < (value as i64) {
-                old
+        if let Some(off) = self.dram.offset(addr) {
+            if is_word {
+                let old = self.dram.atomic_min_32(off as u64, value as i32)
+                    .map_err(|_| Trap::StoreAccessFault(addr))?;
+                Ok(old as i32 as i64 as u64)
             } else {
-                value
-            };
-            self.write32(addr, new as u32)?;
-            Ok(old)
+                let old = self.dram.atomic_min_64(off as u64, value as i64)
+                    .map_err(|_| Trap::StoreAccessFault(addr))?;
+                Ok(old as u64)
+            }
         } else {
-            let old = self.read64(addr)?;
-            let new = if (old as i64) < (value as i64) {
-                old
+            let _guard = AMO_LOCK.lock().unwrap();
+            if is_word {
+                let old = self.read32(addr)? as i32 as i64 as u64;
+                let new = if (old as i64) < (value as i64) { old } else { value };
+                self.write32(addr, new as u32)?;
+                Ok(old)
             } else {
-                value
-            };
-            self.write64(addr, new)?;
-            Ok(old)
+                let old = self.read64(addr)?;
+                let new = if (old as i64) < (value as i64) { old } else { value };
+                self.write64(addr, new)?;
+                Ok(old)
+            }
         }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     fn atomic_max(&self, addr: u64, value: u64, is_word: bool) -> Result<u64, Trap> {
-        let _guard = AMO_LOCK.lock().unwrap();
-        if is_word {
-            let old = self.read32(addr)? as i32 as i64 as u64;
-            let new = if (old as i64) > (value as i64) {
-                old
+        if let Some(off) = self.dram.offset(addr) {
+            if is_word {
+                let old = self.dram.atomic_max_32(off as u64, value as i32)
+                    .map_err(|_| Trap::StoreAccessFault(addr))?;
+                Ok(old as i32 as i64 as u64)
             } else {
-                value
-            };
-            self.write32(addr, new as u32)?;
-            Ok(old)
+                let old = self.dram.atomic_max_64(off as u64, value as i64)
+                    .map_err(|_| Trap::StoreAccessFault(addr))?;
+                Ok(old as u64)
+            }
         } else {
-            let old = self.read64(addr)?;
-            let new = if (old as i64) > (value as i64) {
-                old
+            let _guard = AMO_LOCK.lock().unwrap();
+            if is_word {
+                let old = self.read32(addr)? as i32 as i64 as u64;
+                let new = if (old as i64) > (value as i64) { old } else { value };
+                self.write32(addr, new as u32)?;
+                Ok(old)
             } else {
-                value
-            };
-            self.write64(addr, new)?;
-            Ok(old)
+                let old = self.read64(addr)?;
+                let new = if (old as i64) > (value as i64) { old } else { value };
+                self.write64(addr, new)?;
+                Ok(old)
+            }
         }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     fn atomic_minu(&self, addr: u64, value: u64, is_word: bool) -> Result<u64, Trap> {
-        let _guard = AMO_LOCK.lock().unwrap();
-        if is_word {
-            let old = self.read32(addr)? as u32 as u64;
-            let new = if old < (value as u32 as u64) {
-                old
+        if let Some(off) = self.dram.offset(addr) {
+            if is_word {
+                let old = self.dram.atomic_minu_32(off as u64, value as u32)
+                    .map_err(|_| Trap::StoreAccessFault(addr))?;
+                Ok(old as i32 as i64 as u64)
             } else {
-                value
-            };
-            self.write32(addr, new as u32)?;
-            Ok(old as i32 as i64 as u64)
+                let old = self.dram.atomic_minu_64(off as u64, value)
+                    .map_err(|_| Trap::StoreAccessFault(addr))?;
+                Ok(old)
+            }
         } else {
-            let old = self.read64(addr)?;
-            let new = if old < value { old } else { value };
-            self.write64(addr, new)?;
-            Ok(old)
+            let _guard = AMO_LOCK.lock().unwrap();
+            if is_word {
+                let old = self.read32(addr)? as u32 as u64;
+                let new = if old < (value as u32 as u64) { old } else { value };
+                self.write32(addr, new as u32)?;
+                Ok(old as i32 as i64 as u64)
+            } else {
+                let old = self.read64(addr)?;
+                let new = if old < value { old } else { value };
+                self.write64(addr, new)?;
+                Ok(old)
+            }
         }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     fn atomic_maxu(&self, addr: u64, value: u64, is_word: bool) -> Result<u64, Trap> {
-        let _guard = AMO_LOCK.lock().unwrap();
-        if is_word {
-            let old = self.read32(addr)? as u32 as u64;
-            let new = if old > (value as u32 as u64) {
-                old
+        if let Some(off) = self.dram.offset(addr) {
+            if is_word {
+                let old = self.dram.atomic_maxu_32(off as u64, value as u32)
+                    .map_err(|_| Trap::StoreAccessFault(addr))?;
+                Ok(old as i32 as i64 as u64)
             } else {
-                value
-            };
-            self.write32(addr, new as u32)?;
-            Ok(old as i32 as i64 as u64)
+                let old = self.dram.atomic_maxu_64(off as u64, value)
+                    .map_err(|_| Trap::StoreAccessFault(addr))?;
+                Ok(old)
+            }
         } else {
-            let old = self.read64(addr)?;
-            let new = if old > value { old } else { value };
-            self.write64(addr, new)?;
-            Ok(old)
+            let _guard = AMO_LOCK.lock().unwrap();
+            if is_word {
+                let old = self.read32(addr)? as u32 as u64;
+                let new = if old > (value as u32 as u64) { old } else { value };
+                self.write32(addr, new as u32)?;
+                Ok(old as i32 as i64 as u64)
+            } else {
+                let old = self.read64(addr)?;
+                let new = if old > value { old } else { value };
+                self.write64(addr, new)?;
+                Ok(old)
+            }
         }
     }
 
@@ -1901,22 +1990,36 @@ impl Bus for SystemBus {
         new_value: u64,
         is_word: bool,
     ) -> Result<(bool, u64), Trap> {
-        let _guard = AMO_LOCK.lock().unwrap();
-        if is_word {
-            let old = self.read32(addr)? as u32;
-            if old == expected as u32 {
-                self.write32(addr, new_value as u32)?;
-                Ok((true, old as i32 as i64 as u64))
+        if let Some(off) = self.dram.offset(addr) {
+            if is_word {
+                let (success, old) = self.dram
+                    .atomic_compare_exchange_32(off as u64, expected as u32, new_value as u32)
+                    .map_err(|_| Trap::StoreAccessFault(addr))?;
+                Ok((success, old as i32 as i64 as u64))
             } else {
-                Ok((false, old as i32 as i64 as u64))
+                let (success, old) = self.dram
+                    .atomic_compare_exchange_64(off as u64, expected, new_value)
+                    .map_err(|_| Trap::StoreAccessFault(addr))?;
+                Ok((success, old))
             }
         } else {
-            let old = self.read64(addr)?;
-            if old == expected {
-                self.write64(addr, new_value)?;
-                Ok((true, old))
+            let _guard = AMO_LOCK.lock().unwrap();
+            if is_word {
+                let old = self.read32(addr)? as u32;
+                if old == expected as u32 {
+                    self.write32(addr, new_value as u32)?;
+                    Ok((true, old as i32 as i64 as u64))
+                } else {
+                    Ok((false, old as i32 as i64 as u64))
+                }
             } else {
-                Ok((false, old))
+                let old = self.read64(addr)?;
+                if old == expected {
+                    self.write64(addr, new_value)?;
+                    Ok((true, old))
+                } else {
+                    Ok((false, old))
+                }
             }
         }
     }

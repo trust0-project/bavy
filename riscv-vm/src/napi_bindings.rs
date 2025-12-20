@@ -139,15 +139,15 @@ fn decode_message(data: &[u8]) -> Option<Vec<u8>> {
         }
         MSG_TYPE_CONTROL => {
             // Control messages are handled internally
-            if let Ok(json_str) = std::str::from_utf8(&data[1..]) {
-                if json_str.contains("\"type\":\"Assigned\"") {
-                    log::info!("[WebTransport] Received IP assignment: {}", json_str);
-                } else if json_str.contains("\"type\":\"HeartbeatAck\"") {
-                    log::trace!("[WebTransport] Heartbeat acknowledged");
-                } else if json_str.contains("\"type\":\"Error\"") {
-                    log::error!("[WebTransport] Error from relay: {}", json_str);
-                }
-            }
+            // if let Ok(json_str) = std::str::from_utf8(&data[1..]) {
+            //     if json_str.contains("\"type\":\"Assigned\"") {
+            //         log::info!("[WebTransport] Received IP assignment: {}", json_str);
+            //     } else if json_str.contains("\"type\":\"HeartbeatAck\"") {
+            //         log::trace!("[WebTransport] Heartbeat acknowledged");
+            //     } else if json_str.contains("\"type\":\"Error\"") {
+            //         log::error!("[WebTransport] Error from relay: {}", json_str);
+            //     }
+            // }
             None
         }
         _ => {
@@ -344,7 +344,6 @@ impl WebTransportClient {
                         }
                     };
 
-                    log::info!("[WebTransport] Connected successfully!");
                     connected_clone.store(true, Ordering::SeqCst);
 
                     // Send registration
@@ -357,10 +356,6 @@ impl WebTransportClient {
                         continue;
                     }
 
-                    log::info!(
-                        "[WebTransport] Registration sent, MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                        mac_copy[0], mac_copy[1], mac_copy[2], mac_copy[3], mac_copy[4], mac_copy[5]
-                    );
 
                     let connection = Arc::new(connection);
 
@@ -422,16 +417,8 @@ impl WebTransportClient {
                                                         if let Ok(mut guard) = assigned_ip_clone.lock() {
                                                             *guard = Some(ip);
                                                         }
-                                                        log::info!(
-                                                            "[WebTransport] IP Assigned: {}.{}.{}.{}",
-                                                            ip[0], ip[1], ip[2], ip[3]
-                                                        );
                                                     }
 
-                                                    log::info!(
-                                                        "[WebTransport] Registered with relay: {}",
-                                                        json_str
-                                                    );
                                                 }
                                             }
                                         }

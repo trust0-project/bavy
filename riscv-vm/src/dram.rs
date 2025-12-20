@@ -314,6 +314,349 @@ impl Dram {
         }
         Ok(())
     }
+
+    // ========== ATOMIC OPERATIONS FOR SMP ==========
+    //
+    // These are essential for correctness when multiple harts (threads) access
+    // shared memory. They implement RISC-V AMO (Atomic Memory Operations) instructions.
+
+    /// Atomic exchange (AMOSWAP.W): atomically swap value and return old value.
+    #[inline]
+    pub fn atomic_swap_32(&self, offset: u64, value: u32) -> Result<u32, MemoryError> {
+        if offset % 4 != 0 {
+            return Err(MemoryError::InvalidAlignment(offset));
+        }
+        let off = offset as usize;
+        if off + 4 > self.size {
+            return Err(MemoryError::OutOfBounds(offset));
+        }
+        unsafe {
+            let ptr = self.mem_ptr().add(off) as *const AtomicU32;
+            Ok((*ptr).swap(value, Ordering::SeqCst))
+        }
+    }
+
+    /// Atomic exchange (AMOSWAP.D): atomically swap value and return old value.
+    #[inline]
+    pub fn atomic_swap_64(&self, offset: u64, value: u64) -> Result<u64, MemoryError> {
+        if offset % 8 != 0 {
+            return Err(MemoryError::InvalidAlignment(offset));
+        }
+        let off = offset as usize;
+        if off + 8 > self.size {
+            return Err(MemoryError::OutOfBounds(offset));
+        }
+        unsafe {
+            let ptr = self.mem_ptr().add(off) as *const AtomicU64;
+            Ok((*ptr).swap(value, Ordering::SeqCst))
+        }
+    }
+
+    /// Atomic add (AMOADD.W): atomically add and return old value.
+    #[inline]
+    pub fn atomic_add_32(&self, offset: u64, value: u32) -> Result<u32, MemoryError> {
+        if offset % 4 != 0 {
+            return Err(MemoryError::InvalidAlignment(offset));
+        }
+        let off = offset as usize;
+        if off + 4 > self.size {
+            return Err(MemoryError::OutOfBounds(offset));
+        }
+        unsafe {
+            let ptr = self.mem_ptr().add(off) as *const AtomicU32;
+            Ok((*ptr).fetch_add(value, Ordering::SeqCst))
+        }
+    }
+
+    /// Atomic add (AMOADD.D): atomically add and return old value.
+    #[inline]
+    pub fn atomic_add_64(&self, offset: u64, value: u64) -> Result<u64, MemoryError> {
+        if offset % 8 != 0 {
+            return Err(MemoryError::InvalidAlignment(offset));
+        }
+        let off = offset as usize;
+        if off + 8 > self.size {
+            return Err(MemoryError::OutOfBounds(offset));
+        }
+        unsafe {
+            let ptr = self.mem_ptr().add(off) as *const AtomicU64;
+            Ok((*ptr).fetch_add(value, Ordering::SeqCst))
+        }
+    }
+
+    /// Atomic AND (AMOAND.W): atomically AND and return old value.
+    #[inline]
+    pub fn atomic_and_32(&self, offset: u64, value: u32) -> Result<u32, MemoryError> {
+        if offset % 4 != 0 {
+            return Err(MemoryError::InvalidAlignment(offset));
+        }
+        let off = offset as usize;
+        if off + 4 > self.size {
+            return Err(MemoryError::OutOfBounds(offset));
+        }
+        unsafe {
+            let ptr = self.mem_ptr().add(off) as *const AtomicU32;
+            Ok((*ptr).fetch_and(value, Ordering::SeqCst))
+        }
+    }
+
+    /// Atomic AND (AMOAND.D): atomically AND and return old value.
+    #[inline]
+    pub fn atomic_and_64(&self, offset: u64, value: u64) -> Result<u64, MemoryError> {
+        if offset % 8 != 0 {
+            return Err(MemoryError::InvalidAlignment(offset));
+        }
+        let off = offset as usize;
+        if off + 8 > self.size {
+            return Err(MemoryError::OutOfBounds(offset));
+        }
+        unsafe {
+            let ptr = self.mem_ptr().add(off) as *const AtomicU64;
+            Ok((*ptr).fetch_and(value, Ordering::SeqCst))
+        }
+    }
+
+    /// Atomic OR (AMOOR.W): atomically OR and return old value.
+    #[inline]
+    pub fn atomic_or_32(&self, offset: u64, value: u32) -> Result<u32, MemoryError> {
+        if offset % 4 != 0 {
+            return Err(MemoryError::InvalidAlignment(offset));
+        }
+        let off = offset as usize;
+        if off + 4 > self.size {
+            return Err(MemoryError::OutOfBounds(offset));
+        }
+        unsafe {
+            let ptr = self.mem_ptr().add(off) as *const AtomicU32;
+            Ok((*ptr).fetch_or(value, Ordering::SeqCst))
+        }
+    }
+
+    /// Atomic OR (AMOOR.D): atomically OR and return old value.
+    #[inline]
+    pub fn atomic_or_64(&self, offset: u64, value: u64) -> Result<u64, MemoryError> {
+        if offset % 8 != 0 {
+            return Err(MemoryError::InvalidAlignment(offset));
+        }
+        let off = offset as usize;
+        if off + 8 > self.size {
+            return Err(MemoryError::OutOfBounds(offset));
+        }
+        unsafe {
+            let ptr = self.mem_ptr().add(off) as *const AtomicU64;
+            Ok((*ptr).fetch_or(value, Ordering::SeqCst))
+        }
+    }
+
+    /// Atomic XOR (AMOXOR.W): atomically XOR and return old value.
+    #[inline]
+    pub fn atomic_xor_32(&self, offset: u64, value: u32) -> Result<u32, MemoryError> {
+        if offset % 4 != 0 {
+            return Err(MemoryError::InvalidAlignment(offset));
+        }
+        let off = offset as usize;
+        if off + 4 > self.size {
+            return Err(MemoryError::OutOfBounds(offset));
+        }
+        unsafe {
+            let ptr = self.mem_ptr().add(off) as *const AtomicU32;
+            Ok((*ptr).fetch_xor(value, Ordering::SeqCst))
+        }
+    }
+
+    /// Atomic XOR (AMOXOR.D): atomically XOR and return old value.
+    #[inline]
+    pub fn atomic_xor_64(&self, offset: u64, value: u64) -> Result<u64, MemoryError> {
+        if offset % 8 != 0 {
+            return Err(MemoryError::InvalidAlignment(offset));
+        }
+        let off = offset as usize;
+        if off + 8 > self.size {
+            return Err(MemoryError::OutOfBounds(offset));
+        }
+        unsafe {
+            let ptr = self.mem_ptr().add(off) as *const AtomicU64;
+            Ok((*ptr).fetch_xor(value, Ordering::SeqCst))
+        }
+    }
+
+    /// Atomic compare-and-exchange (for SC instruction).
+    /// Returns (success, old_value).
+    #[inline]
+    pub fn atomic_compare_exchange_32(
+        &self,
+        offset: u64,
+        expected: u32,
+        new_value: u32,
+    ) -> Result<(bool, u32), MemoryError> {
+        if offset % 4 != 0 {
+            return Err(MemoryError::InvalidAlignment(offset));
+        }
+        let off = offset as usize;
+        if off + 4 > self.size {
+            return Err(MemoryError::OutOfBounds(offset));
+        }
+        unsafe {
+            let ptr = self.mem_ptr().add(off) as *const AtomicU32;
+            match (*ptr).compare_exchange(expected, new_value, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(old) => Ok((true, old)),
+                Err(old) => Ok((false, old)),
+            }
+        }
+    }
+
+    /// Atomic compare-and-exchange 64-bit (for SC instruction).
+    /// Returns (success, old_value).
+    #[inline]
+    pub fn atomic_compare_exchange_64(
+        &self,
+        offset: u64,
+        expected: u64,
+        new_value: u64,
+    ) -> Result<(bool, u64), MemoryError> {
+        if offset % 8 != 0 {
+            return Err(MemoryError::InvalidAlignment(offset));
+        }
+        let off = offset as usize;
+        if off + 8 > self.size {
+            return Err(MemoryError::OutOfBounds(offset));
+        }
+        unsafe {
+            let ptr = self.mem_ptr().add(off) as *const AtomicU64;
+            match (*ptr).compare_exchange(expected, new_value, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(old) => Ok((true, old)),
+                Err(old) => Ok((false, old)),
+            }
+        }
+    }
+
+    /// Atomic MIN signed (AMOMIN.W): atomically store min and return old value.
+    #[inline]
+    pub fn atomic_min_32(&self, offset: u64, value: i32) -> Result<i32, MemoryError> {
+        if offset % 4 != 0 {
+            return Err(MemoryError::InvalidAlignment(offset));
+        }
+        let off = offset as usize;
+        if off + 4 > self.size {
+            return Err(MemoryError::OutOfBounds(offset));
+        }
+        unsafe {
+            let ptr = self.mem_ptr().add(off) as *const std::sync::atomic::AtomicI32;
+            Ok((*ptr).fetch_min(value, Ordering::SeqCst))
+        }
+    }
+
+    /// Atomic MIN signed (AMOMIN.D): atomically store min and return old value.
+    #[inline]
+    pub fn atomic_min_64(&self, offset: u64, value: i64) -> Result<i64, MemoryError> {
+        if offset % 8 != 0 {
+            return Err(MemoryError::InvalidAlignment(offset));
+        }
+        let off = offset as usize;
+        if off + 8 > self.size {
+            return Err(MemoryError::OutOfBounds(offset));
+        }
+        unsafe {
+            let ptr = self.mem_ptr().add(off) as *const std::sync::atomic::AtomicI64;
+            Ok((*ptr).fetch_min(value, Ordering::SeqCst))
+        }
+    }
+
+    /// Atomic MAX signed (AMOMAX.W): atomically store max and return old value.
+    #[inline]
+    pub fn atomic_max_32(&self, offset: u64, value: i32) -> Result<i32, MemoryError> {
+        if offset % 4 != 0 {
+            return Err(MemoryError::InvalidAlignment(offset));
+        }
+        let off = offset as usize;
+        if off + 4 > self.size {
+            return Err(MemoryError::OutOfBounds(offset));
+        }
+        unsafe {
+            let ptr = self.mem_ptr().add(off) as *const std::sync::atomic::AtomicI32;
+            Ok((*ptr).fetch_max(value, Ordering::SeqCst))
+        }
+    }
+
+    /// Atomic MAX signed (AMOMAX.D): atomically store max and return old value.
+    #[inline]
+    pub fn atomic_max_64(&self, offset: u64, value: i64) -> Result<i64, MemoryError> {
+        if offset % 8 != 0 {
+            return Err(MemoryError::InvalidAlignment(offset));
+        }
+        let off = offset as usize;
+        if off + 8 > self.size {
+            return Err(MemoryError::OutOfBounds(offset));
+        }
+        unsafe {
+            let ptr = self.mem_ptr().add(off) as *const std::sync::atomic::AtomicI64;
+            Ok((*ptr).fetch_max(value, Ordering::SeqCst))
+        }
+    }
+
+    /// Atomic MIN unsigned (AMOMINU.W): atomically store min and return old value.
+    #[inline]
+    pub fn atomic_minu_32(&self, offset: u64, value: u32) -> Result<u32, MemoryError> {
+        if offset % 4 != 0 {
+            return Err(MemoryError::InvalidAlignment(offset));
+        }
+        let off = offset as usize;
+        if off + 4 > self.size {
+            return Err(MemoryError::OutOfBounds(offset));
+        }
+        unsafe {
+            let ptr = self.mem_ptr().add(off) as *const AtomicU32;
+            Ok((*ptr).fetch_min(value, Ordering::SeqCst))
+        }
+    }
+
+    /// Atomic MIN unsigned (AMOMINU.D): atomically store min and return old value.
+    #[inline]
+    pub fn atomic_minu_64(&self, offset: u64, value: u64) -> Result<u64, MemoryError> {
+        if offset % 8 != 0 {
+            return Err(MemoryError::InvalidAlignment(offset));
+        }
+        let off = offset as usize;
+        if off + 8 > self.size {
+            return Err(MemoryError::OutOfBounds(offset));
+        }
+        unsafe {
+            let ptr = self.mem_ptr().add(off) as *const AtomicU64;
+            Ok((*ptr).fetch_min(value, Ordering::SeqCst))
+        }
+    }
+
+    /// Atomic MAX unsigned (AMOMAXU.W): atomically store max and return old value.
+    #[inline]
+    pub fn atomic_maxu_32(&self, offset: u64, value: u32) -> Result<u32, MemoryError> {
+        if offset % 4 != 0 {
+            return Err(MemoryError::InvalidAlignment(offset));
+        }
+        let off = offset as usize;
+        if off + 4 > self.size {
+            return Err(MemoryError::OutOfBounds(offset));
+        }
+        unsafe {
+            let ptr = self.mem_ptr().add(off) as *const AtomicU32;
+            Ok((*ptr).fetch_max(value, Ordering::SeqCst))
+        }
+    }
+
+    /// Atomic MAX unsigned (AMOMAXU.D): atomically store max and return old value.
+    #[inline]
+    pub fn atomic_maxu_64(&self, offset: u64, value: u64) -> Result<u64, MemoryError> {
+        if offset % 8 != 0 {
+            return Err(MemoryError::InvalidAlignment(offset));
+        }
+        let off = offset as usize;
+        if off + 8 > self.size {
+            return Err(MemoryError::OutOfBounds(offset));
+        }
+        unsafe {
+            let ptr = self.mem_ptr().add(off) as *const AtomicU64;
+            Ok((*ptr).fetch_max(value, Ordering::SeqCst))
+        }
+    }
 }
 
 // ============================================================================

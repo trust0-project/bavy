@@ -186,6 +186,7 @@ async function createVm(
     netWebtransport?: string;
     certHash?: string;
     debug?: boolean;
+    enableGpu?: boolean;
   },
 ) {
   let sdcardBytes: Uint8Array;
@@ -240,6 +241,12 @@ async function createVm(
     if (options?.debug) {
       console.error(`[VM] Loaded SD card as block device`);
     }
+  }
+
+  // Enable GPU rendering if requested
+  if (options?.enableGpu && typeof vm.enable_gpu === 'function') {
+    vm.enable_gpu(1024, 768);
+    console.error(`[VM] GPU enabled (1024x768)`);
   }
 
   // Start worker threads for secondary harts (1..numHarts)
@@ -532,14 +539,225 @@ function runVmLoop(vm: any, nativeNetClient: any | null, workers: Worker[] = [])
 }
 
 /**
+ * Run the VM with a GUI window (SDL)
+ * Displays framebuffer and handles mouse/touch input
+ */
+async function runVmWithGui(vm: any, nativeNetClient: any | null, workers: Worker[] = []) {
+  // Try to load SDL - returns null if not available
+  let sdl: any = null;
+  try {
+    sdl = await import('@kmamal/sdl');
+  } catch {
+    console.error('[GUI] SDL not available. Install with: npm install @kmamal/sdl');
+    console.error('[GUI] Falling back to headless mode.');
+    runVmLoop(vm, nativeNetClient, workers);
+    return;
+  }
+
+  let running = true;
+  const width = 1024;
+  const height = 768;
+
+  // Create SDL window
+  let window: any = null;
+  window = sdl.video.createWindow({
+    title: 'RISC-V VM',
+    width,
+    height,
+  });
+  console.error('[GUI] Window created');
+
+  // Handle mouse events for touch input
+  window.on('mouseButtonDown', (event: any) => {
+    if (event.button === 1) { // Left button
+      const x = event.x;
+      const y = event.y;
+      if (typeof vm.send_touch_event === 'function') {
+        vm.send_touch_event(x, y, true);
+      }
+    }
+  });
+
+  window.on('mouseButtonUp', (event: any) => {
+    if (event.button === 1) {
+      const x = event.x;
+      const y = event.y;
+      if (typeof vm.send_touch_event === 'function') {
+        vm.send_touch_event(x, y, false);
+      }
+    }
+  });
+
+  window.on('close', () => {
+    running = false;
+  });
+
+  // Shutdown function
+  const shutdown = (code: number) => {
+    if (!running) return;
+    running = false;
+
+    // Terminate worker threads
+    for (const worker of workers) {
+      worker.terminate();
+    }
+
+    // Shutdown native network client
+    if (nativeNetClient) {
+      nativeNetClient.shutdown();
+    }
+
+    // Destroy window
+    if (window) {
+      try {
+        window.destroy();
+      } catch {
+        // Window may already be destroyed
+      }
+    }
+
+    process.exit(code);
+  };
+
+  // Handle Ctrl+C
+  process.on('SIGINT', () => {
+    shutdown(0);
+  });
+
+  const INSTRUCTIONS_PER_TICK = 100_000;
+  let lastFrameVersion = 0;
+  let networkConnected = false;
+
+  const drainOutput = () => {
+    const outChunks: string[] = [];
+    let limit = 2000;
+    let code = typeof vm.get_output === 'function' ? vm.get_output() : undefined;
+
+    while (code !== undefined && limit-- > 0) {
+      const c = Number(code);
+      if (c === 8) {
+        outChunks.push('\b \b');
+      } else if (c === 10) {
+        outChunks.push('\r\n');
+      } else if (c === 13) {
+        outChunks.push('\r');
+      } else {
+        outChunks.push(String.fromCharCode(c));
+      }
+      code = vm.get_output();
+    }
+
+    if (outChunks.length) {
+      process.stdout.write(outChunks.join(''));
+    }
+  };
+
+  const bridgeNetwork = () => {
+    if (!nativeNetClient) return;
+
+    // Check connection status and propagate IP assignment
+    if (!networkConnected && nativeNetClient.isRegistered && nativeNetClient.isRegistered()) {
+      networkConnected = true;
+      const ip = nativeNetClient.assignedIp ? nativeNetClient.assignedIp() : 'unknown';
+      console.error(`\r\n[Network] Connected! IP: ${ip}`);
+
+      const ipBytes = nativeNetClient.assignedIpBytes ? nativeNetClient.assignedIpBytes() : null;
+      if (ipBytes && typeof vm.set_external_network_ip === 'function') {
+        vm.set_external_network_ip(new Uint8Array(ipBytes));
+      }
+    }
+
+    // Forward packets from native client to VM (RX)
+    let packet = nativeNetClient.recv();
+    while (packet) {
+      if (typeof vm.inject_network_packet === 'function') {
+        vm.inject_network_packet(new Uint8Array(packet));
+      }
+      packet = nativeNetClient.recv();
+    }
+
+    // Forward packets from VM to native client (TX)
+    if (typeof vm.extract_network_packet === 'function') {
+      let txPacket = vm.extract_network_packet();
+      while (txPacket) {
+        nativeNetClient.send(Buffer.from(txPacket));
+        txPacket = vm.extract_network_packet();
+      }
+    }
+  };
+
+  const updateDisplay = () => {
+    if (!window) return;
+
+    try {
+      // Check frame version in guest memory
+      const gpuFrame = typeof vm.get_gpu_frame === 'function' ? vm.get_gpu_frame() : null;
+      const frameVersion = typeof vm.get_gpu_frame_version === 'function' ? vm.get_gpu_frame_version() : 0;
+
+      if (gpuFrame && frameVersion !== lastFrameVersion) {
+        lastFrameVersion = frameVersion;
+
+        // Convert RGBA to BGRA for SDL
+        const pixels = Buffer.from(gpuFrame);
+        for (let i = 0; i < pixels.length; i += 4) {
+          const r = pixels[i];
+          const b = pixels[i + 2];
+          pixels[i] = b;
+          pixels[i + 2] = r;
+        }
+
+        window.render(width, height, width * 4, 'bgra32', pixels);
+      }
+    } catch (e: any) {
+      if (e.message?.includes('destroyed')) {
+        running = false;
+      }
+    }
+  };
+
+  const loop = () => {
+    if (!running) return;
+
+    try {
+      for (let i = 0; i < INSTRUCTIONS_PER_TICK; i++) {
+        vm.step();
+      }
+
+      drainOutput();
+      bridgeNetwork();
+      updateDisplay();
+
+      if (typeof vm.is_halted === 'function' && vm.is_halted()) {
+        drainOutput();
+        console.log('\r\n[VM] Halted');
+        shutdown(0);
+        return;
+      }
+    } catch (err) {
+      console.error('\r\n[VM] Error:', err);
+      shutdown(1);
+      return;
+    }
+
+    setImmediate(loop);
+  };
+
+  loop();
+}
+
+/**
  * Print banner matching native VM output
  */
-function printBanner(sdcardPath: string, numHarts: number, netWebtransport?: string) {
+function printBanner(sdcardPath: string, numHarts: number, netWebtransport?: string, enableGpu = false) {
   const sdcardName = path.basename(sdcardPath);
 
   console.log();
   console.log('╔══════════════════════════════════════════════════════════════╗');
-  console.log('║            RISC-V Emulator with OpenSBI                      ║');
+  if (enableGpu) {
+    console.log('║        RISC-V Emulator with OpenSBI (GUI)                   ║');
+  } else {
+    console.log('║            RISC-V Emulator with OpenSBI                      ║');
+  }
   console.log('╠══════════════════════════════════════════════════════════════╣');
   console.log(`║  SD Card: ${sdcardName.padEnd(50)} ║`);
   console.log(`║  Harts:   ${String(numHarts).padEnd(50)} ║`);
@@ -576,6 +794,11 @@ const argv = (yargs(hideBin(process.argv)) as any)
     describe: 'Enable debug output',
     default: false,
   })
+  .option('enable-gpu', {
+    type: 'boolean',
+    describe: 'Enable GPU display (opens a window)',
+    default: false,
+  })
   .help()
   .version()
   .parseSync();
@@ -586,6 +809,7 @@ const argv = (yargs(hideBin(process.argv)) as any)
   const netWebtransport = argv['net-webtransport'] as string | undefined;
   const certHash = argv['cert-hash'] as string | undefined;
   const debug = argv.debug as boolean;
+  const enableGpu = argv['enable-gpu'] as boolean;
 
   // Hart count logic:
   // - undefined or 0: auto-detect (cpu/2)
@@ -607,7 +831,7 @@ const argv = (yargs(hideBin(process.argv)) as any)
   }
 
   // Print banner
-  printBanner(sdcardPath, numHarts, netWebtransport);
+  printBanner(sdcardPath, numHarts, netWebtransport, enableGpu);
 
   try {
     const { vm, nativeNetClient, workers } = await createVm(sdcardPath, {
@@ -615,12 +839,15 @@ const argv = (yargs(hideBin(process.argv)) as any)
       netWebtransport,
       certHash,
       debug,
+      enableGpu,
     });
 
-    // NOTE: Worker start signal is now triggered inside the worker 'ready' message handler
-    // when all workers have reported ready. This replaced the old 100ms setTimeout approach.
-
-    runVmLoop(vm, nativeNetClient, workers);
+    // Run with GUI or headless based on flag
+    if (enableGpu) {
+      await runVmWithGui(vm, nativeNetClient, workers);
+    } else {
+      runVmLoop(vm, nativeNetClient, workers);
+    }
   } catch (err) {
     console.error('[CLI] Failed to start VM:', err);
     process.exit(1);

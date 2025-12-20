@@ -1518,6 +1518,15 @@ __metadata:
   languageName: node
   linkType: hard
 
+"@kmamal/sdl@npm:^0.11.13":
+  version: 0.11.13
+  resolution: "@kmamal/sdl@npm:0.11.13"
+  dependencies:
+    tar: "npm:^7.4.3"
+  checksum: 10c0/e8f26239019b105e5c3afaa9a2478b379a51b9debe76b2dcd2da7e55ae2cb3dfc6b0b0d13da0cd2119396c51744eb3d8390de0464d133040c5b2dc3e2372fcfa
+  languageName: node
+  linkType: hard
+
 "@ltd/j-toml@npm:1.38.0":
   version: 1.38.0
   resolution: "@ltd/j-toml@npm:1.38.0"
@@ -4389,7 +4398,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"tar@npm:^7.5.2":
+"tar@npm:^7.4.3, tar@npm:^7.5.2":
   version: 7.5.2
   resolution: "tar@npm:7.5.2"
   dependencies:
@@ -4641,12 +4650,16 @@ __metadata:
   resolution: "virtual-machine@workspace:riscv-vm"
   dependencies:
     "@esbuild-plugins/node-resolve": "npm:^0.2.2"
+    "@kmamal/sdl": "npm:^0.11.13"
     "@napi-rs/cli": "npm:^2.18.0"
     "@trust0/ridb-build": "npm:^0.0.21"
     "@types/node": "npm:^24.10.1"
     tsup: "npm:^8.4.0"
     typescript: "npm:^5.8.3"
     yargs: "npm:^18.0.0"
+  dependenciesMeta:
+    "@kmamal/sdl":
+      optional: true
   bin:
     virtual-machine: build/cli.js
   languageName: unknown

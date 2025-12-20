@@ -146,13 +146,6 @@ impl AsyncNetworkBackend {
             if let Some(ip) = backend.get_assigned_ip() {
                 let mut guard = assigned_ip.lock().unwrap();
                 if guard.is_none() {
-                    log::info!(
-                        "[AsyncNetworkBackend] IP assigned: {}.{}.{}.{}",
-                        ip[0],
-                        ip[1],
-                        ip[2],
-                        ip[3]
-                    );
                     *guard = Some(ip);
                 }
             }

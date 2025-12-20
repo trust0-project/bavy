@@ -103,15 +103,15 @@ fn decode_message(data: &[u8]) -> Option<Vec<u8>> {
         MSG_TYPE_CONTROL => {
             // Control messages are handled internally, not passed to the VM
             // Log assigned IP if present
-            if let Ok(json_str) = std::str::from_utf8(&data[1..]) {
-                if json_str.contains("\"type\":\"Assigned\"") {
-                    log::info!("[WebTransport] Received IP assignment: {}", json_str);
-                } else if json_str.contains("\"type\":\"HeartbeatAck\"") {
-                    log::trace!("[WebTransport] Heartbeat acknowledged");
-                } else if json_str.contains("\"type\":\"Error\"") {
-                    log::error!("[WebTransport] Error from relay: {}", json_str);
-                }
-            }
+            // if let Ok(json_str) = std::str::from_utf8(&data[1..]) {
+            //     if json_str.contains("\"type\":\"Assigned\"") {
+            //         log::info!("[WebTransport] Received IP assignment: {}", json_str);
+            //     } else if json_str.contains("\"type\":\"HeartbeatAck\"") {
+            //         log::trace!("[WebTransport] Heartbeat acknowledged");
+            //     } else if json_str.contains("\"type\":\"Error\"") {
+            //         log::error!("[WebTransport] Error from relay: {}", json_str);
+            //     }
+            // }
             None
         }
         MSG_TYPE_CHUNKED => {
@@ -332,7 +332,6 @@ mod native {
                                 continue;
                             }
                         };
-                        log::warn!("[WebTransport] Connected successfully!");
 
                         // Send registration message
                         let register_msg = make_register_message(&mac_copy);
@@ -342,9 +341,7 @@ mod native {
                             reconnect_delay = (reconnect_delay * 2).min(MAX_RECONNECT_DELAY_SECS);
                             continue;
                         }
-                        log::warn!("[WebTransport] Registration sent, MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                            mac_copy[0], mac_copy[1], mac_copy[2], mac_copy[3], mac_copy[4], mac_copy[5]);
-
+             
                         let connection = Arc::new(connection);
                         
                         // Run sender/receiver/heartbeat in a combined loop using select!
@@ -404,11 +401,7 @@ mod native {
                                                             if let Ok(mut guard) = assigned_ip_clone.lock() {
                                                                 *guard = Some(ip);
                                                             }
-                                                            log::warn!("[WebTransport] IP Assigned: {}.{}.{}.{}", 
-                                                                ip[0], ip[1], ip[2], ip[3]);
                                                         }
-                                                        
-                                                        log::warn!("[WebTransport] Registered with relay: {}", json_str);
                                                     }
                                                 }
                                             }
@@ -744,8 +737,6 @@ mod wasm {
                             return;
                         }
 
-                        console_log("[WebTransport] Connected successfully!");
-
                         // Send registration
                         let register_msg = make_register_message(&mac);
                         let array = Uint8Array::from(&register_msg[..]);
@@ -763,11 +754,6 @@ mod wasm {
                             );
                             return;
                         }
-
-                        console_log(&format!(
-                            "[WebTransport] Registration sent, MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
-                        ));
 
                         // Store transport and writer
                         *transport_rc.borrow_mut() = Some(transport.clone());
@@ -842,10 +828,6 @@ mod wasm {
                                                 if let Some(ip) = parse_ip_from_json(json_str) {
                                                     s.assigned_ip = Some(ip);
                                                     drop(s);
-                                                    console_log(&format!(
-                                                        "[WebTransport] IP Assigned: {}.{}.{}.{}",
-                                                        ip[0], ip[1], ip[2], ip[3]
-                                                    ));
                                                 }
                                             } else if json_str.contains("\"type\":\"Error\"") {
                                                 console_error(&format!(

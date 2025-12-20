@@ -1008,10 +1008,6 @@ impl WasmVm {
                             if dev.get_ip().is_none() {
                                 dev.set_ip(ip);
                                 self.net_status = NetworkStatus::Connected;
-                                web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
-                                    "[VM] IP assigned from relay: {}.{}.{}.{}",
-                                    ip[0], ip[1], ip[2], ip[3]
-                                )));
                             }
                         }
                     }

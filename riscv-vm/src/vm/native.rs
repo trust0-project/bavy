@@ -32,6 +32,7 @@ pub struct SharedState {
 impl SharedState {
     const HALT_REQUESTED: u8 = 0x01;
     const HALTED: u8 = 0x02;
+    const WORKERS_CAN_START: u8 = 0x04;
 
     pub fn new() -> Self {
         Self {
@@ -64,7 +65,20 @@ impl SharedState {
 
     #[inline(always)]
     pub fn should_stop(&self) -> bool {
-        self.flags.load(Ordering::Relaxed) != 0
+        // Only check halt flags, ignore WORKERS_CAN_START
+        (self.flags.load(Ordering::Relaxed) & (Self::HALT_REQUESTED | Self::HALTED)) != 0
+    }
+
+    /// Signal that worker threads can start executing.
+    /// Called by hart 0 after initial boot setup.
+    pub fn allow_workers_to_start(&self) {
+        self.flags.fetch_or(Self::WORKERS_CAN_START, Ordering::Release);
+    }
+
+    /// Check if workers are allowed to start.
+    #[inline(always)]
+    pub fn can_workers_start(&self) -> bool {
+        (self.flags.load(Ordering::Acquire) & Self::WORKERS_CAN_START) != 0
     }
 }
 
@@ -90,6 +104,8 @@ pub struct NativeVm {
     pub shared: Arc<SharedState>,
     num_harts: usize,
     entry_pc: u64,
+    /// WebTransport network backend (if connected)
+    wt_backend: Option<crate::net::webtransport::WebTransportBackend>,
 }
 
 impl NativeVm {
@@ -154,6 +170,7 @@ impl NativeVm {
             shared,
             num_harts,
             entry_pc,
+            wt_backend: None,
         })
     }
 
@@ -183,17 +200,30 @@ impl NativeVm {
     /// Connect to a WebTransport relay for networking.
     ///
     /// Must be called before `run()` / `start_workers()`.
-    /// Sets up the D1 EMAC device for network access.
-    pub fn connect_webtransport(&mut self, url: &str, _cert_hash: Option<String>) {
+    /// Sets up the D1 EMAC device and WebTransport backend for network access.
+    pub fn connect_webtransport(&mut self, url: &str, cert_hash: Option<String>) {
         use crate::devices::d1_emac::D1EmacEmulated;
+        use crate::net::webtransport::WebTransportBackend;
+        use crate::net::NetworkBackend;
+
+        // Create WebTransport backend
+        let backend = WebTransportBackend::new(url, cert_hash);
+        let mac = backend.mac_address();
 
         if let Some(bus) = Arc::get_mut(&mut self.bus) {
-            let emac = D1EmacEmulated::new();
+            // Create EMAC with the same MAC address as the backend
+            let emac = D1EmacEmulated::with_mac(mac);
             *bus.d1_emac.write().unwrap() = Some(emac);
             println!("[VM] D1 EMAC enabled for network: {}", url);
+            println!("[VM] D1 EMAC MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
         } else {
             eprintln!("[VM] Cannot configure network: workers already running");
+            return;
         }
+
+        // Store the backend
+        self.wt_backend = Some(backend);
     }
 
     /// Enable D1 Display device for graphics rendering.
@@ -205,11 +235,17 @@ impl NativeVm {
     /// * `height` - Display height in pixels (ignored, uses 1024x768)
     pub fn enable_gpu(&mut self, _width: u32, _height: u32) {
         use crate::devices::d1_display::D1DisplayEmulated;
+        use crate::devices::d1_touch::D1TouchEmulated;
 
         if let Some(bus) = Arc::get_mut(&mut self.bus) {
             let display = D1DisplayEmulated::new();
+            let touch = D1TouchEmulated::new();
+            
             *bus.d1_display.write().unwrap() = Some(display);
+            *bus.d1_touch.write().unwrap() = Some(touch);
+            
             println!("[VM] D1 Display enabled (1024x768)");
+            println!("[VM] D1 Touch enabled");
         } else {
             eprintln!("[VM] Cannot enable display: workers already running");
         }
@@ -286,13 +322,84 @@ impl NativeVm {
         self.bus.sysinfo.uptime_ms()
     }
 
-    /// Start worker threads for secondary harts.
-    pub fn start_workers(&mut self) {
-        // Give hart 0 a head start to begin executing kernel boot code.
-        // This reduces the race condition where secondary harts start executing
-        // before reaching their WFI parking loops, missing the first IPI burst.
-        thread::sleep(Duration::from_millis(50));
+    // ========================================================================
+    // GPU Frame Retrieval
+    // ========================================================================
+
+    /// Get GPU frame data as RGBA bytes.
+    /// Returns the framebuffer contents as a Vec<u8> with 4 bytes per pixel (RGBA).
+    /// Returns None if GPU is not enabled.
+    pub fn get_gpu_frame(&self) -> Option<Vec<u8>> {
+        const FRAMEBUFFER_PHYS_ADDR: u64 = 0x8100_0000;
+        const FB_WIDTH: usize = 1024;
+        const FB_HEIGHT: usize = 768;
+        const FB_SIZE_BYTES: usize = FB_WIDTH * FB_HEIGHT * 4;
+
+        // Check if display is enabled
+        if self.bus.d1_display.read().ok()?.is_none() {
+            return None;
+        }
+
+        let dram_offset = (FRAMEBUFFER_PHYS_ADDR - crate::bus::DRAM_BASE) as usize;
+        self.bus.dram.read_range(dram_offset, FB_SIZE_BYTES).ok()
+    }
+
+    /// Get GPU frame data as ARGB u32 values (for minifb compatibility).
+    /// Returns the framebuffer contents as a Vec<u32> with one u32 per pixel.
+    /// Format: 0xAARRGGBB (alpha in high byte).
+    /// Returns None if GPU is not enabled.
+    pub fn get_gpu_frame_u32(&self) -> Option<Vec<u32>> {
+        let bytes = self.get_gpu_frame()?;
         
+        // Convert RGBA u8 to ARGB u32 for minifb
+        Some(bytes.chunks_exact(4).map(|c| {
+            // Input: RGBA, Output: ARGB (0xAARRGGBB)
+            ((c[3] as u32) << 24) | ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | (c[2] as u32)
+        }).collect())
+    }
+
+    /// Get GPU display dimensions.
+    /// Returns (width, height) or None if GPU is not enabled.
+    pub fn get_gpu_size(&self) -> Option<(u32, u32)> {
+        let display = self.bus.d1_display.read().ok()?;
+        let d = display.as_ref()?;
+        Some((d.width(), d.height()))
+    }
+
+    /// Get the current frame version from kernel memory.
+    /// Returns a u32 that increments each time the kernel flushes dirty pixels.
+    /// Can be used to skip unchanged frames.
+    pub fn get_gpu_frame_version(&self) -> u32 {
+        const FRAME_VERSION_PHYS_ADDR: u64 = 0x80FF_FFFC;
+        let dram_offset = FRAME_VERSION_PHYS_ADDR - crate::bus::DRAM_BASE;
+        self.bus.dram.load_32(dram_offset).unwrap_or(0)
+    }
+
+    // ========================================================================
+    // Touch Input
+    // ========================================================================
+
+    /// Send a touch event to the D1 GT911 touchscreen controller.
+    ///
+    /// # Arguments
+    /// * `x` - X position (0 to display width)
+    /// * `y` - Y position (0 to display height)
+    /// * `pressed` - true for touch down/move, false for touch up
+    ///
+    /// Returns true if the event was sent successfully.
+    pub fn send_touch_event(&self, x: u32, y: u32, pressed: bool) -> bool {
+        if let Ok(mut touch) = self.bus.d1_touch.write() {
+            if let Some(ref mut dev) = *touch {
+                dev.push_touch(x as u16, y as u16, pressed);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Start worker threads for secondary harts.
+    /// Workers will spin-wait until allow_workers_to_start() is called.
+    pub fn start_workers(&mut self) {
         for hart_id in 1..self.num_harts {
             let bus = Arc::clone(&self.bus);
             let shared = Arc::clone(&self.shared);
@@ -307,6 +414,47 @@ impl NativeVm {
 
             self.handles.push(handle);
             println!("[VM] Started thread for hart {}", hart_id);
+        }
+    }
+
+    /// Poll network backend and bridge packets to/from EMAC.
+    /// Call this periodically from the main loop.
+    fn poll_network(&mut self) {
+        use crate::net::NetworkBackend;
+
+        let backend = match &mut self.wt_backend {
+            Some(b) => b,
+            None => return,
+        };
+
+        // Forward packets from WebTransport to EMAC (RX)
+        while let Ok(Some(packet)) = backend.recv() {
+            if let Ok(mut emac) = self.bus.d1_emac.write() {
+                if let Some(ref mut e) = *emac {
+                    e.queue_rx_packet(packet);
+                }
+            }
+        }
+
+        // Forward packets from EMAC to WebTransport (TX)
+        if let Ok(mut emac) = self.bus.d1_emac.write() {
+            if let Some(ref mut e) = *emac {
+                let tx_packets = e.get_tx_packets();
+                for packet in tx_packets {
+                    let _ = backend.send(&packet);
+                }
+            }
+        }
+
+        // Propagate assigned IP from backend to EMAC
+        if let Some(ip) = backend.get_assigned_ip() {
+            if let Ok(mut emac) = self.bus.d1_emac.write() {
+                if let Some(ref mut e) = *emac {
+                    if e.get_ip().is_none() {
+                        e.set_ip(ip);
+                    }
+                }
+            }
         }
     }
 
@@ -346,6 +494,13 @@ impl NativeVm {
             let (batch_steps, halt_reason) = self.execute_batch(&mut cpu, BATCH_SIZE);
             step_count += batch_steps;
 
+            // After initial boot steps, signal workers to start
+            // OpenSBI takes ~50k+ steps before jumping to kernel, so we wait 100k
+            // This gives hart 0 time to set up boot environment before secondary harts begin
+            if step_count >= 100_000 && !self.shared.can_workers_start() {
+                self.shared.allow_workers_to_start();
+            }
+
             if let Some(reason) = halt_reason {
                 match reason {
                     HaltReason::Shutdown(code) => {
@@ -363,6 +518,7 @@ impl NativeVm {
 
             if step_count % VIRTIO_POLL_INTERVAL == 0 {
                 self.bus.poll_virtio();
+                self.poll_network();
             }
 
             if step_count % CONSOLE_POLL_INTERVAL == 0 {
@@ -540,6 +696,15 @@ impl Drop for NativeVm {
 }
 
 fn hart_thread(hart_id: usize, entry_pc: u64, bus: Arc<SystemBus>, shared: Arc<SharedState>) {
+    // Wait for hart 0 to signal that workers can start.
+    // This ensures hart 0 has executed initial boot code before secondary harts begin.
+    while !shared.can_workers_start() {
+        if shared.should_stop() {
+            return;
+        }
+        thread::sleep(Duration::from_micros(100));
+    }
+
     let mut cpu = Cpu::new(entry_pc, hart_id as u64);
     cpu.setup_smode_boot(); // Enable S-mode operation
     let mut step_count: u64 = 0;
