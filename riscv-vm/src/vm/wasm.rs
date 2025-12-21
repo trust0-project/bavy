@@ -572,6 +572,61 @@ impl WasmVm {
         false
     }
 
+    /// Send a keyboard event to the D1 input device.
+    ///
+    /// This is the primary way to send keyboard input to the VM when using
+    /// the D1 touch/input device (as opposed to VirtIO input).
+    ///
+    /// # Arguments
+    /// * `js_key_code` - JavaScript keyCode (e.g., 65 for 'A', 13 for Enter)
+    /// * `pressed` - true for key press, false for key release
+    ///
+    /// Returns true if the event was sent successfully.
+    pub fn send_d1_key_event(&self, js_key_code: u32, pressed: bool) -> bool {
+        use crate::devices::virtio::input::js_keycode_to_linux;
+        
+        // Convert JavaScript keyCode to Linux evdev key code
+        let linux_code = match js_keycode_to_linux(js_key_code) {
+            Some(code) => code,
+            None => return false, // Unknown key - don't send
+        };
+        
+        if let Ok(mut touch) = self.bus.d1_touch.write() {
+            if let Some(ref mut dev) = *touch {
+                dev.push_key(linux_code, pressed);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Send a typed character to the D1 input device.
+    ///
+    /// This is the preferred way to send text input because it respects
+    /// keyboard layouts. For example, Shift+7 produces '/' on German keyboards,
+    /// and this method sends the actual '/' character.
+    ///
+    /// Use this for printable characters typed by the user.
+    /// Use send_d1_key_event for special keys like Enter, Backspace, arrows.
+    ///
+    /// # Arguments
+    /// * `char_code` - ASCII/Unicode code point (e.g., 47 for '/')
+    ///
+    /// Returns true if the character was sent successfully.
+    pub fn send_d1_char(&self, char_code: u32) -> bool {
+        if char_code > 127 {
+            return false; // Only ASCII for now
+        }
+        
+        if let Ok(mut touch) = self.bus.d1_touch.write() {
+            if let Some(ref mut dev) = *touch {
+                dev.push_char(char_code as u8);
+                return true;
+            }
+        }
+        false
+    }
+
     /// Check if there's a GPU frame ready for rendering.
     ///
     /// With direct memory framebuffer, this always returns true when GPU is enabled.

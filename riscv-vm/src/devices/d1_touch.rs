@@ -56,6 +56,13 @@ pub struct QueuedTouchEvent {
     pub pressed: bool,
 }
 
+/// Queued keyboard event
+#[derive(Clone, Copy, Debug)]
+pub struct QueuedKeyEvent {
+    pub key_code: u16,
+    pub pressed: bool,
+}
+
 /// Emulated GT911 Touchscreen Controller
 pub struct D1TouchEmulated {
     // Current touch state
@@ -68,6 +75,12 @@ pub struct D1TouchEmulated {
     
     // Event queue to handle rapid press/release before kernel polls
     event_queue: Vec<QueuedTouchEvent>,
+    
+    // Keyboard event queue (for evdev key codes)
+    key_event_queue: Vec<QueuedKeyEvent>,
+    
+    // Character queue (for actual typed characters - respects keyboard layout)
+    char_queue: Vec<u8>,
     
     // Configuration
     x_resolution: u16,
@@ -86,6 +99,8 @@ impl D1TouchEmulated {
             buffer_ready: false,
             pending_int: false,
             event_queue: Vec::with_capacity(16),
+            key_event_queue: Vec::with_capacity(32),
+            char_queue: Vec::with_capacity(64),
             x_resolution: DISPLAY_WIDTH,
             y_resolution: DISPLAY_HEIGHT,
             reg_addr: 0,
@@ -109,6 +124,20 @@ impl D1TouchEmulated {
             self.apply_next_queued_event();
         }
         
+    }
+    
+    /// Push a keyboard event (called from host/JS)
+    pub fn push_key(&mut self, key_code: u16, pressed: bool) {
+        self.key_event_queue.push(QueuedKeyEvent {
+            key_code,
+            pressed,
+        });
+    }
+    
+    /// Push a character (ASCII) from the browser - respects keyboard layout
+    /// This is the preferred way to send typed characters (e.g., '/' from Shift+7)
+    pub fn push_char(&mut self, ch: u8) {
+        self.char_queue.push(ch);
     }
     
     /// Apply the next queued event to current state
@@ -289,6 +318,39 @@ impl D1TouchEmulated {
             // Y resolution
             0x118 => self.y_resolution as u32,
             
+            // Keyboard event count
+            0x11C => self.key_event_queue.len() as u32,
+            
+            // Keyboard key code (peek front of queue)
+            0x120 => {
+                if let Some(event) = self.key_event_queue.first() {
+                    event.key_code as u32
+                } else {
+                    0
+                }
+            }
+            
+            // Keyboard key state (1 = pressed, 0 = released)
+            0x124 => {
+                if let Some(event) = self.key_event_queue.first() {
+                    if event.pressed { 1 } else { 0 }
+                } else {
+                    0
+                }
+            }
+            
+            // Character queue count (for typed characters respecting keyboard layout)
+            0x128 => self.char_queue.len() as u32,
+            
+            // Character code (peek front of queue)
+            0x12C => {
+                if let Some(&ch) = self.char_queue.first() {
+                    ch as u32
+                } else {
+                    0
+                }
+            }
+            
             _ => 0,
         }
     }
@@ -316,6 +378,20 @@ impl D1TouchEmulated {
                     if !self.event_queue.is_empty() {
                         self.apply_next_queued_event();
                     }
+                }
+            }
+            
+            // Acknowledge keyboard event (consume from queue)
+            0x11C => {
+                if value == 0 && !self.key_event_queue.is_empty() {
+                    self.key_event_queue.remove(0);
+                }
+            }
+            
+            // Acknowledge character (consume from queue)
+            0x128 => {
+                if value == 0 && !self.char_queue.is_empty() {
+                    self.char_queue.remove(0);
                 }
             }
             

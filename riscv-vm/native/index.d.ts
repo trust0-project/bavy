@@ -59,3 +59,4 @@ export declare class WebTransportClient {
   /** Shut down the connection and cleanup. */
   shutdown(): void
 }
+
