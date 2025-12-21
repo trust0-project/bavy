@@ -1,3 +1,13 @@
+## 0.4.2 (2025-12-21)
+
+### 🩹 Fixes
+
+- upgrade terminal inputs +performance Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([e15a1fe](https://github.com/trust0-project/bavy/commit/e15a1fe))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.4.1 (2025-12-20)
 
 ### 🩹 Fixes
