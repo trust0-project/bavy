@@ -481,6 +481,32 @@ impl WasmVm {
         ));
     }
 
+    /// Enable VirtIO 9P device for host directory mounting.
+    ///
+    /// This exposes a host directory to the guest kernel at the specified
+    /// mount point. The JavaScript side must provide a `window.p9Host` object
+    /// with the following methods:
+    /// - `read(path)` - Returns Uint8Array of file contents
+    /// - `write(path, data)` - Writes data to file, returns boolean
+    /// - `readdir(path)` - Returns array of `{name, isDir}` objects
+    /// - `exists(path)` - Returns boolean
+    /// - `isDir(path)` - Returns boolean
+    ///
+    /// # Arguments
+    /// * `host_path` - Path prefix for the host directory
+    /// * `mount_tag` - Mount tag for guest to identify the mount
+    pub fn enable_9p(&mut self, host_path: &str, mount_tag: &str) {
+        use crate::devices::virtio::VirtioP9Wasm;
+        
+        let p9_device = VirtioP9Wasm::new(host_path, mount_tag);
+        self.bus.virtio_devices.push(Box::new(p9_device));
+        
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
+            &format!("[VM] VirtIO 9P enabled: {} (tag: {})", host_path, mount_tag)
+        ));
+    }
+
+
     /// Send a keyboard event to the guest.
     ///
     /// # Arguments

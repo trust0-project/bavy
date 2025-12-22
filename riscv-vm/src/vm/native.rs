@@ -266,6 +266,29 @@ impl NativeVm {
         }
     }
 
+    /// Enable VirtIO 9P device for host directory mounting.
+    ///
+    /// Exposes a host directory to the guest at `/mnt`.
+    ///
+    /// # Arguments
+    /// * `host_path` - Path to the host directory to share
+    /// * `mount_tag` - Mount tag for guest identification (default: "hostfs")
+    ///
+    /// Must be called before `run()` / `start_workers()`.
+    pub fn enable_9p(&mut self, host_path: &str, mount_tag: Option<&str>) {
+        use crate::devices::virtio::VirtioP9;
+
+        if let Some(bus) = Arc::get_mut(&mut self.bus) {
+            let tag = mount_tag.unwrap_or("hostfs");
+            let p9dev = VirtioP9::new(host_path, tag);
+            bus.virtio_devices.push(Box::new(p9dev));
+            println!("[VM] VirtIO 9P device enabled: {} -> {}", host_path, tag);
+        } else {
+            eprintln!("[VM] Cannot enable 9P: workers already running");
+        }
+    }
+
+
     /// Get the number of harts.
     pub fn num_harts(&self) -> usize {
         self.num_harts
@@ -484,7 +507,7 @@ impl NativeVm {
 
         const BATCH_SIZE: u64 = 256;
         const VIRTIO_POLL_INTERVAL: u64 = 4096;
-        const CONSOLE_POLL_INTERVAL: u64 = 16384;
+        const CONSOLE_POLL_INTERVAL: u64 = 1024;  // Poll frequently for responsive input
 
         loop {
             if self.shared.should_stop() {

@@ -146,6 +146,141 @@ function parseSDCard(sdcard: Uint8Array): SDBootInfo {
 }
 
 /**
+ * Set up the 9P host interface for Node.js.
+ * 
+ * This creates a global `p9Host` object that the WASM VM's VirtioP9 device
+ * will call to perform filesystem operations on the host.
+ */
+function setup9PHost(hostPath: string): void {
+  const resolvedPath = path.resolve(hostPath);
+
+  // Ensure the directory exists
+  if (!fs.existsSync(resolvedPath)) {
+    console.error(`[9P] Warning: Host path does not exist: ${resolvedPath}`);
+    console.error(`[9P] Creating directory...`);
+    fs.mkdirSync(resolvedPath, { recursive: true });
+  }
+
+  // Create the p9Host interface on globalThis (works in Node.js)
+  (globalThis as any).p9Host = {
+    /**
+     * Read a file from the host filesystem.
+     * @param p9Path - Path relative to mount root
+     * @returns Uint8Array of file contents, or undefined if not found
+     */
+    read(p9Path: string): Uint8Array | undefined {
+      try {
+        // Remove leading mount path if present
+        const relativePath = p9Path.startsWith(resolvedPath)
+          ? p9Path.slice(resolvedPath.length)
+          : p9Path;
+        const fullPath = path.join(resolvedPath, relativePath);
+
+        if (!fs.existsSync(fullPath)) {
+          return undefined;
+        }
+
+        const data = fs.readFileSync(fullPath);
+        return new Uint8Array(data);
+      } catch (e) {
+        console.error(`[9P] read error: ${e}`);
+        return undefined;
+      }
+    },
+
+    /**
+     * Write data to a file on the host filesystem.
+     * @param p9Path - Path relative to mount root
+     * @param data - Data to write
+     * @returns true on success
+     */
+    write(p9Path: string, data: Uint8Array): boolean {
+      try {
+        const relativePath = p9Path.startsWith(resolvedPath)
+          ? p9Path.slice(resolvedPath.length)
+          : p9Path;
+        const fullPath = path.join(resolvedPath, relativePath);
+
+        // Ensure parent directory exists
+        const dir = path.dirname(fullPath);
+        if (!fs.existsSync(dir)) {
+          fs.mkdirSync(dir, { recursive: true });
+        }
+
+        fs.writeFileSync(fullPath, Buffer.from(data));
+        return true;
+      } catch (e) {
+        console.error(`[9P] write error: ${e}`);
+        return false;
+      }
+    },
+
+    /**
+     * List directory contents.
+     * @param p9Path - Path relative to mount root
+     * @returns Array of {name, isDir} objects
+     */
+    readdir(p9Path: string): Array<{ name: string, isDir: boolean }> {
+      try {
+        const relativePath = p9Path.startsWith(resolvedPath)
+          ? p9Path.slice(resolvedPath.length)
+          : p9Path;
+        const fullPath = path.join(resolvedPath, relativePath);
+
+        if (!fs.existsSync(fullPath)) {
+          return [];
+        }
+
+        const entries = fs.readdirSync(fullPath, { withFileTypes: true });
+        return entries.map(e => ({
+          name: e.name,
+          isDir: e.isDirectory(),
+        }));
+      } catch (e) {
+        console.error(`[9P] readdir error: ${e}`);
+        return [];
+      }
+    },
+
+    /**
+     * Check if a path exists.
+     * @param p9Path - Path relative to mount root
+     */
+    exists(p9Path: string): boolean {
+      try {
+        const relativePath = p9Path.startsWith(resolvedPath)
+          ? p9Path.slice(resolvedPath.length)
+          : p9Path;
+        const fullPath = path.join(resolvedPath, relativePath);
+        return fs.existsSync(fullPath);
+      } catch {
+        return false;
+      }
+    },
+
+    /**
+     * Check if a path is a directory.
+     * @param p9Path - Path relative to mount root
+     */
+    isDir(p9Path: string): boolean {
+      try {
+        const relativePath = p9Path.startsWith(resolvedPath)
+          ? p9Path.slice(resolvedPath.length)
+          : p9Path;
+        const fullPath = path.join(resolvedPath, relativePath);
+        const stat = fs.statSync(fullPath);
+        return stat.isDirectory();
+      } catch {
+        return false;
+      }
+    },
+  };
+
+  console.error(`[9P] Host interface ready: ${resolvedPath}`);
+}
+
+
+/**
  * Try to load the native WebTransport addon.
  * Returns the WebTransportClient class if available, null otherwise.
  */
@@ -187,6 +322,7 @@ async function createVm(
     certHash?: string;
     debug?: boolean;
     enableGpu?: boolean;
+    mountPath?: string;
   },
 ) {
   let sdcardBytes: Uint8Array;
@@ -222,6 +358,12 @@ async function createVm(
     console.error(`[CLI] Filesystem partition at sector ${bootInfo.fsPartitionStart}`);
   }
 
+  // Set up 9P host interface for Node.js (before creating VM)
+  if (options?.mountPath) {
+    setup9PHost(options.mountPath);
+    console.error(`[CLI] 9P host configured for: ${options.mountPath}`);
+  }
+
   const { WasmInternal } = await import('./');
   const wasm = await WasmInternal();
   const VmCtor = wasm.WasmVm;
@@ -243,11 +385,19 @@ async function createVm(
     }
   }
 
+  // Enable 9P device if mount path specified
+  if (options?.mountPath && typeof (vm as any).enable_9p === 'function') {
+    const resolvedMount = path.resolve(options.mountPath);
+    (vm as any).enable_9p(resolvedMount, 'hostfs');
+    console.error(`[VM] VirtIO 9P enabled: ${resolvedMount}`);
+  }
+
   // Enable GPU rendering if requested
   if (options?.enableGpu && typeof vm.enable_gpu === 'function') {
     vm.enable_gpu(1024, 768);
     console.error(`[VM] GPU enabled (1024x768)`);
   }
+
 
   // Start worker threads for secondary harts (1..numHarts)
   // Use vm.num_harts() to get the actual hart count (handles auto-detect case)
@@ -775,6 +925,10 @@ const argv = (yargs(hideBin(process.argv)) as any)
     type: 'string',
     describe: 'Certificate hash for WebTransport (for self-signed certs)',
   })
+  .option('mount', {
+    type: 'string',
+    describe: 'Mount a host directory via VirtIO 9P (NOT YET SUPPORTED in WASM mode - use native binary)',
+  })
   .option('debug', {
     type: 'boolean',
     describe: 'Enable debug output',
@@ -794,6 +948,7 @@ const argv = (yargs(hideBin(process.argv)) as any)
   const hartsArg = argv.harts as number | undefined;
   const netWebtransport = argv['net-webtransport'] as string | undefined;
   const certHash = argv['cert-hash'] as string | undefined;
+  const mountPath = argv.mount as string | undefined;
   const debug = argv.debug as boolean;
   const enableGpu = argv['enable-gpu'] as boolean;
 
@@ -826,7 +981,9 @@ const argv = (yargs(hideBin(process.argv)) as any)
       certHash,
       debug,
       enableGpu,
+      mountPath,
     });
+
 
     // Run with GUI or headless based on flag
     if (enableGpu) {

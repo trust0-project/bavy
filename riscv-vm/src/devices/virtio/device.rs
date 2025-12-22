@@ -41,6 +41,8 @@ pub const VIRTIO_CONSOLE_DEVICE_ID: u32 = 3;
 pub const VIRTIO_RNG_DEVICE_ID: u32 = 4;
 pub const VIRTIO_GPU_DEVICE_ID: u32 = 16;
 pub const VIRTIO_INPUT_DEVICE_ID: u32 = 18;
+pub const VIRTIO_9P_DEVICE_ID: u32 = 9;
+
 
 // VirtIO Block Features
 #[allow(dead_code)]

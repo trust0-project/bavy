@@ -42,6 +42,10 @@ struct Args {
     #[arg(long, default_value = "1")]
     scale: u8,
 
+    /// Mount a host directory via VirtIO 9P (accessible at /mnt in guest)
+    #[arg(long)]
+    mount: Option<PathBuf>,
+
     /// Enable debug output
     #[arg(long)]
     debug: bool,
@@ -145,6 +149,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Enable GPU if requested
     if args.enable_gpu {
         vm.enable_gpu(1024, 768);
+    }
+
+    // Enable host directory mounting via 9P if specified
+    if let Some(mount_path) = &args.mount {
+        let path_str = mount_path.to_string_lossy();
+        vm.enable_9p(&path_str, None);
     }
 
     // Connect to WebTransport relay if specified
