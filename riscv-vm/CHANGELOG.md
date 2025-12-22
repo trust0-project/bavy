@@ -1,3 +1,13 @@
+## 0.5.0 (2025-12-22)
+
+### 🚀 Features
+
+- filesystem mount Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([a37743d](https://github.com/trust0-project/bavy/commit/a37743d))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.4.2 (2025-12-21)
 
 ### 🩹 Fixes
