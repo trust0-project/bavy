@@ -1,3 +1,13 @@
+## 0.5.1 (2025-12-23)
+
+### 🩹 Fixes
+
+- download sdcard image on the fly Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([49e8691](https://github.com/trust0-project/bavy/commit/49e8691))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.5.0 (2025-12-22)
 
 ### 🚀 Features
