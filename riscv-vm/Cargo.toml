@@ -35,6 +35,8 @@ napi-derive = { version = "2", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+# Simple synchronous HTTP client for SD card URL downloads
+ureq = { version = "2", features = ["tls"] }
 tungstenite = "0.21"
 # WebTransport for connecting to the relay
 wtransport = { version = "0.6", features = ["dangerous-configuration"] }

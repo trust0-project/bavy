@@ -1,7 +1,7 @@
 use clap::Parser;
 use std::fs;
-use std::io::Write;
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 
 use riscv_vm::sdboot;
 use riscv_vm::vm::native::NativeVm;
@@ -18,9 +18,10 @@ use minifb::{Key, MouseButton, MouseMode, Window, WindowOptions, Scale};
 #[command(about = "RISCV emulator with SMP support")]
 #[command(version)]
 struct Args {
-    /// Path to SD card image (contains kernel + filesystem)
+    /// Path or URL to SD card image (contains kernel + filesystem)
+    /// Supports local files or http:// / https:// URLs
     #[arg(short, long)]
-    sdcard: PathBuf,
+    sdcard: String,
 
     /// Number of harts (CPUs), 0 for auto-detect
     #[arg(short = 'n', long, default_value = "0")]
@@ -74,6 +75,68 @@ macro_rules! uart_println {
     }};
 }
 
+/// Load SD card data from a URL or local file path.
+/// 
+/// Supports:
+/// - Local file paths (absolute or relative)
+/// - HTTP/HTTPS URLs (downloads with progress display)
+fn load_sdcard_data(source: &str, debug: bool) -> Result<Vec<u8>, String> {
+    if source.starts_with("http://") || source.starts_with("https://") {
+        // Download from URL
+        if debug {
+            eprintln!("[CLI] Downloading SD card from {}...", source);
+        } else {
+            eprintln!("Downloading SD card image...");
+        }
+        
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(30))
+            .build();
+        
+        let response = agent.get(source).call()
+            .map_err(|e| format!("Failed to download SD card from '{}': {}", source, e))?;
+        
+        // Check for success status
+        let status = response.status();
+        if status != 200 {
+            return Err(format!("HTTP {} when downloading '{}'", status, source));
+        }
+        
+        // Get content length if available for progress display
+        let content_length = response.header("Content-Length")
+            .and_then(|s| s.parse::<usize>().ok());
+        
+        if let Some(len) = content_length {
+            if debug {
+                eprintln!("[CLI] Expected size: {} bytes", len);
+            }
+        }
+        
+        // Read the response body
+        let mut data = if let Some(len) = content_length {
+            Vec::with_capacity(len)
+        } else {
+            Vec::new()
+        };
+        
+        response.into_reader().read_to_end(&mut data)
+            .map_err(|e| format!("Failed to read response body: {}", e))?;
+        
+        eprintln!("Downloaded {} bytes", data.len());
+        
+        Ok(data)
+    } else {
+        // Read from local file
+        let path = Path::new(source);
+        if !path.exists() {
+            return Err(format!("SD card image not found at '{}'", source));
+        }
+        
+        fs::read(path)
+            .map_err(|e| format!("Failed to read SD card image '{}': {}", source, e))
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
@@ -92,9 +155,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     }
 
-    // Load SD card image
-    let sdcard_data = fs::read(&args.sdcard)
-        .map_err(|e| format!("Failed to read SD card image '{}': {}", args.sdcard.display(), e))?;
+    // Load SD card image (from URL or local file)
+    let sdcard_data = load_sdcard_data(&args.sdcard, args.debug)?;
 
     // Parse SD card: find kernel on boot partition
     let boot_info = sdboot::parse_sdcard(&sdcard_data)
@@ -120,12 +182,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         uart_println!("║  RISCV-VM with OpenSBI                                       ║");
     }
     uart_println!("╠══════════════════════════════════════════════════════════════╣");
+    // Extract display name from path or URL
+    let sdcard_display = args.sdcard.rsplit('/').next()
+        .unwrap_or(&args.sdcard);
+    let sdcard_display = if sdcard_display.len() > 52 {
+        &sdcard_display[..52]
+    } else {
+        sdcard_display
+    };
     uart_println!(
         "║  SD Card: {:52} ║",
-        args.sdcard
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
+        sdcard_display
     );
     uart_println!("║  Kernel:  {} bytes @ {:#x}{:>23} ║", 
         boot_info.kernel_data.len(),
