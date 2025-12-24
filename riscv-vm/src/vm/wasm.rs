@@ -201,19 +201,19 @@ impl WasmVm {
         // Check if SharedArrayBuffer is available for true parallelism
         let sab_available = check_shared_array_buffer_available();
 
-        // IMPORTANT: When SAB is available, we must have at least 2 harts.
-        // There's a subtle bug where 1 hart + SAB causes filesystem initialization
-        // to fail. The secondary hart just parks via WFI with minimal overhead.
-        if sab_available && num_harts < 2 {
-            web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
-                "[VM] Forcing min 2 harts for SAB mode (1-hart SAB has FS init bug)",
-            ));
-            num_harts = 2;
-        }
+        // Only use SharedArrayBuffer when we have 2+ harts.
+        // Single-hart mode doesn't benefit from SAB and has known timing issues
+        // with the SAB-backed bus. Using standard DRAM for 1 hart is simpler and
+        // more reliable.
+        let use_sab = sab_available && num_harts > 1;
 
-        if sab_available {
+        if use_sab {
             web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
                 "[VM] SharedArrayBuffer available - enabling SMP mode",
+            ));
+        } else if sab_available && num_harts == 1 {
+            web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
+                "[VM] Single-hart mode - using standard DRAM (SAB disabled for reliability)",
             ));
         } else {
             web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(
@@ -221,7 +221,7 @@ impl WasmVm {
             ));
         }
 
-        // Create bus with shared memory if available
+        // Create bus with shared memory only if using SAB (2+ harts)
         let (
             bus,
             shared_buffer,
@@ -229,7 +229,7 @@ impl WasmVm {
             shared_clint,
             shared_uart_output,
             shared_uart_input,
-        ) = if sab_available {
+        ) = if use_sab {
             // Create SharedArrayBuffer for shared memory
             let total_size = shared_mem::total_shared_size(DRAM_SIZE);
             let sab = js_sys::SharedArrayBuffer::new(total_size as u32);
@@ -359,9 +359,12 @@ impl WasmVm {
         let mmc = D1MmcEmulated::new(disk_image.to_vec());
         *self.bus.d1_mmc.write().unwrap() = Some(mmc);
         
+        // Verify the device is attached
+        let attached = self.bus.d1_mmc.read().unwrap().is_some();
+        
         web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
-            "[VM] D1 MMC loaded with {} byte disk image",
-            disk_image.len()
+            "[VM] D1 MMC loaded with {} byte disk image, attached={}",
+            disk_image.len(), attached
         )));
     }
 
@@ -659,6 +662,45 @@ impl WasmVm {
                 dev.push_char(char_code as u8);
                 return true;
             }
+        }
+        false
+    }
+
+    /// Request cancellation of running command.
+    /// 
+    /// This sets a flag in SharedArrayBuffer that all workers can see.
+    /// The kernel checks this flag in the should_cancel() syscall.
+    /// 
+    /// Call this when:
+    /// - User clicks Cancel button
+    /// - User presses 'q' or ESC during a command
+    /// - User presses Ctrl+C
+    pub fn request_cancel(&self) {
+        // Write the cancellation flag to SharedArrayBuffer at the cancellation offset
+        if let Some(ref sab) = self.shared_buffer {
+            use crate::shared_mem::wasm::SharedControl;
+            let control = SharedControl::new(sab);
+            control.request_cancel();
+        }
+    }
+
+    /// Clear the cancellation flag.
+    /// 
+    /// Call this when a new command starts to reset the cancellation state.
+    pub fn clear_cancel(&self) {
+        if let Some(ref sab) = self.shared_buffer {
+            use crate::shared_mem::wasm::SharedControl;
+            let control = SharedControl::new(sab);
+            control.clear_cancel();
+        }
+    }
+
+    /// Check if cancellation has been requested.
+    pub fn is_cancel_requested(&self) -> bool {
+        if let Some(ref sab) = self.shared_buffer {
+            use crate::shared_mem::wasm::SharedControl;
+            let control = SharedControl::new(sab);
+            return control.is_cancel_requested();
         }
         false
     }
@@ -1151,13 +1193,18 @@ impl WasmVm {
             }
 
             // Update CLINT timer - use shared CLINT if available, otherwise local
-            if let Some(ref clint) = self.shared_clint {
-                // Increment mtime in shared memory (SMP mode)
-                clint.tick(100); // 100 ticks per poll
-            } else {
-                // Increment mtime in local CLINT (non-SAB single-hart mode)
+            // NOTE: In single-hart SAB mode (num_harts == 1 with shared_clint), we tick
+            // per-step in the fix block below instead of here, to avoid double-ticking.
+            if self.num_harts > 1 {
+                // Multi-hart SAB mode: tick periodically (every 100 steps)
+                if let Some(ref clint) = self.shared_clint {
+                    clint.tick(100);
+                }
+            } else if self.shared_clint.is_none() {
+                // Non-SAB single-hart mode: use local CLINT
                 self.bus.clint.tick();
             }
+            // Single-hart SAB mode (num_harts == 1 with shared_clint): ticked per-step below
             
             // Update RTC with current host time
             // js_sys::Date::now() returns milliseconds since Unix epoch
@@ -1169,6 +1216,43 @@ impl WasmVm {
             // Use direct CSR array access (bypassing privilege check - we're emulating hardware).
             const CSR_MIP: usize = 0x344;
             if let Some(ref clint) = self.shared_clint {
+                let (msip, timer) = clint.check_interrupts(0);
+                if msip || timer {
+                    let mut mip = self.cpu.csrs[CSR_MIP];
+                    if msip {
+                        mip |= 1 << 1; // SSIP
+                    }
+                    if timer {
+                        mip |= 1 << 5; // STIP
+                    }
+                    self.cpu.csrs[CSR_MIP] = mip;
+                }
+            }
+        }
+
+        // CRITICAL FIX: Single-hart SAB mode requires per-step timer ticking and interrupt sync.
+        // 
+        // In multi-hart mode, workers tick their own timers and handle interrupts.
+        // But in single-hart SAB mode (num_harts == 1 with shared_clint), we use the
+        // SharedArrayBuffer bus but have no workers. The periodic poll (every 100 steps)
+        // is too slow for time-sensitive operations like MMC completion during FS init.
+        //
+        // We need to:
+        // 1. Tick the shared CLINT timer every step (not just every 100)
+        // 2. Sync interrupts to CPU's MIP every step
+        //
+        // Performance note: This adds ~2 atomic ops per step in single-hart SAB mode,
+        // but this mode is typically used for debugging, not performance-critical workloads.
+        if self.num_harts == 1 {
+            if let Some(ref clint) = self.shared_clint {
+                // Tick the timer every step to ensure timer interrupts fire correctly.
+                // In multi-hart mode, the periodic tick(100) every 100 steps is sufficient
+                // because workers run in parallel. But in single-hart SAB, we need per-step
+                // ticking to avoid timing-related bugs.
+                clint.tick(1);
+                
+                // Sync CLINT interrupt state to CPU's MIP register.
+                const CSR_MIP: usize = 0x344;
                 let (msip, timer) = clint.check_interrupts(0);
                 if msip || timer {
                     let mut mip = self.cpu.csrs[CSR_MIP];

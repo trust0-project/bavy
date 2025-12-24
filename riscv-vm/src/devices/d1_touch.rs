@@ -340,7 +340,10 @@ impl D1TouchEmulated {
             }
             
             // Character queue count (for typed characters respecting keyboard layout)
-            0x128 => self.char_queue.len() as u32,
+            0x128 => {
+                let count = self.char_queue.len() as u32;
+                count
+            }
             
             // Character code (peek front of queue)
             0x12C => {

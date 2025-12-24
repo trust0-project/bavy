@@ -110,6 +110,10 @@ pub const CTRL_START_TIME_MS_HI: u32 = 8;
 /// Packed as big-endian: [IP0 << 24 | IP1 << 16 | IP2 << 8 | IP3]
 /// 0 means no IP assigned yet.
 pub const CTRL_D1_EMAC_IP: u32 = 9;
+/// Control region: Cancellation requested flag (i32 index 10)
+/// Set by main thread when user requests cancellation (Cancel button, 'q', ESC)
+/// Workers check this flag to cancel running commands.
+pub const CTRL_CANCEL_REQUESTED: u32 = 10;
 
 // ============================================================================
 // CLINT Region Offsets (relative to CLINT region start at CONTROL_REGION_SIZE)
@@ -530,6 +534,22 @@ pub mod wasm {
         /// Returns 0 if no IP assigned.
         pub fn get_d1_emac_ip_packed(&self) -> u32 {
             Atomics::load(&self.view, CTRL_D1_EMAC_IP).unwrap_or(0) as u32
+        }
+
+        /// Check if cancellation has been requested.
+        /// Workers check this flag to cancel running commands.
+        pub fn is_cancel_requested(&self) -> bool {
+            Atomics::load(&self.view, CTRL_CANCEL_REQUESTED).unwrap_or(0) != 0
+        }
+
+        /// Request cancellation (called by main thread when user presses Cancel, 'q', ESC).
+        pub fn request_cancel(&self) {
+            let _ = Atomics::store(&self.view, CTRL_CANCEL_REQUESTED, 1);
+        }
+
+        /// Clear cancellation flag (called when command finishes or new command starts).
+        pub fn clear_cancel(&self) {
+            let _ = Atomics::store(&self.view, CTRL_CANCEL_REQUESTED, 0);
         }
     }
 

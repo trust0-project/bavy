@@ -843,6 +843,17 @@ impl SystemBus {
 
         // D1 MMC Controller (0x0402_0000 - 0x0402_0FFF)
         if addr >= D1_MMC0_BASE && addr < D1_MMC0_BASE + D1_MMC0_SIZE {
+            // DEBUG: Log first MMC access to trace device visibility
+            static MMC_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !MMC_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let device_present = self.d1_mmc.read().map(|g| g.is_some()).unwrap_or(false);
+                #[cfg(target_arch = "wasm32")]
+                web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+                    "[BUS MMC DEBUG] First read at 0x{:x}, device present: {}",
+                    addr, device_present
+                )));
+            }
+            
             if let Ok(mut mmc) = self.d1_mmc.write() {
                 if let Some(ref mut dev) = *mmc {
                     return Ok(dev.mmio_read32(addr));
@@ -877,6 +888,18 @@ impl SystemBus {
 
         // D1 I2C2 / Touch Controller (0x0250_2000 - 0x0250_23FF)
         if addr >= D1_I2C2_BASE && addr < D1_I2C2_BASE + D1_I2C2_SIZE {
+            let offset = addr - D1_I2C2_BASE;
+            
+            // Special handling for cancellation flag (offset 0x130)
+            // This reads from SharedArrayBuffer so workers can see main thread's cancellation request
+            #[cfg(target_arch = "wasm32")]
+            if offset == 0x130 {
+                if let Some(ref control) = self.shared_control {
+                    return Ok(if control.is_cancel_requested() { 1 } else { 0 });
+                }
+                return Ok(0);
+            }
+            
             if let Ok(mut touch) = self.d1_touch.write() {
                 if let Some(ref mut dev) = *touch {
                     return Ok(dev.mmio_read32(addr));
