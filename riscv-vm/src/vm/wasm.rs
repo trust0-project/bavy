@@ -196,10 +196,20 @@ impl WasmVm {
         const DRAM_SIZE: usize = 512 * 1024 * 1024; // 512 MiB
 
         // Detect or use specified hart count
-        let num_harts = num_harts.unwrap_or_else(detect_hart_count);
+        let mut num_harts = num_harts.unwrap_or_else(detect_hart_count);
 
         // Check if SharedArrayBuffer is available for true parallelism
         let sab_available = check_shared_array_buffer_available();
+
+        // IMPORTANT: When SAB is available, we must have at least 2 harts.
+        // There's a subtle bug where 1 hart + SAB causes filesystem initialization
+        // to fail. The secondary hart just parks via WFI with minimal overhead.
+        if sab_available && num_harts < 2 {
+            web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
+                "[VM] Forcing min 2 harts for SAB mode (1-hart SAB has FS init bug)",
+            ));
+            num_harts = 2;
+        }
 
         if sab_available {
             web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(

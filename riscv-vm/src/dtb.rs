@@ -166,6 +166,18 @@ pub fn generate_dtb(
     builder.add_prop_u32("interrupt-parent", 100); // PLIC phandle
     builder.end_node();
     
+    // VirtIO MMIO devices @ 0x1000_1000..0x1000_8000 (8 slots)
+    // These are discovered by the kernel at runtime via DTB parsing
+    for i in 0..8u64 {
+        let addr = 0x1000_1000 + i * 0x1000;
+        builder.begin_node(&format!("virtio@{:x}", addr));
+        builder.add_prop_string("compatible", "virtio,mmio");
+        builder.add_prop_reg64(addr, 0x1000);
+        builder.add_prop_u32("interrupts", (1 + i) as u32); // Interrupts 1-8
+        builder.add_prop_u32("interrupt-parent", 100); // PLIC phandle
+        builder.end_node();
+    }
+    
     // D1 Display Engine @ 0x0510_0000 (DE2) + 0x0546_1000 (TCON)
     if d1_config.has_display {
         builder.begin_node("display-engine@5100000");
