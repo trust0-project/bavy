@@ -1,3 +1,13 @@
+## 0.6.0 (2025-12-24)
+
+### 🚀 Features
+
+- DTB discovery Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([4294cb2](https://github.com/trust0-project/bavy/commit/4294cb2))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.5.1 (2025-12-23)
 
 ### 🩹 Fixes
