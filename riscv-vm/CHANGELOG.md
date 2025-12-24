@@ -1,3 +1,13 @@
+## 0.6.1 (2025-12-24)
+
+### 🩹 Fixes
+
+- sinlge hart ssb fix Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([d345578](https://github.com/trust0-project/bavy/commit/d345578))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.6.0 (2025-12-24)
 
 ### 🚀 Features
