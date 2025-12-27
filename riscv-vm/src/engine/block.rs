@@ -32,6 +32,9 @@ pub struct Block {
     pub exec_count: u32,
     /// Generation counter (for cache invalidation).
     pub generation: u32,
+    /// Next block PC for direct chaining (set when block ends with JAL or fallthrough).
+    /// If Some(pc), executor can jump directly to cached block at pc without lookup.
+    pub next_block_pc: Option<u64>,
 }
 
 impl Block {
@@ -45,6 +48,7 @@ impl Block {
             ops: [MicroOp::Fence; MAX_BLOCK_SIZE], // Dummy init
             exec_count: 0,
             generation,
+            next_block_pc: None,
         }
     }
 
@@ -138,18 +142,31 @@ impl<'a> BlockCompiler<'a> {
                 }
             };
 
+            // Check if this is a JAL (unconditional jump) with known target
+            // If so, we can chain to the target block
+            let jal_target = match &op {
+                Op::Jal { imm, .. } => {
+                    let target = (pc as i64).wrapping_add(*imm) as u64;
+                    Some(target)
+                }
+                _ => None,
+            };
+
             // Convert to MicroOp
             let micro_op = self.transcode(op, pc_offset, insn_len);
             let is_term = micro_op.is_terminator();
 
             // Add to block
             if !block.push(micro_op, insn_len) {
-                // Block full
+                // Block full - chain to next instruction
+                block.next_block_pc = Some(pc);
                 return CompileResult::Ok(block);
             }
 
             // Check termination conditions
             if is_term {
+                // Set next_block_pc for JAL (direct jump with known target)
+                block.next_block_pc = jal_target;
                 return CompileResult::Ok(block);
             }
 
@@ -157,9 +174,10 @@ impl<'a> BlockCompiler<'a> {
             pc = pc.wrapping_add(insn_len as u64);
             pc_offset += insn_len as u16;
 
-            // Check page boundary
+            // Check page boundary - chain to next page
             let next_page = (start_pc & !0xFFF) + 0x1000;
             if pc >= next_page {
+                block.next_block_pc = Some(pc);
                 return CompileResult::Ok(block);
             }
         }

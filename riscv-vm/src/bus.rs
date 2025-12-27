@@ -47,6 +47,112 @@ pub const VIRTIO_STRIDE: u64 = 0x1000;
 pub const RTC_BASE: u64 = 0x1010_0000;
 pub const RTC_SIZE: u64 = 0x8; // 8 bytes: low 32 bits + high 32 bits
 
+// ═══════════════════════════════════════════════════════════════════════════
+// MMIO Device Map for O(log N) Binary Search Dispatch
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Device identifiers for MMIO dispatch.
+/// Used by `lookup_device` to route MMIO accesses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DeviceId {
+    TestFinisher = 0,
+    SysInfo = 1,
+    Clint = 2,
+    D1Audio = 3,
+    D1Touch = 4,
+    D1Mmc0 = 5,
+    D1Emac = 6,
+    D1De = 7,
+    D1MipiDsi = 8,
+    D1Dphy = 9,
+    D1TconLcd = 10,
+    Plic = 11,
+    Uart = 12,
+    VirtioSlot0 = 13,
+    VirtioSlot1 = 14,
+    VirtioSlot2 = 15,
+    VirtioSlot3 = 16,
+    VirtioSlot4 = 17,
+    VirtioSlot5 = 18,
+    Rtc = 19,
+}
+
+/// A region in the MMIO address map.
+#[derive(Clone, Copy)]
+struct DeviceRegion {
+    base: u64,
+    size: u64,
+    device: DeviceId,
+}
+
+/// Sorted device regions for binary search.
+/// CRITICAL: Must be sorted by `base` address in ascending order!
+const DEVICE_REGIONS: [DeviceRegion; 20] = [
+    // 0x0010_0000 - TEST_FINISHER
+    DeviceRegion { base: TEST_FINISHER_BASE, size: TEST_FINISHER_SIZE, device: DeviceId::TestFinisher },
+    // 0x0011_0000 - SYSINFO
+    DeviceRegion { base: SYSINFO_BASE, size: SYSINFO_SIZE, device: DeviceId::SysInfo },
+    // 0x0200_0000 - CLINT
+    DeviceRegion { base: CLINT_BASE, size: CLINT_SIZE, device: DeviceId::Clint },
+    // 0x0203_0000 - D1_AUDIO
+    DeviceRegion { base: D1_AUDIO_BASE, size: D1_AUDIO_SIZE, device: DeviceId::D1Audio },
+    // 0x0250_2000 - D1_I2C2/TOUCH
+    DeviceRegion { base: D1_I2C2_BASE, size: D1_I2C2_SIZE, device: DeviceId::D1Touch },
+    // 0x0402_0000 - D1_MMC0
+    DeviceRegion { base: D1_MMC0_BASE, size: D1_MMC0_SIZE, device: DeviceId::D1Mmc0 },
+    // 0x0450_0000 - D1_EMAC
+    DeviceRegion { base: D1_EMAC_BASE, size: D1_EMAC_SIZE, device: DeviceId::D1Emac },
+    // 0x0510_0000 - D1_DE
+    DeviceRegion { base: D1_DE_BASE, size: D1_DE_SIZE, device: DeviceId::D1De },
+    // 0x0545_0000 - D1_MIPI_DSI
+    DeviceRegion { base: D1_MIPI_DSI_BASE, size: D1_MIPI_DSI_SIZE, device: DeviceId::D1MipiDsi },
+    // 0x0545_1000 - D1_DPHY
+    DeviceRegion { base: D1_DPHY_BASE, size: D1_DPHY_SIZE, device: DeviceId::D1Dphy },
+    // 0x0546_1000 - D1_TCON_LCD0
+    DeviceRegion { base: D1_TCON_LCD0, size: D1_TCON_SIZE, device: DeviceId::D1TconLcd },
+    // 0x0C00_0000 - PLIC
+    DeviceRegion { base: PLIC_BASE, size: PLIC_SIZE, device: DeviceId::Plic },
+    // 0x1000_0000 - UART
+    DeviceRegion { base: UART_BASE, size: UART_SIZE, device: DeviceId::Uart },
+    // 0x1000_1000 - VIRTIO Slot 0
+    DeviceRegion { base: VIRTIO_BASE, size: VIRTIO_STRIDE, device: DeviceId::VirtioSlot0 },
+    // 0x1000_2000 - VIRTIO Slot 1
+    DeviceRegion { base: VIRTIO_BASE + VIRTIO_STRIDE, size: VIRTIO_STRIDE, device: DeviceId::VirtioSlot1 },
+    // 0x1000_3000 - VIRTIO Slot 2
+    DeviceRegion { base: VIRTIO_BASE + 2 * VIRTIO_STRIDE, size: VIRTIO_STRIDE, device: DeviceId::VirtioSlot2 },
+    // 0x1000_4000 - VIRTIO Slot 3
+    DeviceRegion { base: VIRTIO_BASE + 3 * VIRTIO_STRIDE, size: VIRTIO_STRIDE, device: DeviceId::VirtioSlot3 },
+    // 0x1000_5000 - VIRTIO Slot 4
+    DeviceRegion { base: VIRTIO_BASE + 4 * VIRTIO_STRIDE, size: VIRTIO_STRIDE, device: DeviceId::VirtioSlot4 },
+    // 0x1000_6000 - VIRTIO Slot 5
+    DeviceRegion { base: VIRTIO_BASE + 5 * VIRTIO_STRIDE, size: VIRTIO_STRIDE, device: DeviceId::VirtioSlot5 },
+    // 0x1010_0000 - RTC
+    DeviceRegion { base: RTC_BASE, size: RTC_SIZE, device: DeviceId::Rtc },
+];
+
+/// Look up the device responsible for an MMIO address.
+/// Uses binary search for O(log N) complexity.
+/// Returns (DeviceId, offset_within_device) or None if unmapped.
+#[inline]
+fn lookup_device(addr: u64) -> Option<(DeviceId, u64)> {
+    // Binary search: find the rightmost region with base <= addr
+    let idx = DEVICE_REGIONS.partition_point(|r| r.base <= addr);
+    
+    // partition_point returns the first index where base > addr,
+    // so we need the previous index
+    if idx == 0 {
+        return None;
+    }
+    
+    let region = &DEVICE_REGIONS[idx - 1];
+    if addr >= region.base && addr < region.base + region.size {
+        Some((region.device, addr - region.base))
+    } else {
+        None
+    }
+}
+
 /// System bus trait for memory and MMIO access.
 ///
 /// All methods take `&self` to allow concurrent access from multiple harts.

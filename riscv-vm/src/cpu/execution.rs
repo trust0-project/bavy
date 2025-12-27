@@ -63,79 +63,133 @@ impl Cpu {
 
     /// Try to execute a compiled block at current PC.
     /// Returns Some(result) if block was executed, None if should fall back to interpreter.
+    /// 
+    /// Block Chaining: When a block ends with a known next_block_pc (JAL target or fallthrough),
+    /// we jump directly to the next cached block without returning to step(). This reduces
+    /// dispatch overhead for hot code paths.
     fn try_execute_block(&mut self, bus: &dyn Bus) -> Option<Result<(), Trap>> {
-        let pc = self.pc;
+        let mut current_pc = self.pc;
+        const MAX_CHAIN_DEPTH: u32 = 16; // Limit chaining to avoid starvation
+        let mut chain_count = 0u32;
 
-        // Check block cache for existing block (single lookup with exec_count update)
-        if let Some(block) = self.block_cache.get_and_touch(pc) {
-            // Execute directly from cached block - no cloning needed!
-            // We copy the block fields we need to avoid borrow checker issues
-            // with self.execute_block_inner needing &mut self
-            let start_pc = block.start_pc;
-            let start_pa = block.start_pa;
-            let len = block.len;
-            let byte_len = block.byte_len;
-            let generation = block.generation;
+        loop {
+            // Check block cache for existing block
+            // ZERO-COPY: Get a raw pointer to the block, drop the borrow, then execute.
+            // Safety: The block is not removed from cache during execution (we hold &mut self),
+            // and the block is not mutated during execution. This eliminates ~1KB copy per block.
+            let block_ptr_and_meta: Option<(*const Block, Option<u64>)> = {
+                if let Some(block) = self.block_cache.get_and_touch(current_pc) {
+                    Some((block as *const Block, block.next_block_pc))
+                } else {
+                    None
+                }
+            }; // Borrow of block_cache ends here
             
-            // Copy only the ops slice we need, not the full array
-            // This is still a copy but unavoidable due to borrow checker
-            let mut ops_copy = [MicroOp::Fence; MAX_BLOCK_SIZE];
-            ops_copy[..len as usize].copy_from_slice(&block.ops[..len as usize]);
-
-            let exec_block = Block {
-                start_pc,
-                start_pa,
-                len,
-                byte_len,
-                ops: ops_copy,
-                exec_count: 0,
-                generation,
-            };
-
-            let result = self.execute_block_inner(&exec_block, bus);
-            return Some(self.handle_block_result(result, bus));
-        }
-
-        // Try to compile a new block
-        let generation = self.block_cache.generation;
-        let satp = self.csrs[CSR_SATP as usize];
-        let mstatus = self.csrs[CSR_MSTATUS as usize];
-
-        let compile_result = {
-            let mut compiler = BlockCompiler {
-                bus,
-                satp,
-                mstatus,
-                mode: self.mode,
-                tlb: &mut self.tlb,
-            };
-            compiler.compile(pc, generation)
-        };
-
-        match compile_result {
-            CompileResult::Ok(block) => {
-                // Clone needed values before inserting
-                let exec_block = Block {
-                    start_pc: block.start_pc,
-                    start_pa: block.start_pa,
-                    len: block.len,
-                    byte_len: block.byte_len,
-                    ops: block.ops,
-                    exec_count: 0,
-                    generation: block.generation,
-                };
-
-                // Insert into cache
-                self.block_cache.insert(block);
-
-                // Execute the block
-                let result = self.execute_block_inner(&exec_block, bus);
-                Some(self.handle_block_result(result, bus))
+            if let Some((block_ptr, next_block_pc)) = block_ptr_and_meta {
+                // SAFETY: The raw pointer is valid because:
+                // 1. It was just obtained from block_cache.get_and_touch()
+                // 2. block_cache is not modified during execute_block_inner
+                // 3. We hold &mut self, so no other code can access block_cache
+                let block = unsafe { &*block_ptr };
+                let result = self.execute_block_inner(block, bus);
+                
+                // Handle block result
+                match result {
+                    crate::cpu::core::BlockExecResult::Continue(next_pc) => {
+                        self.pc = next_pc;
+                        
+                        // Block Chaining: if we have a known next block and haven't chained too many,
+                        // try to jump directly to it
+                        chain_count += 1;
+                        if chain_count < MAX_CHAIN_DEPTH {
+                            if let Some(chain_pc) = next_block_pc {
+                                if chain_pc == next_pc {
+                                    // Target matches - try to chain
+                                    current_pc = next_pc;
+                                    continue;
+                                }
+                            }
+                        }
+                        
+                        // No chaining - return to main loop
+                        return Some(Ok(()));
+                    }
+                    crate::cpu::core::BlockExecResult::Trap { trap, fault_pc } => {
+                        return Some(self.handle_trap(trap, fault_pc, None));
+                    }
+                    crate::cpu::core::BlockExecResult::Exit { next_pc: exit_pc } => {
+                        self.pc = exit_pc;
+                        return None; // Fall back to interpreter
+                    }
+                }
             }
-            CompileResult::Trap(trap) => Some(self.handle_trap(trap, pc, None)),
-            CompileResult::Unsuitable => {
-                // Fall through to single-step
-                None
+
+            // No cached block - try to compile one (only on first iteration)
+            if chain_count > 0 {
+                // We were chaining but hit a cache miss - return to main loop
+                return Some(Ok(()));
+            }
+
+            let generation = self.block_cache.generation;
+            let satp = self.csrs[CSR_SATP as usize];
+            let mstatus = self.csrs[CSR_MSTATUS as usize];
+
+            let compile_result = {
+                let mut compiler = BlockCompiler {
+                    bus,
+                    satp,
+                    mstatus,
+                    mode: self.mode,
+                    tlb: &mut self.tlb,
+                };
+                compiler.compile(current_pc, generation)
+            };
+
+            match compile_result {
+                CompileResult::Ok(block) => {
+                    let exec_block = Block {
+                        start_pc: block.start_pc,
+                        start_pa: block.start_pa,
+                        len: block.len,
+                        byte_len: block.byte_len,
+                        ops: block.ops,
+                        exec_count: 0,
+                        generation: block.generation,
+                        next_block_pc: block.next_block_pc,
+                    };
+                    let next_block_pc = block.next_block_pc;
+
+                    self.block_cache.insert(block);
+
+                    let result = self.execute_block_inner(&exec_block, bus);
+                    match result {
+                        crate::cpu::core::BlockExecResult::Continue(next_pc) => {
+                            self.pc = next_pc;
+                            
+                            // Try chaining for newly compiled block too
+                            chain_count += 1;
+                            if chain_count < MAX_CHAIN_DEPTH {
+                                if let Some(chain_pc) = next_block_pc {
+                                    if chain_pc == next_pc {
+                                        current_pc = next_pc;
+                                        continue;
+                                    }
+                                }
+                            }
+                            
+                            return Some(Ok(()));
+                        }
+                        crate::cpu::core::BlockExecResult::Trap { trap, fault_pc } => {
+                            return Some(self.handle_trap(trap, fault_pc, None));
+                        }
+                        crate::cpu::core::BlockExecResult::Exit { next_pc: exit_pc } => {
+                            self.pc = exit_pc;
+                            return None;
+                        }
+                    }
+                }
+                CompileResult::Trap(trap) => return Some(self.handle_trap(trap, current_pc, None)),
+                CompileResult::Unsuitable => return None,
             }
         }
     }

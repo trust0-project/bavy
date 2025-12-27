@@ -727,14 +727,97 @@ async function runVmWithGui(vm: any, nativeNetClient: any | null, workers: Worke
     }
   });
 
+  // SDL scancode to JavaScript keyCode mapping
+  // Based on SDL_Scancode values from USB HID Usage Tables
+  const scancodeToJsKeyCode: Record<number, number> = {
+    // Letters (SDL scancodes 4-29 = A-Z, JS keyCodes 65-90)
+    4: 65, 5: 66, 6: 67, 7: 68, 8: 69, 9: 70, 10: 71, 11: 72, 12: 73, 13: 74,
+    14: 75, 15: 76, 16: 77, 17: 78, 18: 79, 19: 80, 20: 81, 21: 82, 22: 83,
+    23: 84, 24: 85, 25: 86, 26: 87, 27: 88, 28: 89, 29: 90,
+    // Numbers (SDL 30-39 = 1-9,0, JS 49-57,48)
+    30: 49, 31: 50, 32: 51, 33: 52, 34: 53, 35: 54, 36: 55, 37: 56, 38: 57, 39: 48,
+    // Special keys
+    40: 13,   // Return -> Enter
+    41: 27,   // Escape
+    42: 8,    // Backspace
+    43: 9,    // Tab
+    44: 32,   // Space
+    // Arrow keys (SDL 79-82)
+    79: 39,   // Right
+    80: 37,   // Left
+    81: 40,   // Down
+    82: 38,   // Up
+    // Function keys (SDL 58-69 = F1-F12, JS 112-123)
+    58: 112, 59: 113, 60: 114, 61: 115, 62: 116, 63: 117,
+    64: 118, 65: 119, 66: 120, 67: 121, 68: 122, 69: 123,
+    // Other special keys
+    73: 45,   // Insert
+    74: 36,   // Home
+    75: 33,   // Page Up
+    76: 46,   // Delete
+    77: 35,   // End
+    78: 34,   // Page Down
+  };
+
+  // Special keys that should use send_d1_key_event
+  const specialKeyCodes = new Set([
+    8, 9, 13, 27, 33, 34, 35, 36, 37, 38, 39, 40, 45, 46,
+    112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123,
+  ]);
+
+  // Handle keyboard events for GUI input
+  window.on('keyDown', (event: any) => {
+    const scancode = event.scancode;
+    const jsKeyCode = scancodeToJsKeyCode[scancode];
+
+    if (jsKeyCode !== undefined) {
+      if (specialKeyCodes.has(jsKeyCode)) {
+        // Special key - use send_d1_key_event
+        if (typeof vm.send_d1_key_event === 'function') {
+          vm.send_d1_key_event(jsKeyCode, true);
+        }
+      } else if (jsKeyCode >= 32 && jsKeyCode <= 126) {
+        // Printable ASCII - use send_d1_char
+        // Apply shift for letters
+        let charCode = jsKeyCode;
+        if (!event.shift && jsKeyCode >= 65 && jsKeyCode <= 90) {
+          charCode = jsKeyCode + 32; // Lowercase
+        }
+        if (typeof vm.send_d1_char === 'function') {
+          vm.send_d1_char(charCode);
+        }
+      }
+    }
+  });
+
+  window.on('keyUp', (event: any) => {
+    const scancode = event.scancode;
+    const jsKeyCode = scancodeToJsKeyCode[scancode];
+
+    if (jsKeyCode !== undefined && specialKeyCodes.has(jsKeyCode)) {
+      // Only send key-up for special keys
+      if (typeof vm.send_d1_key_event === 'function') {
+        vm.send_d1_key_event(jsKeyCode, false);
+      }
+    }
+  });
+
   window.on('close', () => {
+    console.error('\\r\\n[GUI] Window closed, shutting down...');
     running = false;
+    // Need to terminate workers and exit - can't call shutdown() here
+    // because it may be called before shutdown is defined.
+    // Instead, set a flag that the loop will check.
   });
 
   // Shutdown function
+  let shuttingDown = false;
   const shutdown = (code: number) => {
-    if (!running) return;
+    if (shuttingDown) return;
+    shuttingDown = true;
     running = false;
+
+    console.error('\\r\\n[GUI] Shutting down VM...');
 
     // Terminate worker threads
     for (const worker of workers) {
@@ -852,7 +935,11 @@ async function runVmWithGui(vm: any, nativeNetClient: any | null, workers: Worke
   };
 
   const loop = () => {
-    if (!running) return;
+    if (!running) {
+      // Window was closed or halt requested
+      shutdown(0);
+      return;
+    }
 
     try {
       for (let i = 0; i < INSTRUCTIONS_PER_TICK; i++) {

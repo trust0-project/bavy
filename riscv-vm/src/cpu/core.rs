@@ -443,8 +443,8 @@ impl Cpu {
     pub(super) fn execute_block_inner(&mut self, block: &Block, bus: &dyn Bus) -> BlockExecResult {
         let base_pc = block.start_pc;
         let len = block.len as usize;
-        // Copy the ops array to avoid borrow issues during execution
-        let ops = block.ops;
+        // ZERO-COPY: Reference the ops array directly instead of copying
+        let ops = &block.ops;
 
         let mut idx = 0usize;
 

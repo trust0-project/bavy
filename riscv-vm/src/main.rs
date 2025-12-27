@@ -327,6 +327,83 @@ fn run_with_gui(mut vm: NativeVm, scale_factor: u8) -> Result<(), Box<dyn std::e
         }
         last_mouse_pressed = mouse_pressed;
 
+        // Handle keyboard input
+        let keys = window.get_keys_pressed(minifb::KeyRepeat::Yes);
+        for key in keys {
+                if let Ok(mut touch) = bus.d1_touch.write() {
+                    if let Some(ref mut dev) = *touch {
+                        // Map minifb Key to character or special key event
+                        match key {
+                            // Special keys - send as key events
+                            Key::Enter => dev.push_key(28, true),      // KEY_ENTER
+                            Key::Backspace => dev.push_key(14, true),  // KEY_BACKSPACE
+                            Key::Tab => dev.push_key(15, true),        // KEY_TAB
+                            Key::Up => dev.push_key(103, true),        // KEY_UP
+                            Key::Down => dev.push_key(108, true),      // KEY_DOWN
+                            Key::Left => dev.push_key(105, true),      // KEY_LEFT
+                            Key::Right => dev.push_key(106, true),     // KEY_RIGHT
+                            Key::Home => dev.push_key(102, true),      // KEY_HOME
+                            Key::End => dev.push_key(107, true),       // KEY_END
+                            Key::PageUp => dev.push_key(104, true),    // KEY_PAGEUP
+                            Key::PageDown => dev.push_key(109, true),  // KEY_PAGEDOWN
+                            Key::Delete => dev.push_key(111, true),    // KEY_DELETE
+                            Key::Insert => dev.push_key(110, true),    // KEY_INSERT
+                            
+                            // Printable characters - send as char events
+                            Key::Space => dev.push_char(b' '),
+                            Key::Key0 => dev.push_char(b'0'),
+                            Key::Key1 => dev.push_char(b'1'),
+                            Key::Key2 => dev.push_char(b'2'),
+                            Key::Key3 => dev.push_char(b'3'),
+                            Key::Key4 => dev.push_char(b'4'),
+                            Key::Key5 => dev.push_char(b'5'),
+                            Key::Key6 => dev.push_char(b'6'),
+                            Key::Key7 => dev.push_char(b'7'),
+                            Key::Key8 => dev.push_char(b'8'),
+                            Key::Key9 => dev.push_char(b'9'),
+                            Key::A => dev.push_char(b'a'),
+                            Key::B => dev.push_char(b'b'),
+                            Key::C => dev.push_char(b'c'),
+                            Key::D => dev.push_char(b'd'),
+                            Key::E => dev.push_char(b'e'),
+                            Key::F => dev.push_char(b'f'),
+                            Key::G => dev.push_char(b'g'),
+                            Key::H => dev.push_char(b'h'),
+                            Key::I => dev.push_char(b'i'),
+                            Key::J => dev.push_char(b'j'),
+                            Key::K => dev.push_char(b'k'),
+                            Key::L => dev.push_char(b'l'),
+                            Key::M => dev.push_char(b'm'),
+                            Key::N => dev.push_char(b'n'),
+                            Key::O => dev.push_char(b'o'),
+                            Key::P => dev.push_char(b'p'),
+                            Key::Q => dev.push_char(b'q'),
+                            Key::R => dev.push_char(b'r'),
+                            Key::S => dev.push_char(b's'),
+                            Key::T => dev.push_char(b't'),
+                            Key::U => dev.push_char(b'u'),
+                            Key::V => dev.push_char(b'v'),
+                            Key::W => dev.push_char(b'w'),
+                            Key::X => dev.push_char(b'x'),
+                            Key::Y => dev.push_char(b'y'),
+                            Key::Z => dev.push_char(b'z'),
+                            Key::Minus => dev.push_char(b'-'),
+                            Key::Equal => dev.push_char(b'='),
+                            Key::LeftBracket => dev.push_char(b'['),
+                            Key::RightBracket => dev.push_char(b']'),
+                            Key::Backslash => dev.push_char(b'\\'),
+                            Key::Semicolon => dev.push_char(b';'),
+                            Key::Apostrophe => dev.push_char(b'\''),
+                            Key::Comma => dev.push_char(b','),
+                            Key::Period => dev.push_char(b'.'),
+                            Key::Slash => dev.push_char(b'/'),
+                            Key::Backquote => dev.push_char(b'`'),
+                            _ => {} // Ignore other keys
+                        }
+                    }
+                }
+            }
+
         // Drain UART output to console
         for byte in bus.uart.drain_output() {
             if byte == b'\n' {
