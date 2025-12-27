@@ -1,3 +1,13 @@
+## 0.7.0 (2025-12-27)
+
+### 🚀 Features
+
+- performance improvements Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([75d4280](https://github.com/trust0-project/bavy/commit/75d4280))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.6.1 (2025-12-24)
 
 ### 🩹 Fixes
