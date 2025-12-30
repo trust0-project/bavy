@@ -1,3 +1,13 @@
+## 0.7.1 (2025-12-30)
+
+### 🩹 Fixes
+
+- vm multi hart and opensbi improvements + fixes Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([293b4fc](https://github.com/trust0-project/bavy/commit/293b4fc))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.7.0 (2025-12-27)
 
 ### 🚀 Features
