@@ -11,6 +11,7 @@ pub mod loader;
 pub mod net;
 pub mod sdboot;  // SD card boot support (MBR, FAT32)
 pub mod shared_mem;
+pub mod hart_registry;  // Unified hart lifecycle management
 pub mod snapshot;
 pub mod vm;
 
@@ -27,6 +28,7 @@ pub mod console;
 pub mod worker;
 
 // Re-export specific VM types for consumers
+#[cfg(not(target_arch = "wasm32"))]
 pub use vm::emulator::Emulator;
 
 #[cfg(target_arch = "wasm32")]

@@ -5,30 +5,32 @@
 //!
 //! ## Architecture
 //!
-//! - Each worker runs one secondary hart (1, 2, 3, ...)
-//! - Hart 0 runs on the main thread (handles I/O)
-//! - Workers share DRAM and CLINT via SharedArrayBuffer
-//! - Workers do NOT have access to VirtIO devices (disk, network)
-//! - Inter-hart communication uses CLINT MSIP for IPIs
+//! The worker uses a cooperative batch execution model:
+//! 1. JavaScript calls `step_batch()` in a loop
+//! 2. Rust executes up to N instructions and returns
+//! 3. JavaScript event loop gets a chance to run
+//! 4. Repeat
 //!
-//! ## Memory Layout
+//! This prevents the worker from being unresponsive while still
+//! achieving good performance through large batch sizes.
 //!
-//! The SharedArrayBuffer is laid out as:
-//! - Control region (4KB): halt flags, hart count
-//! - CLINT region (64KB): mtime, msip[], mtimecmp[]
-//! - DRAM region: kernel memory
+//! ## Hart Lifecycle (OpenSBI-compliant)
+//!
+//! Workers use the `WasmHartRegistry` for lifecycle management:
+//! 1. Worker starts in STOPPED state
+//! 2. Worker calls `registry.wait_for_start()` (blocks via Atomics.wait)
+//! 3. Main thread calls `sbi_hart_start()` which updates HCB state
+//! 4. Worker wakes, reads start parameters, transitions to STARTED
+//!
+//! This eliminates the legacy `CTRL_WORKERS_CAN_START` polling model.
 
-#[cfg(target_arch = "wasm32")]
-use crate::Trap;
-#[cfg(target_arch = "wasm32")]
-use crate::bus::SystemBus;
-#[cfg(target_arch = "wasm32")]
 use crate::cpu::Cpu;
-#[cfg(target_arch = "wasm32")]
-use crate::shared_mem::{
-    self,
-    wasm::{SharedClint, SharedControl},
-};
+use crate::bus::SystemBus;
+use crate::cpu::types::Trap;
+use crate::shared_mem::{self, wasm::{SharedClint, SharedControl}};
+use crate::hart_registry::{HartState, HartRegistry};
+use crate::hart_registry::wasm::WasmHartRegistry;
+
 #[cfg(target_arch = "wasm32")]
 use js_sys::SharedArrayBuffer;
 #[cfg(target_arch = "wasm32")]
@@ -61,15 +63,18 @@ pub struct WorkerState {
     bus: SystemBus,
     control: SharedControl,
     clint: SharedClint,
+    registry: WasmHartRegistry,
     hart_id: usize,
     step_count: u64,
     /// Counter for WFI events (separate from step_count for throttled logging)
     wfi_count: u64,
     /// Counter for batch calls
     batch_count: u64,
-    /// Cached flag: have we received the "workers can start" signal?
-    /// Once set to true, we never need to check again (reduces atomic ops).
-    workers_started: bool,
+    /// Entry PC from ELF (used when PRESERVE_BOOT_PC flag is set)
+    entry_pc: u64,
+    /// Cached flag: have we started executing?
+    /// Once set to true, we skip the HartRegistry check.
+    started: bool,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -85,28 +90,49 @@ impl WorkerState {
         let control = SharedControl::new(&sab);
         let clint = SharedClint::new(&sab);
 
+        // Clone SAB before moving into SystemBus (need it for WorkerState registry)
+        let sab_for_registry = sab.clone();
+
+        // Create HartRegistry for bus (required by SystemBus interface)
+        let bus_registry = WasmHartRegistry::new_view(
+            &sab,
+            shared_mem::CTRL_HCB_BASE,
+            128,
+        );
+        let registry_arc: std::sync::Arc<dyn crate::hart_registry::HartRegistry> = 
+            std::sync::Arc::new(bus_registry);
+
         // Create bus view of shared DRAM
         let dram_offset = shared_mem::dram_offset();
-        let shared_clint_for_bus = SharedClint::new(&sab);
+        let shared_clint_for_bus = SharedClint::new(&sab_for_registry);
         // Workers read from shared UART input (is_worker = true)
-        let bus = SystemBus::from_shared_buffer(sab, dram_offset, shared_clint_for_bus, true, hart_id);
+        let bus = SystemBus::from_shared_buffer(
+            sab_for_registry.clone(), dram_offset, shared_clint_for_bus, true, hart_id, registry_arc,
+        );
+
+        // Create worker's own registry view for lifecycle polling
+        let registry = WasmHartRegistry::new_view(
+            &sab_for_registry,
+            shared_mem::CTRL_HCB_BASE,
+            128,
+        );
 
         // Create CPU for this hart
         let mut cpu = Cpu::new(entry_pc, hart_id as u64);
         cpu.setup_smode_boot(); // Enable S-mode operation
 
-        // Verify a0 is set to hart_id (critical for kernel boot)
-        let a0_value = cpu.read_reg(crate::engine::decoder::Register::X10);
         WorkerState {
             cpu,
             bus,
             control,
             clint,
+            registry,
             hart_id,
             step_count: 0,
             wfi_count: 0,
             batch_count: 0,
-            workers_started: false, // Will be cached on first check
+            entry_pc,
+            started: false,
         }
     }
 
@@ -138,32 +164,54 @@ impl WorkerState {
             return WorkerStepResult::Halted;
         }
 
-        // Wait for main thread to signal that workers can start.
-        // This ensures hart 0 boots first and sets up memory before
-        // secondary harts start executing kernel code.
+        // OpenSBI-compliant Hart Lifecycle using HartRegistry
         //
-        // CRITICAL: Don't execute ANY instructions until start signal is set.
-        // Return early so JS event loop can process messages and check again.
-        if !self.workers_started {
-            if !self.control.can_workers_start() {
-                // Just return immediately - don't execute any instructions yet
-                // This keeps the JS event loop responsive and prevents workers
-                // from executing kernel code before hart 0 finishes setup.
-                //
-                // Sleep briefly to avoid busy-spinning (10ms)
-                self.control.wait_brief(10.0);
-                return WorkerStepResult::Continue;
-            }
-            // Workers can start - cache this permanently
-            self.workers_started = true;
-            
-            // CRITICAL: Check for pending interrupts immediately!
-            // The kernel may have sent IPIs during boot (before workers started).
-            // We must deliver them now so the kernel's S-mode interrupt handler
-            // can run and secondary harts can enter their hart_loop.
-            let (msip_at_start, timer_at_start) = self.clint.check_interrupts(self.hart_id);
-            if msip_at_start || timer_at_start {
-                self.deliver_interrupts();
+        // Secondary harts poll their HCB state until the kernel calls
+        // sbi_hart_start() which transitions them from STOPPED to START_PENDING.
+        // We use polling with timeout (not blocking Atomics.wait) for reliability.
+        //
+        // Once started, we cache the flag to skip registry checks.
+        if !self.started {
+            let state = self.registry.get_state(self.hart_id);
+            match state {
+                HartState::StartPending => {
+                    // Kernel called sbi_hart_start() - read parameters
+                    let (addr, opaque, preserve_boot_pc) = self.registry.wait_for_start(self.hart_id);
+                    
+                    // Set PC: use provided address, or preserve ELF entry if flagged
+                    if !preserve_boot_pc && addr != 0 {
+                        self.cpu.pc = addr;
+                    } else {
+                        self.cpu.pc = self.entry_pc;
+                    }
+                    
+                    // Set registers per SBI HSM spec: a0 = hartid, a1 = opaque
+                    self.cpu.write_reg(crate::engine::decoder::Register::X10, self.hart_id as u64);
+                    self.cpu.write_reg(crate::engine::decoder::Register::X11, opaque);
+                    
+                    // Acknowledge start and transition to STARTED
+                    self.registry.acknowledge_start(self.hart_id);
+                    self.started = true;
+                    
+                    // Deliver any pending interrupts
+                    self.deliver_interrupts();
+                    
+                    return WorkerStepResult::Continue;
+                }
+                HartState::Started => {
+                    // Already started (resumed from WFI)
+                    self.started = true;
+                }
+                HartState::Stopped => {
+                    // Not started yet - sleep briefly and retry
+                    self.control.wait_brief(10.0);
+                    return WorkerStepResult::Continue;
+                }
+                _ => {
+                    // Other states (StopPending, Suspended, etc.) - wait
+                    self.control.wait_brief(10.0);
+                    return WorkerStepResult::Continue;
+                }
             }
         }
 

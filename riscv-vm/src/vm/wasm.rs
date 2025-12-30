@@ -243,6 +243,16 @@ impl WasmVm {
             // Also pass SharedClint so CLINT MMIO accesses go through shared memory.
             let dram_offset = shared_mem::dram_offset();
             let shared_clint_for_bus = shared_mem::wasm::SharedClint::new(&sab);
+            
+            // Create HartRegistry for this VM and wrap in Arc
+            let registry = crate::hart_registry::wasm::WasmHartRegistry::new(
+                &sab,
+                shared_mem::CTRL_HCB_BASE,
+                num_harts,
+            );
+            let registry_arc: std::sync::Arc<dyn crate::hart_registry::HartRegistry> = 
+                std::sync::Arc::new(registry);
+            
             // Main thread (hart 0) reads from local UART, not shared input
             let bus = SystemBus::from_shared_buffer(
                 sab.clone(),
@@ -250,6 +260,7 @@ impl WasmVm {
                 shared_clint_for_bus,
                 false,
                 0,  // hart_id for main thread
+                registry_arc,
             );
 
             let control = shared_mem::wasm::SharedControl::new(&sab);
@@ -266,8 +277,11 @@ impl WasmVm {
                 Some(uart_input),
             )
         } else {
-            // Standard bus without shared memory
-            let bus = SystemBus::new(DRAM_BASE, DRAM_SIZE);
+            // Standard bus without shared memory (single-hart WASM mode)
+            // Create a simple registry for non-SMP mode
+            let registry: std::sync::Arc<dyn crate::hart_registry::HartRegistry> = 
+                std::sync::Arc::new(crate::hart_registry::wasm::WasmHartRegistry::new_standalone(1));
+            let bus = SystemBus::with_registry(DRAM_BASE, DRAM_SIZE, registry);
             (bus, None, None, None, None, None)
         };
 

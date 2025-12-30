@@ -101,6 +101,7 @@ pub const CTRL_NUM_HARTS: u32 = 4;
 pub const CTRL_EPOCH: u32 = 5;
 /// Control region: workers can start executing (i32 index 6)
 /// Workers poll this flag; they park until main thread sets it.
+/// DEPRECATED: Use HartControlBlock state instead. Kept for backwards compatibility.
 pub const CTRL_WORKERS_CAN_START: u32 = 6;
 /// Control region: VM start time in milliseconds (i32 indices 7-8 for 64-bit)
 /// Used to compute wall-clock based mtime.
@@ -114,6 +115,30 @@ pub const CTRL_D1_EMAC_IP: u32 = 9;
 /// Set by main thread when user requests cancellation (Cancel button, 'q', ESC)
 /// Workers check this flag to cancel running commands.
 pub const CTRL_CANCEL_REQUESTED: u32 = 10;
+
+// ============================================================================
+// HartControlBlock (HCB) Region
+// ============================================================================
+
+/// HCB region byte offset within control region.
+/// Starts at byte 512 (i32 index 128) to leave room for control flags.
+pub const CTRL_HCB_BASE: usize = 0x200;
+
+/// Size of each HartControlBlock in bytes (8 x i32 = 32 bytes).
+pub const HCB_SIZE: usize = 32;
+
+/// Total size of HCB region (128 harts × 32 bytes = 4KB).
+pub const HCB_REGION_SIZE: usize = MAX_HARTS * HCB_SIZE;
+
+/// Calculate byte offset for a hart's HCB within the SharedArrayBuffer.
+pub const fn hcb_offset(hart_id: usize) -> usize {
+    CTRL_HCB_BASE + (hart_id * HCB_SIZE)
+}
+
+/// Calculate i32 index for a hart's HCB state field (for Atomics).
+pub const fn hcb_state_index(hart_id: usize) -> u32 {
+    ((CTRL_HCB_BASE / 4) + (hart_id * (HCB_SIZE / 4))) as u32
+}
 
 // ============================================================================
 // CLINT Region Offsets (relative to CLINT region start at CONTROL_REGION_SIZE)
@@ -986,8 +1011,8 @@ mod tests {
         // UART input region is 4KB
         assert_eq!(UART_INPUT_REGION_SIZE, 4096);
 
-        // Header is control + CLINT + UART output + UART input + VirtIO proxy
-        assert_eq!(HEADER_SIZE, 4096 + 0x10000 + 4096 + 4096 + 8192);
+        // Header is control + CLINT + UART output + UART input
+        assert_eq!(HEADER_SIZE, 4096 + 0x10000 + 4096 + 4096);
 
         // DRAM starts after header
         assert_eq!(dram_offset(), HEADER_SIZE);

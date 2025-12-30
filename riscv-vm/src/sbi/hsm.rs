@@ -102,6 +102,7 @@ pub fn handle(cpu: &mut Cpu, bus: &dyn Bus, fid: u64) -> SbiRet {
 /// Start a hart (FID 0)
 ///
 /// Starts execution on the specified hart at the given address.
+/// Uses the HartRegistry for state management and parameter passing.
 ///
 /// # Arguments
 /// * `a0` - Hart ID to start
@@ -116,39 +117,49 @@ fn hart_start(cpu: &Cpu, bus: &dyn Bus) -> SbiRet {
     let target_hart = cpu.read_reg(Register::X10) as usize; // a0
     let start_addr = cpu.read_reg(Register::X11);  // a1
     let opaque = cpu.read_reg(Register::X12);      // a2
-
+    
+    // Use HartRegistry for state machine and parameter passing
+    let registry = bus.hart_registry();
+    
     // Validate hart ID
-    if target_hart >= MAX_HARTS {
+    if target_hart >= registry.num_harts() {
         return SbiRet::invalid_param();
     }
-
-    // Check current state - must be STOPPED
-    let current_state = HART_STATES[target_hart].load(Ordering::SeqCst);
-    if current_state == HART_STATE_STARTED || current_state == HART_STATE_START_PENDING {
-        return SbiRet {
-            error: super::SBI_ERR_ALREADY_STARTED,
-            value: 0,
-        };
+    
+    // Use registry to start the hart - this handles:
+    // 1. State transition STOPPED -> START_PENDING
+    // 2. Storing start_addr and opaque for the target hart to read
+    // 3. Waking the target hart
+    use crate::hart_registry::HartError;
+    // If start_addr is 0, use PRESERVE_BOOT_PC flag to keep ELF entry point
+    let preserve_boot_pc = start_addr == 0;
+    match registry.start_hart(target_hart, start_addr, opaque, preserve_boot_pc) {
+        Ok(()) => {
+            // Also update static array for backward compatibility
+            HART_STATES[target_hart].store(HART_STATE_START_PENDING, Ordering::SeqCst);
+            
+            // Write MSIP to ensure CLINT-based wakeup for native harts
+            let msip_addr = CLINT_BASE + MSIP_OFFSET + (target_hart as u64) * 4;
+            let _ = bus.write32(msip_addr, 1);
+            
+            log::debug!(
+                "SBI_HSM: hart_start hartid={} addr={:#x} opaque={:#x}",
+                target_hart,
+                start_addr,
+                opaque
+            );
+            
+            SbiRet::ok()
+        }
+        Err(HartError::AlreadyStarted) => {
+            SbiRet {
+                error: super::SBI_ERR_ALREADY_STARTED,
+                value: 0,
+            }
+        }
+        Err(HartError::InvalidHart) => SbiRet::invalid_param(),
+        Err(_) => SbiRet::failed(),
     }
-
-    // Transition to START_PENDING
-    HART_STATES[target_hart].store(HART_STATE_START_PENDING, Ordering::SeqCst);
-
-    // Set MSIP to wake the hart
-    let msip_addr = CLINT_BASE + MSIP_OFFSET + (target_hart as u64) * 4;
-    if let Err(_) = bus.write32(msip_addr, 1) {
-        HART_STATES[target_hart].store(HART_STATE_STOPPED, Ordering::SeqCst);
-        return SbiRet::failed();
-    }
-
-    log::debug!(
-        "SBI_HSM: hart_start hartid={} addr={:#x} opaque={:#x}",
-        target_hart,
-        start_addr,
-        opaque
-    );
-
-    SbiRet::ok()
 }
 
 /// Stop the calling hart (FID 1)

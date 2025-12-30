@@ -5,6 +5,7 @@ use crate::devices::sysinfo::{SYSINFO_BASE, SYSINFO_SIZE, SysInfo};
 use crate::devices::uart::{UART_BASE, UART_SIZE, Uart};
 use crate::devices::virtio::VirtioDevice;
 use crate::dram::Dram;
+use crate::hart_registry::HartRegistry;
 
 // D1 (Allwinner) device emulation for unified kernel support
 use crate::devices::d1_mmc::{D1MmcEmulated, D1_MMC0_BASE, D1_MMC0_SIZE};
@@ -12,7 +13,7 @@ use crate::devices::d1_display::{D1DisplayEmulated, D1_DE_BASE, D1_DE_SIZE, D1_M
 use crate::devices::d1_emac::{D1EmacEmulated, D1_EMAC_BASE, D1_EMAC_SIZE};
 use crate::devices::d1_touch::{D1TouchEmulated, D1_I2C2_BASE, D1_I2C2_SIZE};
 use crate::devices::d1_audio::{D1AudioEmulated, D1_AUDIO_BASE, D1_AUDIO_SIZE};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 #[cfg(target_arch = "wasm32")]
 use js_sys::SharedArrayBuffer;
@@ -398,6 +399,10 @@ pub trait Bus: Send + Sync {
             }
         }
     }
+
+    /// Get the hart registry for HSM lifecycle operations.
+    /// Used by SBI HSM extension to manage hart start/stop.
+    fn hart_registry(&self) -> &dyn HartRegistry;
 }
 
 // A simple system bus that just wraps DRAM for now (Phase 1)
@@ -432,10 +437,28 @@ pub struct SystemBus {
     /// RTC timestamp from host (Unix seconds since epoch)
     /// Updated by the host each tick to provide wall-clock time to the guest
     rtc_timestamp: std::sync::atomic::AtomicU64,
+    
+    /// Hart lifecycle registry for SBI HSM operations
+    registry: Arc<dyn HartRegistry>,
 }
 
 impl SystemBus {
+    /// Create a SystemBus for native (non-WASM) builds with a default single-hart registry.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new(dram_base: u64, dram_size: usize) -> Self {
+        Self::with_registry(
+            dram_base,
+            dram_size,
+            Arc::new(crate::hart_registry::native::NativeHartRegistry::new(1)),
+        )
+    }
+    
+    /// Create a SystemBus with a custom registry.
+    pub fn with_registry(
+        dram_base: u64,
+        dram_size: usize,
+        registry: Arc<dyn HartRegistry>,
+    ) -> Self {
         Self {
             dram: Dram::new(dram_base, dram_size),
             clint: Clint::new(),
@@ -457,6 +480,7 @@ impl SystemBus {
             #[cfg(target_arch = "wasm32")]
             shared_control: None,
             rtc_timestamp: std::sync::atomic::AtomicU64::new(0),
+            registry,
         }
     }
 
@@ -473,6 +497,7 @@ impl SystemBus {
     /// * `is_worker` - If true, enables shared UART input for receiving keyboard input.
     ///                 Main thread (hart 0) should pass false since it reads from local UART.
     /// * `hart_id` - Hart ID for this bus (used for VirtIO proxy slot allocation)
+    /// * `registry` - Hart registry for HSM lifecycle management
     ///
     /// IMPORTANT: Pass the FULL SharedArrayBuffer, not a sliced copy!
     /// SharedArrayBuffer::slice() creates a copy, breaking shared memory.
@@ -483,6 +508,7 @@ impl SystemBus {
         shared_clint: crate::shared_mem::wasm::SharedClint,
         is_worker: bool,
         hart_id: usize,
+        registry: Arc<dyn HartRegistry>,
     ) -> Self {
         // Use the shared CLINT's hart count for local CLINT initialization
         // The local CLINT is a fallback; shared_clint is used for actual MMIO
@@ -519,6 +545,7 @@ impl SystemBus {
             shared_uart_input,
             shared_control: Some(shared_control),
             rtc_timestamp: std::sync::atomic::AtomicU64::new(0),
+            registry,
         }
     }
 
@@ -2273,5 +2300,10 @@ impl Bus for SystemBus {
         }
         // Slow path: MMIO devices
         self.write64_slow(addr, val)
+    }
+
+    #[inline]
+    fn hart_registry(&self) -> &dyn HartRegistry {
+        &*self.registry
     }
 }
