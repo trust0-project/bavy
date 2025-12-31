@@ -1,3 +1,13 @@
+## 0.7.2 (2025-12-31)
+
+### 🩹 Fixes
+
+- VM improvement Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([cb3912a](https://github.com/trust0-project/bavy/commit/cb3912a))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.7.1 (2025-12-30)
 
 ### 🩹 Fixes
