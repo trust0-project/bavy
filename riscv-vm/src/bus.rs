@@ -941,7 +941,17 @@ impl SystemBus {
 
         // RTC device - provides host timestamp to guest
         if addr >= RTC_BASE && addr < RTC_BASE + RTC_SIZE {
+            // For WASM workers, read from shared control region
+            // For main thread or native builds, use local atomic
+            #[cfg(target_arch = "wasm32")]
+            let ts = if let Some(ref ctrl) = self.shared_control {
+                ctrl.get_rtc_timestamp()
+            } else {
+                self.rtc_timestamp.load(std::sync::atomic::Ordering::Relaxed)
+            };
+            #[cfg(not(target_arch = "wasm32"))]
             let ts = self.rtc_timestamp.load(std::sync::atomic::Ordering::Relaxed);
+            
             let offset = addr - RTC_BASE;
             return Ok(match offset {
                 0 => (ts & 0xFFFFFFFF) as u32,        // Low 32 bits

@@ -8,7 +8,7 @@ use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Shared state between main thread and worker threads.
 ///
@@ -542,6 +542,11 @@ impl NativeVm {
             if step_count % VIRTIO_POLL_INTERVAL == 0 {
                 self.bus.poll_virtio();
                 self.poll_network();
+                
+                // Update RTC with current host time (for wall-clock display)
+                if let Ok(duration) = SystemTime::now().duration_since(UNIX_EPOCH) {
+                    self.bus.set_rtc_timestamp(duration.as_secs());
+                }
             }
 
             if step_count % CONSOLE_POLL_INTERVAL == 0 {

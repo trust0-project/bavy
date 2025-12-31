@@ -128,6 +128,14 @@ impl D1TouchEmulated {
     
     /// Push a keyboard event (called from host/JS)
     pub fn push_key(&mut self, key_code: u16, pressed: bool) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            use wasm_bindgen::JsValue;
+            web_sys::console::log_1(&JsValue::from_str(&format!(
+                "[D1 Touch] push_key: code={} pressed={} queue_len={}",
+                key_code, pressed, self.key_event_queue.len()
+            )));
+        }
         self.key_event_queue.push(QueuedKeyEvent {
             key_code,
             pressed,
@@ -319,7 +327,17 @@ impl D1TouchEmulated {
             0x118 => self.y_resolution as u32,
             
             // Keyboard event count
-            0x11C => self.key_event_queue.len() as u32,
+            0x11C => {
+                let count = self.key_event_queue.len() as u32;
+                #[cfg(target_arch = "wasm32")]
+                if count > 0 {
+                    use wasm_bindgen::JsValue;
+                    web_sys::console::log_1(&JsValue::from_str(&format!(
+                        "[D1 Touch] MMIO read KEY_COUNT={}", count
+                    )));
+                }
+                count
+            }
             
             // Keyboard key code (peek front of queue)
             0x120 => {

@@ -115,6 +115,11 @@ pub const CTRL_D1_EMAC_IP: u32 = 9;
 /// Set by main thread when user requests cancellation (Cancel button, 'q', ESC)
 /// Workers check this flag to cancel running commands.
 pub const CTRL_CANCEL_REQUESTED: u32 = 10;
+/// Control region: RTC timestamp low 32 bits (i32 index 11)
+/// Unix seconds since epoch, updated by hart 0.
+pub const CTRL_RTC_TIMESTAMP_LO: u32 = 11;
+/// Control region: RTC timestamp high 32 bits (i32 index 12)
+pub const CTRL_RTC_TIMESTAMP_HI: u32 = 12;
 
 // ============================================================================
 // HartControlBlock (HCB) Region
@@ -575,6 +580,21 @@ pub mod wasm {
         /// Clear cancellation flag (called when command finishes or new command starts).
         pub fn clear_cancel(&self) {
             let _ = Atomics::store(&self.view, CTRL_CANCEL_REQUESTED, 0);
+        }
+
+        /// Get RTC timestamp (Unix seconds since epoch).
+        /// Returns 0 if not set.
+        pub fn get_rtc_timestamp(&self) -> u64 {
+            let lo = Atomics::load(&self.view, CTRL_RTC_TIMESTAMP_LO).unwrap_or(0) as u32 as u64;
+            let hi = Atomics::load(&self.view, CTRL_RTC_TIMESTAMP_HI).unwrap_or(0) as u32 as u64;
+            lo | (hi << 32)
+        }
+
+        /// Set RTC timestamp (Unix seconds since epoch).
+        /// Called by hart 0 periodically to update wall-clock time.
+        pub fn set_rtc_timestamp(&self, unix_secs: u64) {
+            let _ = Atomics::store(&self.view, CTRL_RTC_TIMESTAMP_LO, (unix_secs & 0xFFFFFFFF) as i32);
+            let _ = Atomics::store(&self.view, CTRL_RTC_TIMESTAMP_HI, (unix_secs >> 32) as i32);
         }
     }
 

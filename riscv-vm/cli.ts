@@ -569,7 +569,7 @@ function runVmLoop(vm: any, nativeNetClient: any | null, workers: Worker[] = [])
     // Drain UART output buffer
     // In raw terminal mode, we need \r\n for proper line breaks
     const outChunks: string[] = [];
-    let limit = 2000;
+    let limit = 65536;
     let code = typeof vm.get_output === 'function' ? vm.get_output() : undefined;
 
     while (code !== undefined && limit-- > 0) {
@@ -852,7 +852,7 @@ async function runVmWithGui(vm: any, nativeNetClient: any | null, workers: Worke
 
   const drainOutput = () => {
     const outChunks: string[] = [];
-    let limit = 2000;
+    let limit = 65536;
     let code = typeof vm.get_output === 'function' ? vm.get_output() : undefined;
 
     while (code !== undefined && limit-- > 0) {

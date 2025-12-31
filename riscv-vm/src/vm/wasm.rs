@@ -1224,6 +1224,10 @@ impl WasmVm {
             // js_sys::Date::now() returns milliseconds since Unix epoch
             let unix_secs = (js_sys::Date::now() / 1000.0) as u64;
             self.bus.set_rtc_timestamp(unix_secs);
+            // Also write to shared memory so workers can read it
+            if let Some(ref ctrl) = self.shared_control {
+                ctrl.set_rtc_timestamp(unix_secs);
+            }
             
             // Sync CLINT interrupt state to CPU's MIP during periodic poll.
             // This ensures timer/software interrupts are visible when the kernel reads sip.
