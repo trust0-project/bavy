@@ -1,3 +1,13 @@
+## 0.7.5 (2026-07-04)
+
+### 🩹 Fixes
+
+- performance issues Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([21aaf5e](https://github.com/trust0-project/bavy/commit/21aaf5e))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.7.4 (2026-07-04)
 
 ### 🩹 Fixes
