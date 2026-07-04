@@ -1,3 +1,13 @@
+## 0.7.3 (2026-07-04)
+
+### 🩹 Fixes
+
+- cargo readme changes Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([95347ee](https://github.com/trust0-project/bavy/commit/95347ee))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.7.2 (2025-12-31)
 
 ### 🩹 Fixes
