@@ -1,3 +1,13 @@
+## 0.7.4 (2026-07-04)
+
+### 🩹 Fixes
+
+- change release Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([6284dc4](https://github.com/trust0-project/bavy/commit/6284dc4))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.7.3 (2026-07-04)
 
 ### 🩹 Fixes
