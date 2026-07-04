@@ -2985,7 +2985,7 @@ dependencies = [
 
 [[package]]
 name = "riscv-vm"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "aes-gcm",
  "argon2",
