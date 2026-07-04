@@ -234,9 +234,6 @@ jobs:
           npm pack --dry-run
         working-directory: riscv-vm
 
-      # Authenticates via GitHub OIDC (Trusted Publishing) — no NPM_TOKEN needed.
-      # Register the trusted publisher on npmjs.com: package "virtual-machine"
-      # -> Settings -> Trusted Publisher -> repo trust0-project/bavy, workflow release-trigger.yml
       - name: Publish to npm
         run: npm publish --access public --provenance
         working-directory: riscv-vm

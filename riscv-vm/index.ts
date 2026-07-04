@@ -14,7 +14,6 @@ export async function WasmInternal() {
 
 export { NetworkStatus, WasmVm } from "./pkg/riscv_vm";
 
-// Re-export worker message types for consumers (from side-effect-free module)
 export type {
   WorkerInitMessage,
   WorkerReadyMessage,
