@@ -197,6 +197,10 @@ jobs:
           node-version: 22
           registry-url: 'https://registry.npmjs.org'
 
+      # Trusted Publishing (OIDC) requires npm >= 11.5.1; Node 22 ships an older npm.
+      - name: Upgrade npm
+        run: npm install -g npm@latest
+
       - name: Setup Rust (for WASM build)
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -230,9 +234,9 @@ jobs:
           npm pack --dry-run
         working-directory: riscv-vm
 
+      # Authenticates via GitHub OIDC (Trusted Publishing) — no NPM_TOKEN needed.
+      # Register the trusted publisher on npmjs.com: package "virtual-machine"
+      # -> Settings -> Trusted Publisher -> repo trust0-project/bavy, workflow release-trigger.yml
       - name: Publish to npm
         run: npm publish --access public --provenance
         working-directory: riscv-vm
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NPM_CONFIG_PROVENANCE: true
