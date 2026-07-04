@@ -1,16 +1,6 @@
-[target.wasm32-unknown-unknown]
-rustflags = ["-C", "target-feature=-bulk-memory"]
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+# WASM target configuration.
+#
+# bulk-memory is enabled (default since Rust 1.87 / LLVM 17 era, and supported
+# by all browsers since 2021): memcpy-heavy paths (framebuffer reads,
+# read_range, Vec operations) compile to native memory.copy/memory.fill
+# instructions instead of byte loops.

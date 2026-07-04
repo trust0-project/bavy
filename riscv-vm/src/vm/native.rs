@@ -442,19 +442,23 @@ impl NativeVm {
 
     /// Poll network backend and bridge packets to/from EMAC.
     /// Call this periodically from the main loop.
-    fn poll_network(&mut self) {
+    ///
+    /// Returns true if any packets moved (used to re-arm EMAC polling).
+    fn poll_network(&mut self) -> bool {
         use crate::net::NetworkBackend;
 
         let backend = match &mut self.wt_backend {
             Some(b) => b,
-            None => return,
+            None => return false,
         };
+        let mut moved = false;
 
         // Forward packets from WebTransport to EMAC (RX)
         while let Ok(Some(packet)) = backend.recv() {
             if let Ok(mut emac) = self.bus.d1_emac.write() {
                 if let Some(ref mut e) = *emac {
                     e.queue_rx_packet(packet);
+                    moved = true;
                 }
             }
         }
@@ -465,6 +469,7 @@ impl NativeVm {
                 let tx_packets = e.get_tx_packets();
                 for packet in tx_packets {
                     let _ = backend.send(&packet);
+                    moved = true;
                 }
             }
         }
@@ -479,6 +484,7 @@ impl NativeVm {
                 }
             }
         }
+        moved
     }
 
     /// Check if workers have been started.
@@ -540,9 +546,23 @@ impl NativeVm {
             }
 
             if step_count % VIRTIO_POLL_INTERVAL == 0 {
-                self.bus.poll_virtio();
-                self.poll_network();
-                
+                // Doorbell gating: only walk VirtIO queues / EMAC DMA when
+                // the guest touched the device or host ingress queued work.
+                let mut activity = self.bus.take_device_activity();
+                if self.poll_network() {
+                    activity |= crate::bus::DEVICE_ACTIVITY_EMAC;
+                }
+                if activity & crate::bus::DEVICE_ACTIVITY_VIRTIO != 0 {
+                    self.bus.poll_virtio();
+                }
+                if activity & crate::bus::DEVICE_ACTIVITY_EMAC != 0 {
+                    if let Ok(mut emac) = self.bus.d1_emac.write() {
+                        if let Some(ref mut e) = *emac {
+                            e.poll_dma(&self.bus.dram);
+                        }
+                    }
+                }
+
                 // Update RTC with current host time (for wall-clock display)
                 if let Ok(duration) = SystemTime::now().duration_since(UNIX_EPOCH) {
                     self.bus.set_rtc_timestamp(duration.as_secs());

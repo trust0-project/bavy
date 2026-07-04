@@ -49,7 +49,8 @@
     "build:native": "napi build --platform --release --features napi --cargo-cwd . --cargo-flags=\"--lib\" native",
     "build:native:debug": "napi build --platform --features napi --cargo-cwd . --cargo-flags=\"--lib\" native",
     "build:all": "npm run build && npm run build:native",
-    "gui": "npx tsx cli-gui.ts"
+    "gui": "npx tsx cli-gui.ts",
+    "bench": "node scripts/bench-node.mjs"
   },
   "repository": {
     "type": "git",

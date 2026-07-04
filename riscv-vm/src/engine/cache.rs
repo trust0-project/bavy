@@ -1,20 +1,33 @@
 //! Block Cache for the JIT-less Superblock Engine.
 //!
-//! Manages a cache of compiled basic blocks keyed by PC. Uses generation-based
-//! invalidation for efficient TLB flush handling.
+//! Direct-mapped open-addressed array of compiled blocks keyed by PC.
+//! This replaces the previous HashMap<u64, Box<Block>>: block lookup is the
+//! hottest dispatch operation in the VM and the hash + probe + Box pointer
+//! chase cost ~2.5x a TLB hit. A direct-mapped array is one index + one tag
+//! compare on a linear slab.
+//!
+//! Invalidation is generation-based: bumping `generation` makes every cached
+//! block stale without touching the slab (stale entries fail the tag check).
 
 use super::block::Block;
 #[cfg(test)]
 use super::microop::MicroOp;
-use std::collections::HashMap;
 
-/// Block cache configuration.
+/// Number of cache slots (power of two for mask indexing).
 pub const BLOCK_CACHE_SIZE: usize = 4096;
+const BLOCK_CACHE_MASK: u64 = (BLOCK_CACHE_SIZE as u64) - 1;
 
-/// Block cache using PC as key.
+/// One direct-mapped slot. `valid` + the block's own start_pc form the tag.
+struct Slot {
+    valid: bool,
+    block: Block,
+}
+
+/// Direct-mapped block cache indexed by PC.
 pub struct BlockCache {
-    /// PC → Block mapping.
-    blocks: HashMap<u64, Box<Block>>,
+    /// Boxed slab: ~BLOCK_CACHE_SIZE x sizeof(Block); heap-allocated so Cpu
+    /// stays cheap to construct and move.
+    slots: Box<[Slot]>,
     /// Current generation (incremented on flush).
     pub generation: u32,
     /// Statistics: cache hits.
@@ -28,8 +41,15 @@ pub struct BlockCache {
 impl BlockCache {
     /// Create a new empty block cache.
     pub fn new() -> Self {
+        let slots = (0..BLOCK_CACHE_SIZE)
+            .map(|_| Slot {
+                valid: false,
+                block: Block::new(0, 0, 0),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         Self {
-            blocks: HashMap::with_capacity(BLOCK_CACHE_SIZE),
+            slots,
             generation: 0,
             hits: 0,
             misses: 0,
@@ -37,104 +57,99 @@ impl BlockCache {
         }
     }
 
+    /// Slot index for a PC. Instructions are 2-byte aligned (C extension),
+    /// so shift out the low bit before masking.
+    #[inline(always)]
+    fn index(pc: u64) -> usize {
+        ((pc >> 1) & BLOCK_CACHE_MASK) as usize
+    }
+
     /// Look up a block by PC.
-    /// Returns a reference to the block if found and valid.
     #[inline]
     pub fn get(&mut self, pc: u64) -> Option<&Block> {
-        if let Some(block) = self.blocks.get(&pc) {
-            if block.generation == self.generation {
-                self.hits += 1;
-                return Some(block);
-            }
+        // SAFETY: index() is always < BLOCK_CACHE_SIZE due to the mask
+        let slot = unsafe { self.slots.get_unchecked(Self::index(pc)) };
+        if slot.valid && slot.block.start_pc == pc && slot.block.generation == self.generation {
+            self.hits += 1;
+            Some(&slot.block)
+        } else {
+            self.misses += 1;
+            None
         }
-        self.misses += 1;
-        None
     }
 
-    /// Insert a compiled block into the cache.
-    pub fn insert(&mut self, block: Block) {
-        // Evict if cache is full
-        if self.blocks.len() >= BLOCK_CACHE_SIZE {
-            self.evict_cold();
-        }
-
-        let pc = block.start_pc;
-        self.blocks.insert(pc, Box::new(block));
-    }
-
-    /// Invalidate all blocks (called on SATP change, SFENCE.VMA).
-    pub fn flush(&mut self) {
-        self.generation = self.generation.wrapping_add(1);
-        self.invalidations += 1;
-        // Don't clear the map; stale entries will be rejected by generation check
-    }
-
-    /// Invalidate blocks in a specific physical address range.
-    /// Called when code is modified.
-    pub fn invalidate_range(&mut self, start_pa: u64, end_pa: u64) {
-        self.blocks.retain(|_, block| {
-            let block_end = block.start_pa + block.byte_len as u64;
-            !(block.start_pa < end_pa && block_end > start_pa)
-        });
-        self.invalidations += 1;
-    }
-
-    /// Evict least-used blocks when cache is full.
-    fn evict_cold(&mut self) {
-        // Simple strategy: remove blocks with lowest exec_count
-        let threshold = self.blocks.len() / 4;
-        let mut cold = Vec::with_capacity(threshold);
-
-        for (&pc, block) in &self.blocks {
-            if block.exec_count < 10 {
-                cold.push(pc);
-                if cold.len() >= threshold {
-                    break;
-                }
-            }
-        }
-
-        for pc in cold {
-            self.blocks.remove(&pc);
-        }
-
-        // If we didn't find enough cold blocks, remove oldest (by generation)
-        if self.blocks.len() >= BLOCK_CACHE_SIZE {
-            let oldest_gen = self.generation.wrapping_sub(1);
-            self.blocks
-                .retain(|_, block| block.generation >= oldest_gen);
+    /// Look up a block and increment its exec_count in a single operation.
+    #[inline(always)]
+    pub fn get_and_touch(&mut self, pc: u64) -> Option<&Block> {
+        // SAFETY: index() is always < BLOCK_CACHE_SIZE due to the mask
+        let slot = unsafe { self.slots.get_unchecked_mut(Self::index(pc)) };
+        if slot.valid && slot.block.start_pc == pc && slot.block.generation == self.generation {
+            self.hits += 1;
+            slot.block.exec_count = slot.block.exec_count.saturating_add(1);
+            Some(&slot.block)
+        } else {
+            self.misses += 1;
+            None
         }
     }
 
     /// Get mutable block for updating exec_count.
     #[inline]
     pub fn get_mut(&mut self, pc: u64) -> Option<&mut Block> {
-        self.blocks.get_mut(&pc).map(|b| &mut **b)
+        let generation = self.generation;
+        let slot = &mut self.slots[Self::index(pc)];
+        if slot.valid && slot.block.start_pc == pc && slot.block.generation == generation {
+            Some(&mut slot.block)
+        } else {
+            None
+        }
     }
 
-    /// Look up a block and increment its exec_count in a single operation.
-    /// This is more efficient than separate get() + get_mut() calls.
-    /// Returns a reference to the block if found and valid.
-    #[inline]
-    pub fn get_and_touch(&mut self, pc: u64) -> Option<&Block> {
-        if let Some(block) = self.blocks.get_mut(&pc) {
-            if block.generation == self.generation {
-                self.hits += 1;
-                block.exec_count = block.exec_count.saturating_add(1);
-                return Some(&**block);
+    /// Insert a compiled block, evicting whatever occupied its slot.
+    pub fn insert(&mut self, block: Block) {
+        let slot = &mut self.slots[Self::index(block.start_pc)];
+        slot.block = block;
+        slot.valid = true;
+    }
+
+    /// Invalidate all blocks (called on SATP change, SFENCE.VMA).
+    pub fn flush(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.invalidations += 1;
+        // Slots are not cleared; stale entries fail the generation check.
+    }
+
+    /// Invalidate blocks in a specific physical address range.
+    /// Called when code is modified.
+    pub fn invalidate_range(&mut self, start_pa: u64, end_pa: u64) {
+        for slot in self.slots.iter_mut() {
+            if slot.valid {
+                let block_end = slot.block.start_pa + slot.block.byte_len as u64;
+                if slot.block.start_pa < end_pa && block_end > start_pa {
+                    slot.valid = false;
+                }
             }
         }
-        self.misses += 1;
-        None
+        self.invalidations += 1;
     }
 
     /// Clear the entire cache.
     pub fn clear(&mut self) {
-        self.blocks.clear();
+        for slot in self.slots.iter_mut() {
+            slot.valid = false;
+        }
         self.generation = 0;
         self.hits = 0;
         self.misses = 0;
         self.invalidations = 0;
+    }
+
+    /// Number of valid entries (O(n); diagnostics only).
+    fn valid_count(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|s| s.valid && s.block.generation == self.generation)
+            .count()
     }
 
     /// Get cache statistics as a tuple: (hits, misses, size, hit_rate).
@@ -145,7 +160,7 @@ impl BlockCache {
         } else {
             0.0
         };
-        (self.hits, self.misses, self.blocks.len(), hit_rate)
+        (self.hits, self.misses, self.valid_count(), hit_rate)
     }
 }
 
@@ -213,13 +228,37 @@ mod tests {
         let mut cache = BlockCache::new();
 
         // Insert block with old generation
-        let mut block = make_test_block(0x8000_0000, 0);
-        cache.generation = 1; // Advance generation
-        block.generation = 0; // Block has old generation
-        cache.blocks.insert(0x8000_0000, Box::new(block));
+        let block = make_test_block(0x8000_0000, 0);
+        cache.generation = 1; // Advance generation past the block's
+        cache.insert(block);
 
         // Should not find it due to generation mismatch
         assert!(cache.get(0x8000_0000).is_none());
+    }
+
+    #[test]
+    fn test_cache_direct_mapped_eviction() {
+        let mut cache = BlockCache::new();
+        let pc_a = 0x8000_0000u64;
+        // Same slot: differs by exactly BLOCK_CACHE_SIZE instruction slots.
+        let pc_b = pc_a + (BLOCK_CACHE_SIZE as u64) * 2;
+        cache.insert(make_test_block(pc_a, 0));
+        assert!(cache.get(pc_a).is_some());
+        cache.insert(make_test_block(pc_b, 0));
+        // pc_b evicted pc_a (same slot), pc_b hits.
+        assert!(cache.get(pc_b).is_some());
+        assert!(cache.get(pc_a).is_none());
+    }
+
+    #[test]
+    fn test_cache_invalidate_range() {
+        let mut cache = BlockCache::new();
+        cache.insert(make_test_block(0x8000_0000, 0));
+        cache.insert(make_test_block(0x8000_1000, 0));
+        // Invalidate only the first page.
+        cache.invalidate_range(0x8000_0000, 0x8000_0800);
+        assert!(cache.get(0x8000_0000).is_none());
+        assert!(cache.get(0x8000_1000).is_some());
     }
 
     #[test]

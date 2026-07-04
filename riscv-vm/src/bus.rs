@@ -210,6 +210,24 @@ pub trait Bus: Send + Sync {
         0
     }
 
+    /// Direct DRAM window for devirtualized fast-path memory access.
+    ///
+    /// Returns (guest_base_addr, host_pointer, len) when the bus can expose
+    /// guest RAM as raw host memory. The block engine uses this to turn the
+    /// common "translated address hits DRAM" case into a bounds check plus a
+    /// raw load/store, skipping the dyn-Bus virtual call and Result plumbing.
+    ///
+    /// Buses whose RAM cannot be raw-accessed (SharedArrayBuffer backing on
+    /// WASM, strict-memory debugging builds) return None and all accesses
+    /// take the trait-method path.
+    ///
+    /// # Safety contract
+    /// The pointer must stay valid for the lifetime of the bus and the memory
+    /// must tolerate relaxed concurrent access (see dram::DATA_ORDER).
+    fn dram_window(&self) -> Option<(u64, *mut u8, usize)> {
+        None
+    }
+
     /// Poll hardware interrupt sources for a specific hart.
     /// Returns MIP bits for that hart.
     /// Default implementation returns 0 (no interrupts).
@@ -222,6 +240,56 @@ pub trait Bus: Send + Sync {
     // These are used by AMO instructions. Default implementations use
     // non-atomic read-modify-write which works for single-threaded mode.
     // WASM implementations override these to use JavaScript Atomics API.
+
+    /// Acquire-ordered atomic load, used by LR (load-reserved).
+    ///
+    /// Plain data loads may be relaxed for speed; LR must carry acquire
+    /// semantics because compilers lower acquire CAS loops to lr.aq/sc.rl
+    /// without separate fence instructions.
+    fn atomic_load(&self, addr: u64, is_word: bool) -> Result<u64, Trap> {
+        if is_word {
+            self.read32(addr).map(|v| v as i32 as i64 as u64)
+        } else {
+            self.read64(addr)
+        }
+    }
+
+    /// Release-ordered atomic store, used by SC (store-conditional).
+    fn atomic_store(&self, addr: u64, value: u64, is_word: bool) -> Result<(), Trap> {
+        if is_word {
+            self.write32(addr, value as u32)
+        } else {
+            self.write64(addr, value)
+        }
+    }
+
+    /// Atomic compare-exchange, used to implement SC (store-conditional).
+    ///
+    /// Returns Ok(true) if the exchange succeeded (memory still held
+    /// `expected`), Ok(false) if another hart changed it. Per-hart
+    /// reservation flags alone cannot implement SC correctly under SMP -
+    /// two harts' SCs could both "succeed" - so SC is lowered to CAS
+    /// against the value observed at LR time (QEMU does the same).
+    fn atomic_cas(&self, addr: u64, expected: u64, new: u64, is_word: bool) -> Result<bool, Trap> {
+        // Default non-atomic implementation for single-threaded buses.
+        if is_word {
+            let current = self.read32(addr)?;
+            if current == expected as u32 {
+                self.write32(addr, new as u32)?;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        } else {
+            let current = self.read64(addr)?;
+            if current == expected {
+                self.write64(addr, new)?;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
+    }
 
     /// Atomic swap (AMOSWAP): atomically replace value and return old value.
     fn atomic_swap(&self, addr: u64, value: u64, is_word: bool) -> Result<u64, Trap> {
@@ -437,10 +505,21 @@ pub struct SystemBus {
     /// RTC timestamp from host (Unix seconds since epoch)
     /// Updated by the host each tick to provide wall-clock time to the guest
     rtc_timestamp: std::sync::atomic::AtomicU64,
-    
+
+    /// Device activity doorbell bits, set when the guest writes device MMIO
+    /// (see DEVICE_ACTIVITY_*). Host run loops use take_device_activity() to
+    /// skip expensive polling (VirtIO queues, EMAC DMA descriptor walks)
+    /// while the guest hasn't touched the device.
+    pub device_activity: std::sync::atomic::AtomicU32,
+
     /// Hart lifecycle registry for SBI HSM operations
     registry: Arc<dyn HartRegistry>,
 }
+
+/// Device activity bit: guest wrote a VirtIO MMIO register.
+pub const DEVICE_ACTIVITY_VIRTIO: u32 = 1 << 0;
+/// Device activity bit: guest wrote a D1 EMAC register.
+pub const DEVICE_ACTIVITY_EMAC: u32 = 1 << 1;
 
 impl SystemBus {
     /// Create a SystemBus for native (non-WASM) builds with a default single-hart registry.
@@ -480,6 +559,7 @@ impl SystemBus {
             #[cfg(target_arch = "wasm32")]
             shared_control: None,
             rtc_timestamp: std::sync::atomic::AtomicU64::new(0),
+            device_activity: std::sync::atomic::AtomicU32::new(DEVICE_ACTIVITY_VIRTIO | DEVICE_ACTIVITY_EMAC),
             registry,
         }
     }
@@ -545,6 +625,7 @@ impl SystemBus {
             shared_uart_input,
             shared_control: Some(shared_control),
             rtc_timestamp: std::sync::atomic::AtomicU64::new(0),
+            device_activity: std::sync::atomic::AtomicU32::new(DEVICE_ACTIVITY_VIRTIO | DEVICE_ACTIVITY_EMAC),
             registry,
         }
     }
@@ -741,6 +822,54 @@ impl SystemBus {
         }
     }
 
+    /// Consume and return the device-activity doorbell bits
+    /// (DEVICE_ACTIVITY_*). Zero means the guest has not touched any
+    /// pollable device since the last call, so expensive polling
+    /// (VirtIO queues, EMAC DMA descriptor walks) can be skipped.
+    #[inline]
+    pub fn take_device_activity(&self) -> u32 {
+        self.device_activity
+            .swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Re-arm device-activity bits (used when host-side work arrives, e.g.
+    /// network RX packets queued for the guest).
+    #[inline]
+    pub fn raise_device_activity(&self, bits: u32) {
+        self.device_activity
+            .fetch_or(bits, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Inject an external interrupt for input events.
+    ///
+    /// Called when the host pushes keyboard, mouse, or touch events to the VM.
+    /// Sets the D1 Touch IRQ pending bit in PLIC so the guest kernel wakes up
+    /// and processes the input.
+    ///
+    /// The kernel's external interrupt handler will:
+    /// 1. Claim this interrupt from PLIC
+    /// 2. Poll the input device to get events
+    /// 3. Complete the interrupt
+    ///
+    /// # Usage
+    /// Call this from `send_d1_key_event()`, `send_touch_event()`, etc. after
+    /// pushing events to the device queue.
+    pub fn inject_input_interrupt(&self) {
+        // D1 Touch uses IRQ 2 (we define this; VIRTIO0 is IRQ 1, UART is IRQ 10)
+        const D1_TOUCH_IRQ: u32 = 2;
+        
+        // Set the PLIC pending bit for touch input
+        // This is level-triggered: the kernel must poll all events and the
+        // level will be cleared when the device queue is empty
+        self.plic.set_source_level(D1_TOUCH_IRQ, true);
+        
+        #[cfg(target_arch = "wasm32")]
+        {
+            // Debug logging removed for production
+            // Uncomment for testing: web_sys::console::log_1(&"[VM] Injected input interrupt (IRQ 2)".into());
+        }
+    }
+
     /// Load from CLINT, routing through shared CLINT when available (WASM workers).
     #[cfg(target_arch = "wasm32")]
     #[inline]
@@ -874,6 +1003,9 @@ impl SystemBus {
 
     #[cold]
     fn read16_slow(&self, addr: u64) -> Result<u16, Trap> {
+        if addr % 2 != 0 {
+            return Err(Trap::LoadAddressMisaligned(addr));
+        }
         if addr >= TEST_FINISHER_BASE && addr < TEST_FINISHER_BASE + TEST_FINISHER_SIZE {
             return Ok(0);
         }
@@ -929,6 +1061,9 @@ impl SystemBus {
 
     #[cold]
     fn read32_slow(&self, addr: u64) -> Result<u32, Trap> {
+        if addr % 4 != 0 {
+            return Err(Trap::LoadAddressMisaligned(addr));
+        }
         if addr >= TEST_FINISHER_BASE && addr < TEST_FINISHER_BASE + TEST_FINISHER_SIZE {
             return Ok(0);
         }
@@ -1120,6 +1255,9 @@ impl SystemBus {
 
     #[cold]
     fn read64_slow(&self, addr: u64) -> Result<u64, Trap> {
+        if addr % 8 != 0 {
+            return Err(Trap::LoadAddressMisaligned(addr));
+        }
         if addr >= TEST_FINISHER_BASE && addr < TEST_FINISHER_BASE + TEST_FINISHER_SIZE {
             return Ok(0);
         }
@@ -1231,6 +1369,9 @@ impl SystemBus {
 
     #[cold]
     fn write16_slow(&self, addr: u64, val: u16) -> Result<(), Trap> {
+        if addr % 2 != 0 {
+            return Err(Trap::StoreAddressMisaligned(addr));
+        }
         if addr >= TEST_FINISHER_BASE && addr < TEST_FINISHER_BASE + TEST_FINISHER_SIZE {
             return Err(Trap::RequestedTrap(val as u64));
         }
@@ -1272,6 +1413,9 @@ impl SystemBus {
 
     #[cold]
     fn write32_slow(&self, addr: u64, val: u32) -> Result<(), Trap> {
+        if addr % 4 != 0 {
+            return Err(Trap::StoreAddressMisaligned(addr));
+        }
         if addr >= TEST_FINISHER_BASE && addr < TEST_FINISHER_BASE + TEST_FINISHER_SIZE {
             return Err(Trap::RequestedTrap(val as u64));
         }
@@ -1317,6 +1461,10 @@ impl SystemBus {
 
         // D1 EMAC Controller (0x0450_0000 - 0x0450_0FFF)
         if addr >= D1_EMAC_BASE && addr < D1_EMAC_BASE + D1_EMAC_SIZE {
+            self.device_activity.fetch_or(
+                DEVICE_ACTIVITY_EMAC,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             if let Ok(mut emac) = self.d1_emac.write() {
                 if let Some(ref mut dev) = *emac {
                     dev.mmio_write32(addr, val);
@@ -1393,6 +1541,10 @@ impl SystemBus {
         }
 
         if let Some((idx, offset)) = self.get_virtio_device(addr) {
+            self.device_activity.fetch_or(
+                DEVICE_ACTIVITY_VIRTIO,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             self.virtio_devices[idx]
                 .write(offset, val as u64, &self.dram)
                 .map_err(|_| Trap::StoreAccessFault(addr))?;
@@ -1411,6 +1563,9 @@ impl SystemBus {
 
     #[cold]
     fn write64_slow(&self, addr: u64, val: u64) -> Result<(), Trap> {
+        if addr % 8 != 0 {
+            return Err(Trap::StoreAddressMisaligned(addr));
+        }
         if addr >= TEST_FINISHER_BASE && addr < TEST_FINISHER_BASE + TEST_FINISHER_SIZE {
             return Err(Trap::RequestedTrap(val));
         }
@@ -1469,10 +1624,57 @@ impl Bus for SystemBus {
         self.check_interrupts_for_hart(hart_id)
     }
 
+    #[inline]
+    fn dram_window(&self) -> Option<(u64, *mut u8, usize)> {
+        // strict-memory builds force every access through the Dram atomic
+        // helpers so ordering bugs can be ruled out.
+        #[cfg(feature = "strict-memory")]
+        {
+            None
+        }
+        #[cfg(not(feature = "strict-memory"))]
+        {
+            self.dram
+                .raw_window()
+                .map(|(ptr, len)| (self.dram.base, ptr, len))
+        }
+    }
+
     // ========== WASM Atomic Operations ==========
     //
     // For WASM with SharedArrayBuffer, we use JavaScript Atomics API
     // to ensure proper synchronization across Web Workers.
+
+    #[cfg(target_arch = "wasm32")]
+    fn atomic_cas(&self, addr: u64, expected: u64, new: u64, is_word: bool) -> Result<bool, Trap> {
+        if let Some(off) = self.dram.offset(addr) {
+            if is_word {
+                self.dram
+                    .atomic_cas_32(off as u64, expected as u32, new as u32)
+                    .map_err(|_| Trap::StoreAccessFault(addr))
+            } else {
+                self.dram
+                    .atomic_cas_64(off as u64, expected, new)
+                    .map_err(|_| Trap::StoreAccessFault(addr))
+            }
+        } else if is_word {
+            let current = self.read32(addr)?;
+            if current == expected as u32 {
+                self.write32(addr, new as u32)?;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        } else {
+            let current = self.read64(addr)?;
+            if current == expected {
+                self.write64(addr, new)?;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
+    }
 
     #[cfg(target_arch = "wasm32")]
     fn atomic_swap(&self, addr: u64, value: u64, is_word: bool) -> Result<u64, Trap> {
@@ -1902,6 +2104,81 @@ impl Bus for SystemBus {
     // These use Rust's std::sync::atomic intrinsics for true atomicity.
 
     #[cfg(not(target_arch = "wasm32"))]
+    fn atomic_load(&self, addr: u64, is_word: bool) -> Result<u64, Trap> {
+        if let Some(off) = self.dram.offset(addr) {
+            if is_word {
+                let v = self
+                    .dram
+                    .atomic_load_32(off as u64)
+                    .map_err(|_| Trap::LoadAccessFault(addr))?;
+                Ok(v as i32 as i64 as u64)
+            } else {
+                self.dram
+                    .atomic_load_64(off as u64)
+                    .map_err(|_| Trap::LoadAccessFault(addr))
+            }
+        } else if is_word {
+            self.read32(addr).map(|v| v as i32 as i64 as u64)
+        } else {
+            self.read64(addr)
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn atomic_store(&self, addr: u64, value: u64, is_word: bool) -> Result<(), Trap> {
+        if let Some(off) = self.dram.offset(addr) {
+            if is_word {
+                self.dram
+                    .atomic_store_32(off as u64, value as u32)
+                    .map_err(|_| Trap::StoreAccessFault(addr))
+            } else {
+                self.dram
+                    .atomic_store_64(off as u64, value)
+                    .map_err(|_| Trap::StoreAccessFault(addr))
+            }
+        } else if is_word {
+            self.write32(addr, value as u32)
+        } else {
+            self.write64(addr, value)
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn atomic_cas(&self, addr: u64, expected: u64, new: u64, is_word: bool) -> Result<bool, Trap> {
+        if let Some(off) = self.dram.offset(addr) {
+            if is_word {
+                self.dram
+                    .atomic_cas_32(off as u64, expected as u32, new as u32)
+                    .map_err(|_| Trap::StoreAccessFault(addr))
+            } else {
+                self.dram
+                    .atomic_cas_64(off as u64, expected, new)
+                    .map_err(|_| Trap::StoreAccessFault(addr))
+            }
+        } else {
+            // Non-DRAM (MMIO): serialize under the AMO lock.
+            let _guard = AMO_LOCK.lock().unwrap();
+            if is_word {
+                let current = self.read32(addr)?;
+                if current == expected as u32 {
+                    self.write32(addr, new as u32)?;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            } else {
+                let current = self.read64(addr)?;
+                if current == expected {
+                    self.write64(addr, new)?;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn atomic_swap(&self, addr: u64, value: u64, is_word: bool) -> Result<u64, Trap> {
         if let Some(off) = self.dram.offset(addr) {
             if is_word {
@@ -2205,10 +2482,8 @@ impl Bus for SystemBus {
 
     #[inline(always)]
     fn read16(&self, addr: u64) -> Result<u16, Trap> {
-        if addr % 2 != 0 {
-            return Err(Trap::LoadAddressMisaligned(addr));
-        }
-        // Fast path: DRAM access (most common case)
+        // Fast path: DRAM access (most common case). Misaligned DRAM access
+        // is legal (handled unaligned by Dram); misaligned MMIO is not.
         if let Some(off) = self.dram.offset(addr) {
             return self
                 .dram
@@ -2221,10 +2496,8 @@ impl Bus for SystemBus {
 
     #[inline(always)]
     fn read32(&self, addr: u64) -> Result<u32, Trap> {
-        if addr % 4 != 0 {
-            return Err(Trap::LoadAddressMisaligned(addr));
-        }
-        // Fast path: DRAM access (most common case)
+        // Fast path: DRAM access (most common case). Misaligned DRAM access
+        // is legal (handled unaligned by Dram); misaligned MMIO is not.
         if let Some(off) = self.dram.offset(addr) {
             return self
                 .dram
@@ -2237,10 +2510,8 @@ impl Bus for SystemBus {
 
     #[inline(always)]
     fn read64(&self, addr: u64) -> Result<u64, Trap> {
-        if addr % 8 != 0 {
-            return Err(Trap::LoadAddressMisaligned(addr));
-        }
-        // Fast path: DRAM access (most common case)
+        // Fast path: DRAM access (most common case). Misaligned DRAM access
+        // is legal (handled unaligned by Dram); misaligned MMIO is not.
         if let Some(off) = self.dram.offset(addr) {
             return self
                 .dram
@@ -2266,10 +2537,8 @@ impl Bus for SystemBus {
 
     #[inline(always)]
     fn write16(&self, addr: u64, val: u16) -> Result<(), Trap> {
-        if addr % 2 != 0 {
-            return Err(Trap::StoreAddressMisaligned(addr));
-        }
-        // Fast path: DRAM access (most common case)
+        // Fast path: DRAM access (most common case). Misaligned DRAM access
+        // is legal (handled unaligned by Dram); misaligned MMIO is not.
         if let Some(off) = self.dram.offset(addr) {
             return self
                 .dram
@@ -2282,10 +2551,8 @@ impl Bus for SystemBus {
 
     #[inline(always)]
     fn write32(&self, addr: u64, val: u32) -> Result<(), Trap> {
-        if addr % 4 != 0 {
-            return Err(Trap::StoreAddressMisaligned(addr));
-        }
-        // Fast path: DRAM access (most common case)
+        // Fast path: DRAM access (most common case). Misaligned DRAM access
+        // is legal (handled unaligned by Dram); misaligned MMIO is not.
         if let Some(off) = self.dram.offset(addr) {
             return self
                 .dram
@@ -2298,10 +2565,8 @@ impl Bus for SystemBus {
 
     #[inline(always)]
     fn write64(&self, addr: u64, val: u64) -> Result<(), Trap> {
-        if addr % 8 != 0 {
-            return Err(Trap::StoreAddressMisaligned(addr));
-        }
-        // Fast path: DRAM access (most common case)
+        // Fast path: DRAM access (most common case). Misaligned DRAM access
+        // is legal (handled unaligned by Dram); misaligned MMIO is not.
         if let Some(off) = self.dram.offset(addr) {
             return self
                 .dram

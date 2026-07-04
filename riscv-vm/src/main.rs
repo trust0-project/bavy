@@ -20,8 +20,17 @@ use minifb::{Key, MouseButton, MouseMode, Window, WindowOptions, Scale};
 struct Args {
     /// Path or URL to SD card image (contains kernel + filesystem)
     /// Supports local files or http:// / https:// URLs
-    #[arg(short, long)]
-    sdcard: String,
+    #[arg(short, long, required_unless_present = "bench")]
+    sdcard: Option<String>,
+
+    /// Run a synthetic benchmark workload instead of booting an SD card.
+    /// Workloads: nop, prime, memcpy, spinlock, ecall, all
+    #[arg(long)]
+    bench: Option<String>,
+
+    /// Benchmark duration per workload, in seconds
+    #[arg(long, default_value = "3.0")]
+    bench_seconds: f64,
 
     /// Number of harts (CPUs), 0 for auto-detect
     #[arg(short = 'n', long, default_value = "0")]
@@ -155,8 +164,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     }
 
+    // Benchmark mode: run synthetic workloads and exit.
+    if let Some(bench_name) = &args.bench {
+        let harts = if args.harts == 0 { 1 } else { args.harts };
+        return run_bench(bench_name, args.bench_seconds, harts);
+    }
+
     // Load SD card image (from URL or local file)
-    let sdcard_data = load_sdcard_data(&args.sdcard, args.debug)?;
+    let sdcard_source = args.sdcard.as_deref().expect("clap enforces sdcard");
+    let sdcard_data = load_sdcard_data(sdcard_source, args.debug)?;
 
     // Parse SD card: find kernel on boot partition
     let boot_info = sdboot::parse_sdcard(&sdcard_data)
@@ -183,8 +199,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     uart_println!("╠══════════════════════════════════════════════════════════════╣");
     // Extract display name from path or URL
-    let sdcard_display = args.sdcard.rsplit('/').next()
-        .unwrap_or(&args.sdcard);
+    let sdcard_display = sdcard_source.rsplit('/').next()
+        .unwrap_or(sdcard_source);
     let sdcard_display = if sdcard_display.len() > 52 {
         &sdcard_display[..52]
     } else {
@@ -239,6 +255,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(not(feature = "gui"))]
     run_headless(vm);
+
+    Ok(())
+}
+
+/// Run synthetic benchmark workloads and print MIPS results.
+fn run_bench(name: &str, seconds: f64, harts: usize) -> Result<(), Box<dyn std::error::Error>> {
+    use riscv_vm::bench;
+
+    let workloads: Vec<&str> = if name == "all" {
+        bench::WORKLOADS.to_vec()
+    } else {
+        vec![name]
+    };
+
+    println!("riscv-vm benchmark | harts={harts} | {seconds:.1}s per workload");
+    println!("{:<10} {:>8} {:>16} {:>10}", "workload", "harts", "instructions", "MIPS");
+    println!("{}", "-".repeat(48));
+
+    for workload in workloads {
+        // Spinlock is only meaningful with >= 2 harts; bump automatically
+        // when running the full suite with a single hart.
+        let effective_harts = if workload == "spinlock" && harts == 1 && name == "all" {
+            2
+        } else {
+            harts
+        };
+        let result = bench::run_native(workload, seconds, effective_harts)
+            .map_err(|e| format!("bench '{workload}' failed: {e}"))?;
+        println!(
+            "{:<10} {:>8} {:>16} {:>10.2}",
+            result.name, result.harts, result.instructions, result.mips
+        );
+    }
 
     Ok(())
 }

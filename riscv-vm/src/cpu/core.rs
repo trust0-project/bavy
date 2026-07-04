@@ -31,6 +31,124 @@ pub(super) enum BlockExecResult {
     Exit { next_pc: u64 },
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Devirtualized DRAM fast path
+//
+// The block engine captures the bus's raw DRAM window once per block and
+// performs raw (relaxed-atomic) loads/stores for physical addresses that hit
+// DRAM with natural alignment. Everything else - MMIO, misalignment, no
+// window (SAB backing / strict-memory) - falls back to the dyn Bus methods,
+// which also produce the identical trap mapping the interpreter uses.
+// ═══════════════════════════════════════════════════════════════════════════
+
+type DramWindow = Option<(u64, *mut u8, usize)>;
+
+#[inline(always)]
+fn fast_read8(win: DramWindow, bus: &dyn Bus, pa: u64) -> Result<u8, Trap> {
+    if let Some((base, ptr, len)) = win {
+        let off = pa.wrapping_sub(base) as usize;
+        if off < len {
+            return Ok(unsafe { *ptr.add(off) });
+        }
+    }
+    bus.read8(pa)
+}
+
+#[inline(always)]
+fn fast_read16(win: DramWindow, bus: &dyn Bus, pa: u64) -> Result<u16, Trap> {
+    if let Some((base, ptr, len)) = win {
+        let off = pa.wrapping_sub(base) as usize;
+        if off + 2 <= len && pa & 1 == 0 {
+            return Ok(unsafe { (ptr.add(off) as *const u16).read_unaligned().to_le() });
+        }
+    }
+    bus.read16(pa)
+}
+
+#[inline(always)]
+fn fast_read32(win: DramWindow, bus: &dyn Bus, pa: u64) -> Result<u32, Trap> {
+    if let Some((base, ptr, len)) = win {
+        let off = pa.wrapping_sub(base) as usize;
+        if off + 4 <= len && pa & 3 == 0 {
+            let v = unsafe {
+                (*(ptr.add(off) as *const core::sync::atomic::AtomicU32))
+                    .load(core::sync::atomic::Ordering::Relaxed)
+            };
+            return Ok(v.to_le());
+        }
+    }
+    bus.read32(pa)
+}
+
+#[inline(always)]
+fn fast_read64(win: DramWindow, bus: &dyn Bus, pa: u64) -> Result<u64, Trap> {
+    if let Some((base, ptr, len)) = win {
+        let off = pa.wrapping_sub(base) as usize;
+        if off + 8 <= len && pa & 7 == 0 {
+            let v = unsafe {
+                (*(ptr.add(off) as *const core::sync::atomic::AtomicU64))
+                    .load(core::sync::atomic::Ordering::Relaxed)
+            };
+            return Ok(v.to_le());
+        }
+    }
+    bus.read64(pa)
+}
+
+#[inline(always)]
+fn fast_write8(win: DramWindow, bus: &dyn Bus, pa: u64, val: u8) -> Result<(), Trap> {
+    if let Some((base, ptr, len)) = win {
+        let off = pa.wrapping_sub(base) as usize;
+        if off < len {
+            unsafe { *ptr.add(off) = val };
+            return Ok(());
+        }
+    }
+    bus.write8(pa, val)
+}
+
+#[inline(always)]
+fn fast_write16(win: DramWindow, bus: &dyn Bus, pa: u64, val: u16) -> Result<(), Trap> {
+    if let Some((base, ptr, len)) = win {
+        let off = pa.wrapping_sub(base) as usize;
+        if off + 2 <= len && pa & 1 == 0 {
+            unsafe { (ptr.add(off) as *mut u16).write_unaligned(val.to_le()) };
+            return Ok(());
+        }
+    }
+    bus.write16(pa, val)
+}
+
+#[inline(always)]
+fn fast_write32(win: DramWindow, bus: &dyn Bus, pa: u64, val: u32) -> Result<(), Trap> {
+    if let Some((base, ptr, len)) = win {
+        let off = pa.wrapping_sub(base) as usize;
+        if off + 4 <= len && pa & 3 == 0 {
+            unsafe {
+                (*(ptr.add(off) as *const core::sync::atomic::AtomicU32))
+                    .store(val.to_le(), core::sync::atomic::Ordering::Relaxed)
+            };
+            return Ok(());
+        }
+    }
+    bus.write32(pa, val)
+}
+
+#[inline(always)]
+fn fast_write64(win: DramWindow, bus: &dyn Bus, pa: u64, val: u64) -> Result<(), Trap> {
+    if let Some((base, ptr, len)) = win {
+        let off = pa.wrapping_sub(base) as usize;
+        if off + 8 <= len && pa & 7 == 0 {
+            unsafe {
+                (*(ptr.add(off) as *const core::sync::atomic::AtomicU64))
+                    .store(val.to_le(), core::sync::atomic::Ordering::Relaxed)
+            };
+            return Ok(());
+        }
+    }
+    bus.write64(pa, val)
+}
+
 /// RISC-V CPU core.
 ///
 /// Aligned to 128 bytes to prevent false sharing when multiple CPUs are
@@ -39,9 +157,17 @@ pub(super) enum BlockExecResult {
 #[repr(align(128))]
 pub struct Cpu {
     pub regs: [u64; 32],
+    /// Floating-point register file (F/D extensions). f32 values are
+    /// NaN-boxed into the upper bits per the RISC-V spec.
+    pub fregs: [u64; 32],
     pub pc: u64,
     /// Reservation set address for LR/SC (granule-aligned), or None if no reservation.
     pub(super) reservation: Option<u64>,
+    /// Value observed by the most recent LR. SC is implemented as a host
+    /// compare-exchange against this value, which is what makes concurrent
+    /// SCs from different harts mutually exclusive (per-hart reservation
+    /// flags alone cannot see another hart's intervening store).
+    pub(super) reservation_value: u64,
     /// Simple CSR storage for Zicsr (12-bit CSR address space).
     pub(crate) csrs: CsrFile,
     /// Current privilege mode (Machine/Supervisor/User).
@@ -59,6 +185,8 @@ pub struct Cpu {
     pub block_cache: BlockCache,
     /// Enable/disable superblock optimization.
     pub use_blocks: bool,
+    /// Total retired guest instructions (backs minstret/instret CSRs and MIPS accounting).
+    pub instret: u64,
 }
 
 impl Cpu {
@@ -69,18 +197,21 @@ impl Cpu {
     /// * `hart_id` - Hardware thread ID (0 for primary, 1+ for secondary)
     pub fn new(pc: u64, hart_id: u64) -> Self {
         let mut csrs = CsrFile::new();
-        // misa: rv64imac_zicsr_zifencei (value from phase-0.md)
-        const MISA_RV64IMAC_ZICSR_ZIFENCEI: u64 = 0x4000_0000_0018_1125;
-        csrs[CSR_MISA as usize] = MISA_RV64IMAC_ZICSR_ZIFENCEI;
+        // misa: RV64 (MXL=2) with A, C, D, F, I, M, S, U extension bits.
+        const MISA_RV64IMAFDC_SU: u64 = 0x8000_0000_0014_112D;
+        csrs[CSR_MISA as usize] = MISA_RV64IMAFDC_SU;
         csrs[CSR_MHARTID as usize] = hart_id; // Initialize hart ID
 
-        // mstatus initial value: all zeros except UXL/SXL can be left as 0 (WARL).
-        csrs[CSR_MSTATUS as usize] = 0;
+        // mstatus initial value: FS = Initial (01) so floating-point is
+        // usable out of reset; everything else zero (WARL).
+        csrs[CSR_MSTATUS as usize] = 1 << 13;
 
         Self {
             regs: [0; 32],
+            fregs: [0; 32],
             pc,
             reservation: None,
+            reservation_value: 0,
             csrs,
             mode: Mode::Machine,
             tlb: Tlb::new(),
@@ -88,6 +219,7 @@ impl Cpu {
             decode_cache: [None; DECODE_CACHE_SIZE],
             block_cache: BlockCache::new(),
             use_blocks: true, // Disabled by default; enable for production workloads
+            instret: 0,
         }
     }
 
@@ -446,11 +578,18 @@ impl Cpu {
         // ZERO-COPY: Reference the ops array directly instead of copying
         let ops = &block.ops;
 
+        // Capture the raw DRAM window once; every load/store in this block
+        // then takes a bounds-check + raw access instead of a virtual call.
+        let win: DramWindow = bus.dram_window();
+
         let mut idx = 0usize;
 
         while idx < len {
             let op = ops[idx];
             idx += 1;
+            // Count the instruction as retired up front; block_trap/block_exit
+            // undo this for ops that fault or are re-executed by the interpreter.
+            self.instret = self.instret.wrapping_add(1);
 
             match op {
                 // ═══════════════════════════════════════════════════════════
@@ -858,15 +997,15 @@ impl Cpu {
                     let pc = base_pc.wrapping_add(pc_offset as u64);
                     let pa = match self.translate_addr_for_block(bus, addr, MmuAccessType::Load) {
                         Ok(pa) => pa,
-                        Err(trap) => return BlockExecResult::Trap { trap, fault_pc: pc },
+                        Err(trap) => return self.block_trap(trap, pc),
                     };
-                    match bus.read64(pa) {
+                    match fast_read64(win, bus, pa) {
                         Ok(val) => {
                             if rd != 0 {
                                 self.regs[rd as usize] = val;
                             }
                         }
-                        Err(trap) => return BlockExecResult::Trap { trap, fault_pc: pc },
+                        Err(trap) => return self.block_trap(trap, pc),
                     }
                 }
 
@@ -880,15 +1019,15 @@ impl Cpu {
                     let pc = base_pc.wrapping_add(pc_offset as u64);
                     let pa = match self.translate_addr_for_block(bus, addr, MmuAccessType::Load) {
                         Ok(pa) => pa,
-                        Err(trap) => return BlockExecResult::Trap { trap, fault_pc: pc },
+                        Err(trap) => return self.block_trap(trap, pc),
                     };
-                    match bus.read32(pa) {
+                    match fast_read32(win, bus, pa) {
                         Ok(val) => {
                             if rd != 0 {
                                 self.regs[rd as usize] = (val as i32) as i64 as u64;
                             }
                         }
-                        Err(trap) => return BlockExecResult::Trap { trap, fault_pc: pc },
+                        Err(trap) => return self.block_trap(trap, pc),
                     }
                 }
 
@@ -902,15 +1041,15 @@ impl Cpu {
                     let pc = base_pc.wrapping_add(pc_offset as u64);
                     let pa = match self.translate_addr_for_block(bus, addr, MmuAccessType::Load) {
                         Ok(pa) => pa,
-                        Err(trap) => return BlockExecResult::Trap { trap, fault_pc: pc },
+                        Err(trap) => return self.block_trap(trap, pc),
                     };
-                    match bus.read32(pa) {
+                    match fast_read32(win, bus, pa) {
                         Ok(val) => {
                             if rd != 0 {
                                 self.regs[rd as usize] = val as u64;
                             }
                         }
-                        Err(trap) => return BlockExecResult::Trap { trap, fault_pc: pc },
+                        Err(trap) => return self.block_trap(trap, pc),
                     }
                 }
 
@@ -924,15 +1063,15 @@ impl Cpu {
                     let pc = base_pc.wrapping_add(pc_offset as u64);
                     let pa = match self.translate_addr_for_block(bus, addr, MmuAccessType::Load) {
                         Ok(pa) => pa,
-                        Err(trap) => return BlockExecResult::Trap { trap, fault_pc: pc },
+                        Err(trap) => return self.block_trap(trap, pc),
                     };
-                    match bus.read16(pa) {
+                    match fast_read16(win, bus, pa) {
                         Ok(val) => {
                             if rd != 0 {
                                 self.regs[rd as usize] = (val as i16) as i64 as u64;
                             }
                         }
-                        Err(trap) => return BlockExecResult::Trap { trap, fault_pc: pc },
+                        Err(trap) => return self.block_trap(trap, pc),
                     }
                 }
 
@@ -946,15 +1085,15 @@ impl Cpu {
                     let pc = base_pc.wrapping_add(pc_offset as u64);
                     let pa = match self.translate_addr_for_block(bus, addr, MmuAccessType::Load) {
                         Ok(pa) => pa,
-                        Err(trap) => return BlockExecResult::Trap { trap, fault_pc: pc },
+                        Err(trap) => return self.block_trap(trap, pc),
                     };
-                    match bus.read16(pa) {
+                    match fast_read16(win, bus, pa) {
                         Ok(val) => {
                             if rd != 0 {
                                 self.regs[rd as usize] = val as u64;
                             }
                         }
-                        Err(trap) => return BlockExecResult::Trap { trap, fault_pc: pc },
+                        Err(trap) => return self.block_trap(trap, pc),
                     }
                 }
 
@@ -968,15 +1107,15 @@ impl Cpu {
                     let pc = base_pc.wrapping_add(pc_offset as u64);
                     let pa = match self.translate_addr_for_block(bus, addr, MmuAccessType::Load) {
                         Ok(pa) => pa,
-                        Err(trap) => return BlockExecResult::Trap { trap, fault_pc: pc },
+                        Err(trap) => return self.block_trap(trap, pc),
                     };
-                    match bus.read8(pa) {
+                    match fast_read8(win, bus, pa) {
                         Ok(val) => {
                             if rd != 0 {
                                 self.regs[rd as usize] = (val as i8) as i64 as u64;
                             }
                         }
-                        Err(trap) => return BlockExecResult::Trap { trap, fault_pc: pc },
+                        Err(trap) => return self.block_trap(trap, pc),
                     }
                 }
 
@@ -990,15 +1129,15 @@ impl Cpu {
                     let pc = base_pc.wrapping_add(pc_offset as u64);
                     let pa = match self.translate_addr_for_block(bus, addr, MmuAccessType::Load) {
                         Ok(pa) => pa,
-                        Err(trap) => return BlockExecResult::Trap { trap, fault_pc: pc },
+                        Err(trap) => return self.block_trap(trap, pc),
                     };
-                    match bus.read8(pa) {
+                    match fast_read8(win, bus, pa) {
                         Ok(val) => {
                             if rd != 0 {
                                 self.regs[rd as usize] = val as u64;
                             }
                         }
-                        Err(trap) => return BlockExecResult::Trap { trap, fault_pc: pc },
+                        Err(trap) => return self.block_trap(trap, pc),
                     }
                 }
 
@@ -1016,10 +1155,10 @@ impl Cpu {
                     let pc = base_pc.wrapping_add(pc_offset as u64);
                     let pa = match self.translate_addr_for_block(bus, addr, MmuAccessType::Store) {
                         Ok(pa) => pa,
-                        Err(trap) => return BlockExecResult::Trap { trap, fault_pc: pc },
+                        Err(trap) => return self.block_trap(trap, pc),
                     };
-                    if let Err(trap) = bus.write64(pa, val) {
-                        return BlockExecResult::Trap { trap, fault_pc: pc };
+                    if let Err(trap) = fast_write64(win, bus, pa, val) {
+                        return self.block_trap(trap, pc);
                     }
                     self.clear_reservation_if_conflict(addr);
                 }
@@ -1035,10 +1174,10 @@ impl Cpu {
                     let pc = base_pc.wrapping_add(pc_offset as u64);
                     let pa = match self.translate_addr_for_block(bus, addr, MmuAccessType::Store) {
                         Ok(pa) => pa,
-                        Err(trap) => return BlockExecResult::Trap { trap, fault_pc: pc },
+                        Err(trap) => return self.block_trap(trap, pc),
                     };
-                    if let Err(trap) = bus.write32(pa, val) {
-                        return BlockExecResult::Trap { trap, fault_pc: pc };
+                    if let Err(trap) = fast_write32(win, bus, pa, val) {
+                        return self.block_trap(trap, pc);
                     }
                     self.clear_reservation_if_conflict(addr);
                 }
@@ -1054,10 +1193,10 @@ impl Cpu {
                     let pc = base_pc.wrapping_add(pc_offset as u64);
                     let pa = match self.translate_addr_for_block(bus, addr, MmuAccessType::Store) {
                         Ok(pa) => pa,
-                        Err(trap) => return BlockExecResult::Trap { trap, fault_pc: pc },
+                        Err(trap) => return self.block_trap(trap, pc),
                     };
-                    if let Err(trap) = bus.write16(pa, val) {
-                        return BlockExecResult::Trap { trap, fault_pc: pc };
+                    if let Err(trap) = fast_write16(win, bus, pa, val) {
+                        return self.block_trap(trap, pc);
                     }
                     self.clear_reservation_if_conflict(addr);
                 }
@@ -1073,10 +1212,10 @@ impl Cpu {
                     let pc = base_pc.wrapping_add(pc_offset as u64);
                     let pa = match self.translate_addr_for_block(bus, addr, MmuAccessType::Store) {
                         Ok(pa) => pa,
-                        Err(trap) => return BlockExecResult::Trap { trap, fault_pc: pc },
+                        Err(trap) => return self.block_trap(trap, pc),
                     };
-                    if let Err(trap) = bus.write8(pa, val) {
-                        return BlockExecResult::Trap { trap, fault_pc: pc };
+                    if let Err(trap) = fast_write8(win, bus, pa, val) {
+                        return self.block_trap(trap, pc);
                     }
                     self.clear_reservation_if_conflict(addr);
                 }
@@ -1217,6 +1356,131 @@ impl Cpu {
                 }
 
                 // ═══════════════════════════════════════════════════════════
+                // Atomics: LR/SC and AMO execute inline so hot spinlock loops
+                // stay in the block engine instead of exiting per acquire.
+                // Semantics mirror the interpreter exactly (execution.rs).
+                // ═══════════════════════════════════════════════════════════
+                MicroOp::LrW { rd, rs1, pc_offset } | MicroOp::LrD { rd, rs1, pc_offset } => {
+                    let is_word = matches!(op, MicroOp::LrW { .. });
+                    let addr = self.regs[rs1 as usize];
+                    let pc = base_pc.wrapping_add(pc_offset as u64);
+                    let pa = match self.translate_addr_for_block(bus, addr, MmuAccessType::Load) {
+                        Ok(pa) => pa,
+                        Err(trap) => return self.block_trap(trap, pc),
+                    };
+                    // Acquire-ordered load; observed value remembered for
+                    // CAS-based SC.
+                    match bus.atomic_load(pa, is_word) {
+                        Ok(v) => {
+                            if rd != 0 {
+                                self.regs[rd as usize] = v;
+                            }
+                            self.reservation = Some(Self::reservation_granule(addr));
+                            self.reservation_value = v;
+                        }
+                        Err(trap) => return self.block_trap(trap, pc),
+                    }
+                }
+
+                MicroOp::ScW {
+                    rd,
+                    rs1,
+                    rs2,
+                    pc_offset,
+                }
+                | MicroOp::ScD {
+                    rd,
+                    rs1,
+                    rs2,
+                    pc_offset,
+                } => {
+                    let is_word = matches!(op, MicroOp::ScW { .. });
+                    let addr = self.regs[rs1 as usize];
+                    let pc = base_pc.wrapping_add(pc_offset as u64);
+                    let pa = match self.translate_addr_for_block(bus, addr, MmuAccessType::Load) {
+                        Ok(pa) => pa,
+                        Err(trap) => return self.block_trap(trap, pc),
+                    };
+                    // Natural alignment required (matches interpreter).
+                    if is_word && addr % 4 != 0 {
+                        return self.block_trap(Trap::StoreAddressMisaligned(addr), pc);
+                    }
+                    if !is_word && addr % 8 != 0 {
+                        return self.block_trap(Trap::StoreAddressMisaligned(addr), pc);
+                    }
+                    let granule = Self::reservation_granule(addr);
+                    if self.reservation == Some(granule) {
+                        // SC succeeds only if memory still holds the LR value
+                        // (host compare-exchange; see execution.rs).
+                        let val = self.regs[rs2 as usize];
+                        match bus.atomic_cas(pa, self.reservation_value, val, is_word) {
+                            Ok(ok) => {
+                                if rd != 0 {
+                                    self.regs[rd as usize] = if ok { 0 } else { 1 };
+                                }
+                            }
+                            Err(trap) => return self.block_trap(trap, pc),
+                        }
+                        self.reservation = None;
+                    } else if rd != 0 {
+                        self.regs[rd as usize] = 1;
+                    }
+                }
+
+                MicroOp::AmoSwap { .. }
+                | MicroOp::AmoAdd { .. }
+                | MicroOp::AmoXor { .. }
+                | MicroOp::AmoAnd { .. }
+                | MicroOp::AmoOr { .. }
+                | MicroOp::AmoMin { .. }
+                | MicroOp::AmoMax { .. }
+                | MicroOp::AmoMinu { .. }
+                | MicroOp::AmoMaxu { .. } => {
+                    let (rd, rs1, rs2, is_word, pc_offset) = match op {
+                        MicroOp::AmoSwap { rd, rs1, rs2, is_word, pc_offset }
+                        | MicroOp::AmoAdd { rd, rs1, rs2, is_word, pc_offset }
+                        | MicroOp::AmoXor { rd, rs1, rs2, is_word, pc_offset }
+                        | MicroOp::AmoAnd { rd, rs1, rs2, is_word, pc_offset }
+                        | MicroOp::AmoOr { rd, rs1, rs2, is_word, pc_offset }
+                        | MicroOp::AmoMin { rd, rs1, rs2, is_word, pc_offset }
+                        | MicroOp::AmoMax { rd, rs1, rs2, is_word, pc_offset }
+                        | MicroOp::AmoMinu { rd, rs1, rs2, is_word, pc_offset }
+                        | MicroOp::AmoMaxu { rd, rs1, rs2, is_word, pc_offset } => {
+                            (rd, rs1, rs2, is_word, pc_offset)
+                        }
+                        _ => unreachable!(),
+                    };
+                    let addr = self.regs[rs1 as usize];
+                    let pc = base_pc.wrapping_add(pc_offset as u64);
+                    let pa = match self.translate_addr_for_block(bus, addr, MmuAccessType::Load) {
+                        Ok(pa) => pa,
+                        Err(trap) => return self.block_trap(trap, pc),
+                    };
+                    self.clear_reservation_if_conflict(addr);
+                    let rs2_val = self.regs[rs2 as usize];
+                    let result = match op {
+                        MicroOp::AmoSwap { .. } => bus.atomic_swap(pa, rs2_val, is_word),
+                        MicroOp::AmoAdd { .. } => bus.atomic_add(pa, rs2_val, is_word),
+                        MicroOp::AmoXor { .. } => bus.atomic_xor(pa, rs2_val, is_word),
+                        MicroOp::AmoAnd { .. } => bus.atomic_and(pa, rs2_val, is_word),
+                        MicroOp::AmoOr { .. } => bus.atomic_or(pa, rs2_val, is_word),
+                        MicroOp::AmoMin { .. } => bus.atomic_min(pa, rs2_val, is_word),
+                        MicroOp::AmoMax { .. } => bus.atomic_max(pa, rs2_val, is_word),
+                        MicroOp::AmoMinu { .. } => bus.atomic_minu(pa, rs2_val, is_word),
+                        MicroOp::AmoMaxu { .. } => bus.atomic_maxu(pa, rs2_val, is_word),
+                        _ => unreachable!(),
+                    };
+                    match result {
+                        Ok(old) => {
+                            if rd != 0 {
+                                self.regs[rd as usize] = old;
+                            }
+                        }
+                        Err(trap) => return self.block_trap(trap, pc),
+                    }
+                }
+
+                // ═══════════════════════════════════════════════════════════
                 // System operations (exit to interpreter)
                 // ═══════════════════════════════════════════════════════════
                 MicroOp::Ecall { pc_offset }
@@ -1228,23 +1492,10 @@ impl Cpu {
                 | MicroOp::Csrrs { pc_offset, .. }
                 | MicroOp::Csrrc { pc_offset, .. }
                 | MicroOp::Csrrwi { pc_offset, .. }
-                | MicroOp::Csrrsi { pc_offset, .. }
                 | MicroOp::Csrrci { pc_offset, .. }
-                | MicroOp::LrW { pc_offset, .. }
-                | MicroOp::LrD { pc_offset, .. }
-                | MicroOp::ScW { pc_offset, .. }
-                | MicroOp::ScD { pc_offset, .. }
-                | MicroOp::AmoSwap { pc_offset, .. }
-                | MicroOp::AmoAdd { pc_offset, .. }
-                | MicroOp::AmoXor { pc_offset, .. }
-                | MicroOp::AmoAnd { pc_offset, .. }
-                | MicroOp::AmoOr { pc_offset, .. }
-                | MicroOp::AmoMin { pc_offset, .. }
-                | MicroOp::AmoMax { pc_offset, .. }
-                | MicroOp::AmoMinu { pc_offset, .. }
-                | MicroOp::AmoMaxu { pc_offset, .. } => {
+                | MicroOp::Csrrsi { pc_offset, .. } => {
                     let pc = base_pc.wrapping_add(pc_offset as u64);
-                    return BlockExecResult::Exit { next_pc: pc };
+                    return self.block_exit(pc);
                 }
 
                 MicroOp::Wfi { pc_offset } => {
@@ -1252,17 +1503,46 @@ impl Cpu {
                     // The outer loop will check for pending interrupts and use
                     // Condvar to sleep the host thread, saving CPU cycles.
                     let pc = base_pc.wrapping_add(pc_offset as u64);
-                    return BlockExecResult::Exit { next_pc: pc };
+                    return self.block_exit(pc);
+                }
+
+                MicroOp::InterpOp { pc_offset } => {
+                    // No micro-op encoding (FP instruction): hand to interpreter.
+                    let pc = base_pc.wrapping_add(pc_offset as u64);
+                    return self.block_exit(pc);
                 }
 
                 MicroOp::Fence => {
-                    // No-op in our memory model
+                    // Guest FENCE must order host memory accesses now that
+                    // plain data accesses are relaxed (see dram::DATA_ORDER).
+                    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
                 }
             }
         }
 
         // Block ended without terminator (shouldn't happen with valid compilation)
         BlockExecResult::Continue(base_pc.wrapping_add(block.byte_len as u64))
+    }
+
+    /// Build a Trap result from block execution, un-counting the faulting
+    /// instruction (a trapping instruction does not retire).
+    #[inline(always)]
+    fn block_trap(&mut self, trap: Trap, fault_pc: u64) -> BlockExecResult {
+        self.instret = self.instret.wrapping_sub(1);
+        BlockExecResult::Trap {
+            trap,
+            fault_pc,
+        }
+    }
+
+    /// Build an Exit result from block execution, un-counting the exiting
+    /// instruction (it is re-executed and re-counted by the interpreter).
+    #[inline(always)]
+    fn block_exit(&mut self, next_pc: u64) -> BlockExecResult {
+        self.instret = self.instret.wrapping_sub(1);
+        BlockExecResult::Exit {
+            next_pc,
+        }
     }
 
     /// Translate address without entering trap handler (for block execution)
@@ -1605,6 +1885,8 @@ mod tests {
     fn test_x0_invariant() {
         let bus = make_bus();
         let mut cpu = Cpu::new(0x8000_0000, 0);
+        // Single-step semantics: exercise the interpreter path directly.
+        cpu.use_blocks = false;
 
         // Place a value in memory
         let addr = 0x8000_0100;
@@ -1675,6 +1957,8 @@ mod tests {
     fn test_m_extension_mul_div_rem() {
         let bus = make_bus();
         let mut cpu = Cpu::new(0x8000_0000, 0);
+        // Single-step semantics: exercise the interpreter path directly.
+        cpu.use_blocks = false;
 
         // MUL: 3 * 4 = 12
         cpu.write_reg(Register::X1, 3);
@@ -1745,6 +2029,8 @@ mod tests {
     fn test_compressed_addi_and_lwsp_paths() {
         let bus = make_bus();
         let mut cpu = Cpu::new(0x8000_0000, 0);
+        // Single-step semantics: exercise the interpreter path directly.
+        cpu.use_blocks = false;
 
         // Encodings from assembler with rv64imac (see rvc_test.S in dev notes):
         let c_addi_x11_1: u16 = 0x0585; // addi x11,x11,1 (C.ADDI)
@@ -1783,14 +2069,15 @@ mod tests {
         let mut cpu = Cpu::new(0x8000_0000, 0);
         let csr_addr: u32 = 0x300; // mstatus
 
-        // CSRRWI x1, mstatus, 5  (mstatus = 5, x1 = old = 0)
+        // CSRRWI x1, mstatus, 5  (mstatus = 5, x1 = old value)
+        // Out of reset mstatus.FS = Initial (bit 13) so FP is usable.
         let csrrwi = {
             let zimm = 5u32;
             (csr_addr << 20) | (zimm << 15) | (0x5 << 12) | (1 << 7) | 0x73
         };
         bus.write32(0x8000_0000, csrrwi).unwrap();
         cpu.step(&bus).unwrap();
-        assert_eq!(cpu.read_reg(Register::X1), 0);
+        assert_eq!(cpu.read_reg(Register::X1), 1 << 13);
 
         // CSRRSI x2, mstatus, 0xA  (mstatus = 5 | 0xA = 0xF, x2 = old = 5)
         let csrrsi = {
@@ -1815,6 +2102,8 @@ mod tests {
     fn test_a_extension_lr_sc_basic() {
         let bus = make_bus();
         let mut cpu = Cpu::new(0x8000_0000, 0);
+        // Single-step semantics: exercise the interpreter path directly.
+        cpu.use_blocks = false;
 
         let addr = 0x8000_0200;
         bus.write64(addr, 0xDEAD_BEEF_DEAD_BEEF).unwrap();
@@ -1842,6 +2131,8 @@ mod tests {
     fn test_a_extension_reservation_and_misaligned_sc() {
         let bus = make_bus();
         let mut cpu = Cpu::new(0x8000_0000, 0);
+        // Single-step semantics: exercise the interpreter path directly.
+        cpu.use_blocks = false;
 
         let addr = 0x8000_0300;
         bus.write64(addr, 0xCAFEBABE_F00D_F00D).unwrap();
@@ -1883,6 +2174,8 @@ mod tests {
     fn test_load_sign_and_zero_extension() {
         let bus = make_bus();
         let mut cpu = Cpu::new(0x8000_0000, 0);
+        // Single-step semantics: exercise the interpreter path directly.
+        cpu.use_blocks = false;
 
         let addr = 0x8000_0100;
         // 0xFFEE_DDCC_BBAA_9988 laid out little-endian in memory
@@ -1926,31 +2219,36 @@ mod tests {
 
     #[test]
     fn test_misaligned_load_and_store_traps() {
+        // Policy change: misaligned scalar loads/stores to DRAM are handled
+        // in hardware-style (no trap), matching real application-class cores
+        // and the kernel's expectations. Misaligned MMIO still traps.
         let bus = make_bus();
         let mut cpu = Cpu::new(0x8000_0000, 0);
+        // Single-step semantics: exercise the interpreter path directly.
+        cpu.use_blocks = false;
 
-        // x2 = misaligned address
-        cpu.write_reg(Register::X2, 0x8000_0001);
+        // x2 = misaligned DRAM address; x3 = value
+        cpu.write_reg(Register::X2, 0x8000_0101);
+        cpu.write_reg(Register::X3, 0xAABB_CCDD);
 
-        // LW x1, 0(x2)  -> should trap with LoadAddressMisaligned
+        // SW x3, 0(x2) then LW x1, 0(x2) round-trips despite misalignment
+        let sw = encode_s(0, 3, 2, 2, 0x23);
         let lw = encode_i(0, 2, 2, 1, 0x03);
-        bus.write32(0x8000_0000, lw).unwrap();
-
-        let res = cpu.step(&bus);
-        match res {
-            Err(Trap::LoadAddressMisaligned(a)) => assert_eq!(a, 0x8000_0001),
-            _ => panic!("Expected LoadAddressMisaligned trap"),
-        }
-
-        // SW x1, 0(x2)  -> should trap with StoreAddressMisaligned
-        cpu.pc = 0x8000_0000;
-        let sw = encode_s(0, 1, 2, 2, 0x23);
         bus.write32(0x8000_0000, sw).unwrap();
+        bus.write32(0x8000_0004, lw).unwrap();
 
+        cpu.step(&bus).unwrap();
+        cpu.step(&bus).unwrap();
+        assert_eq!(cpu.read_reg(Register::X1) as u32, 0xAABB_CCDD);
+
+        // Misaligned MMIO access still traps (CLINT base + 1).
+        cpu.pc = 0x8000_0010;
+        cpu.write_reg(Register::X2, 0x0200_0001);
+        bus.write32(0x8000_0010, lw).unwrap();
         let res = cpu.step(&bus);
         match res {
-            Err(Trap::StoreAddressMisaligned(a)) => assert_eq!(a, 0x8000_0001),
-            _ => panic!("Expected StoreAddressMisaligned trap"),
+            Err(Trap::LoadAddressMisaligned(a)) => assert_eq!(a, 0x0200_0001),
+            _ => panic!("Expected LoadAddressMisaligned trap for MMIO, got {:?}", res),
         }
     }
 
@@ -2064,6 +2362,8 @@ mod tests {
     fn test_interrupts_clint_plic() {
         let bus = make_bus();
         let mut cpu = Cpu::new(0x8000_0000, 0);
+        // Single-step semantics: exercise the interpreter path directly.
+        cpu.use_blocks = false;
         // Set poll_counter to 255 so the first step triggers immediate interrupt check
         cpu.poll_counter = 255;
 

@@ -723,6 +723,12 @@ impl<'a> BlockCompiler<'a> {
             }
 
             Op::Fence => MicroOp::Fence,
+
+            // Floating point has no micro-op encoding; hand the instruction
+            // to the interpreter (block terminates here).
+            Op::LoadFp { .. } | Op::StoreFp { .. } | Op::OpFp { .. } | Op::FmaFp { .. } => {
+                MicroOp::InterpOp { pc_offset }
+            }
         }
     }
 }

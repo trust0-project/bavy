@@ -210,6 +210,20 @@ impl Plic {
         let enable = self.enable_cache[ctx].load(Ordering::Relaxed);
         let threshold = self.threshold_cache[ctx].load(Ordering::Relaxed);
 
+        // DEBUG: Log state when pending is non-zero for this context
+        #[cfg(target_arch = "wasm32")]
+        if pending != 0 && ctx == 1 {
+            // Only log for S-mode context 1 (hart 0) to avoid spam
+            static DEBUG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let count = DEBUG_COUNT.fetch_add(1, Ordering::Relaxed);
+            if count < 5 {
+                web_sys::console::log_1(&format!(
+                    "[PLIC DEBUG] ctx={} pending=0x{:x} enable=0x{:x} threshold={} candidates=0x{:x}",
+                    ctx, pending, enable, threshold, pending & enable
+                ).into());
+            }
+        }
+
         // Quick check: any enabled source pending?
         let candidates = pending & enable;
         if candidates == 0 {

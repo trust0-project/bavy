@@ -1,6 +1,8 @@
+pub mod bench;
 pub mod bus;
 pub mod cpu;
 pub mod devices;
+pub mod jit;
 pub mod dram;
 pub mod dtb;
 pub mod engine;
@@ -11,6 +13,11 @@ pub mod loader;
 pub mod net;
 pub mod sdboot;  // SD card boot support (MBR, FAT32)
 pub mod shared_mem;
+pub mod crypto;  // Secure vault encryption primitives
+#[cfg(not(target_arch = "wasm32"))]
+pub mod vault;   // Secure file-based vault storage (native/Node.js)
+#[cfg(not(target_arch = "wasm32"))]
+pub mod state_manager;  // Encrypted state persistence manager
 pub mod hart_registry;  // Unified hart lifecycle management
 pub mod snapshot;
 pub mod vm;

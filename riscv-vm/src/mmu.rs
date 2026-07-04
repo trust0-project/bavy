@@ -13,9 +13,13 @@ const PAGE_SIZE: u64 = 4096;
 const PTE_SIZE: u64 = 8;
 const MAX_LEVELS: usize = 4;
 
-/// TLB size (power of 2 for fast modulo)
-const TLB_SIZE: usize = 64;
-const TLB_MASK: usize = TLB_SIZE - 1;
+/// TLB geometry: 2-way set-associative, 256 sets = 512 entries total.
+/// 512 x 24 bytes = 12 KB, still L1-resident on modern hosts. Two ways
+/// remove the pathological conflict misses of a direct-mapped design when
+/// two hot pages alias to the same set (common with kernel/user splits).
+const TLB_SETS: usize = 256;
+const TLB_WAYS: usize = 2;
+const TLB_SET_MASK: usize = TLB_SETS - 1;
 
 /// Permission bit masks for packed perm field
 pub const PERM_R: u8 = 1 << 0;
@@ -117,23 +121,37 @@ impl Default for TlbEntry {
     }
 }
 
-/// Direct-mapped TLB for fast virtual-to-physical address translation
+/// 2-way set-associative TLB for fast virtual-to-physical translation.
+///
+/// Ways of a set are adjacent in memory ([set][way] layout), so probing both
+/// ways touches a single cache line pair. Replacement: round-robin per set
+/// (1-bit victim toggle), which is cheap and close to LRU for 2 ways.
 pub struct Tlb {
-    entries: [TlbEntry; TLB_SIZE],
+    entries: [[TlbEntry; TLB_WAYS]; TLB_SETS],
+    /// Per-set round-robin victim way (bit per set).
+    victim: [u8; TLB_SETS],
 }
 
 impl Tlb {
     pub fn new() -> Self {
         Self {
-            entries: [TlbEntry::EMPTY; TLB_SIZE],
+            entries: [[TlbEntry::EMPTY; TLB_WAYS]; TLB_SETS],
+            victim: [0; TLB_SETS],
         }
+    }
+
+    #[inline(always)]
+    fn set_index(vpn: u64) -> usize {
+        (vpn as usize) & TLB_SET_MASK
     }
 
     /// Flush entire TLB (SFENCE.VMA with rs1=x0, rs2=x0)
     #[inline]
     pub fn flush(&mut self) {
-        for entry in &mut self.entries {
-            entry.valid = false;
+        for set in &mut self.entries {
+            for entry in set {
+                entry.valid = false;
+            }
         }
     }
 
@@ -142,9 +160,11 @@ impl Tlb {
     #[inline]
     pub fn flush_asid(&mut self, asid: u64) {
         let asid16 = asid as u16;
-        for entry in &mut self.entries {
-            if !entry.global() && entry.asid == asid16 {
-                entry.valid = false;
+        for set in &mut self.entries {
+            for entry in set {
+                if !entry.global() && entry.asid == asid16 {
+                    entry.valid = false;
+                }
             }
         }
     }
@@ -153,28 +173,24 @@ impl Tlb {
     #[inline]
     pub fn flush_va(&mut self, va: u64) {
         let vpn = va >> 12;
-        let idx = (vpn as usize) & TLB_MASK;
-        // SAFETY: idx is always < TLB_SIZE due to the bitmask
-        let entry = unsafe { self.entries.get_unchecked_mut(idx) };
-
-        if entry.vpn == vpn {
-            entry.valid = false;
+        let set = Self::set_index(vpn);
+        for entry in &mut self.entries[set] {
+            if entry.vpn == vpn {
+                entry.valid = false;
+            }
         }
     }
 
     /// Flush specific page with ASID check (SFENCE.VMA with rs1!=x0, rs2!=x0)
     #[inline]
     pub fn flush_page(&mut self, vpn: u64, asid: u64) {
-        let idx = (vpn as usize) & TLB_MASK;
-        // SAFETY: idx is always < TLB_SIZE due to the bitmask
-        let entry = unsafe { self.entries.get_unchecked_mut(idx) };
-
-        if entry.valid && entry.vpn == vpn {
-            // For page-specific flush, invalidate matching ASID mappings.
-            // Global mappings ignore ASID and are treated as matching.
-            let match_asid = entry.global() || entry.asid == asid as u16;
-            if match_asid {
-                entry.valid = false;
+        let set = Self::set_index(vpn);
+        for entry in &mut self.entries[set] {
+            if entry.valid && entry.vpn == vpn {
+                // Global mappings ignore ASID and are treated as matching.
+                if entry.global() || entry.asid == asid as u16 {
+                    entry.valid = false;
+                }
             }
         }
     }
@@ -183,72 +199,67 @@ impl Tlb {
     /// Returns reference to TlbEntry if found, None if miss.
     #[inline(always)]
     pub fn lookup(&self, vpn: u64, asid: u64) -> Option<&TlbEntry> {
-        let idx = (vpn as usize) & TLB_MASK;
-        // SAFETY: idx is always < TLB_SIZE due to the bitmask
-        let entry = unsafe { self.entries.get_unchecked(idx) };
-
-        // Hit if: valid AND VPN matches AND (entry is global OR ASID matches).
-        if entry.valid && entry.vpn == vpn && (entry.global() || entry.asid == asid as u16) {
-            Some(entry)
-        } else {
-            None
+        let set = Self::set_index(vpn);
+        // SAFETY: set index is always < TLB_SETS due to the bitmask
+        let ways = unsafe { self.entries.get_unchecked(set) };
+        for entry in ways {
+            if entry.valid && entry.vpn == vpn && (entry.global() || entry.asid == asid as u16) {
+                return Some(entry);
+            }
         }
+        None
     }
 
     /// Fast lookup returning just (ppn, perm) for common case
     #[inline(always)]
     pub fn lookup_fast(&self, vpn: u64, asid: u64) -> Option<(u64, u8)> {
-        let idx = (vpn as usize) & TLB_MASK;
-        // SAFETY: idx is always < TLB_SIZE due to the bitmask
-        let entry = unsafe { self.entries.get_unchecked(idx) };
-
-        if entry.valid && entry.vpn == vpn && (entry.global() || entry.asid == asid as u16) {
-            Some((entry.ppn, entry.perm))
-        } else {
-            None
-        }
+        self.lookup(vpn, asid).map(|e| (e.ppn, e.perm))
     }
 
     /// Look up with level awareness (for superpages)
     #[inline]
     pub fn lookup_with_level(&self, vpn: u64, asid: u64) -> Option<(u64, u8, u8)> {
-        let idx = (vpn as usize) & TLB_MASK;
-        // SAFETY: idx is always < TLB_SIZE due to the bitmask
-        let entry = unsafe { self.entries.get_unchecked(idx) };
-
-        if entry.valid && entry.vpn == vpn && (entry.global() || entry.asid == asid as u16) {
-            Some((entry.ppn, entry.perm, entry.level))
-        } else {
-            None
-        }
+        self.lookup(vpn, asid).map(|e| (e.ppn, e.perm, e.level))
     }
 
-    /// Insert a TLB entry. Overwrites any existing entry at the same index.
+    /// Insert a TLB entry, replacing an invalid way or the round-robin victim.
     #[inline(always)]
     pub fn insert(&mut self, entry: TlbEntry) {
-        let idx = (entry.vpn as usize) & TLB_MASK;
-        // SAFETY: idx is always < TLB_SIZE due to the bitmask
-        unsafe {
-            *self.entries.get_unchecked_mut(idx) = entry;
+        let set = Self::set_index(entry.vpn);
+        // SAFETY: set index is always < TLB_SETS due to the bitmask
+        let ways = unsafe { self.entries.get_unchecked_mut(set) };
+
+        // Prefer replacing an existing mapping of the same VPN, then an
+        // invalid way, then the round-robin victim.
+        for way in ways.iter_mut() {
+            if way.valid && way.vpn == entry.vpn {
+                *way = entry;
+                return;
+            }
         }
+        for (i, way) in ways.iter_mut().enumerate() {
+            if !way.valid {
+                *way = entry;
+                self.victim[set] = (i as u8 + 1) % TLB_WAYS as u8;
+                return;
+            }
+        }
+        let victim = self.victim[set] as usize % TLB_WAYS;
+        ways[victim] = entry;
+        self.victim[set] = (victim as u8 + 1) % TLB_WAYS as u8;
     }
 
     /// Insert a translation with explicit parameters.
-    /// Overwrites any existing entry at the same index (direct-mapped).
     #[inline]
     pub fn insert_translation(&mut self, vpn: u64, ppn: u64, perm: u8, level: u8, asid: u16) {
-        let idx = (vpn as usize) & TLB_MASK;
-        // SAFETY: idx is always < TLB_SIZE due to the bitmask
-        unsafe {
-            *self.entries.get_unchecked_mut(idx) = TlbEntry {
-                vpn,
-                ppn,
-                asid,
-                perm,
-                level,
-                valid: true,
-            };
-        }
+        self.insert(TlbEntry {
+            vpn,
+            ppn,
+            asid,
+            perm,
+            level,
+            valid: true,
+        });
     }
 }
 

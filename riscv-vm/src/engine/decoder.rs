@@ -131,6 +131,37 @@ pub enum Op {
         rl: bool,
     }, // RV64A atomics (LR/SC/AMO*)
     Fence, // FENCE / FENCE.I
+    LoadFp {
+        rd: Register, // FP destination register
+        rs1: Register,
+        imm: i64,
+        funct3: u32, // 2 = FLW, 3 = FLD
+    },
+    StoreFp {
+        rs1: Register,
+        rs2: Register, // FP source register
+        imm: i64,
+        funct3: u32, // 2 = FSW, 3 = FSD
+    },
+    OpFp {
+        rd: Register,
+        rs1: Register,
+        rs2: Register,
+        funct7: u32,
+        rm: u32, // rounding mode (funct3 field)
+    },
+    /// Fused multiply-add family (FMADD/FMSUB/FNMSUB/FNMADD).
+    FmaFp {
+        rd: Register,
+        rs1: Register,
+        rs2: Register,
+        rs3: Register,
+        /// 0 = FMADD, 1 = FMSUB, 2 = FNMSUB, 3 = FNMADD
+        kind: u32,
+        /// Format: 0 = single, 1 = double
+        fmt: u32,
+        rm: u32,
+    },
 }
 
 #[inline]
@@ -248,6 +279,59 @@ pub fn decode(insn: u32) -> Result<Op, Trap> {
         }
         0x0F => Ok(Op::Fence),
 
+        // F/D extensions
+        0x07 => {
+            // LOAD-FP: FLW (funct3=2) / FLD (funct3=3)
+            if funct3 == 2 || funct3 == 3 {
+                Ok(Op::LoadFp {
+                    rd,
+                    rs1,
+                    imm: imm_i,
+                    funct3,
+                })
+            } else {
+                Err(Trap::IllegalInstruction(insn as u64))
+            }
+        }
+        0x27 => {
+            // STORE-FP: FSW (funct3=2) / FSD (funct3=3)
+            if funct3 == 2 || funct3 == 3 {
+                Ok(Op::StoreFp {
+                    rs1,
+                    rs2,
+                    imm: imm_s,
+                    funct3,
+                })
+            } else {
+                Err(Trap::IllegalInstruction(insn as u64))
+            }
+        }
+        0x53 => Ok(Op::OpFp {
+            rd,
+            rs1,
+            rs2,
+            funct7,
+            rm: funct3,
+        }),
+        0x43 | 0x47 | 0x4B | 0x4F => {
+            // R4-type fused multiply-add family
+            let fmt = funct7 & 0x3;
+            if fmt > 1 {
+                return Err(Trap::IllegalInstruction(insn as u64));
+            }
+            let rs3 = Register::from_u32((insn >> 27) & 0x1F);
+            let kind = (opcode >> 2) & 0x3; // 0x43->0, 0x47->1, 0x4B->2, 0x4F->3
+            Ok(Op::FmaFp {
+                rd,
+                rs1,
+                rs2,
+                rs3,
+                kind,
+                fmt,
+                rm: funct3,
+            })
+        }
+
         _ => Err(Trap::IllegalInstruction(insn as u64)),
     }
 }
@@ -346,6 +430,13 @@ fn expand_q0(insn: u16, funct3: u16) -> Result<u32, Trap> {
             let rd_prime = 8 + ((insn_u >> 2) & 0x7);
             Ok(encode_i(nzuimm as i32, 2, 0x0, rd_prime, 0x13))
         }
+        // C.FLD -> FLD rd', uimm(rs1')
+        0b001 => {
+            let uimm = (((insn_u >> 10) & 0x7) << 3) | (((insn_u >> 5) & 0x3) << 6);
+            let rd_prime = 8 + ((insn_u >> 2) & 0x7);
+            let rs1_prime = 8 + ((insn_u >> 7) & 0x7);
+            Ok(encode_i(uimm as i32, rs1_prime, 0x3, rd_prime, 0x07))
+        }
         // C.LW -> LW rd', uimm(rs1')
         0b010 => {
             let uimm = (((insn_u >> 6) & 0x1) << 2)
@@ -361,6 +452,13 @@ fn expand_q0(insn: u16, funct3: u16) -> Result<u32, Trap> {
             let rd_prime = 8 + ((insn_u >> 2) & 0x7);
             let rs1_prime = 8 + ((insn_u >> 7) & 0x7);
             Ok(encode_i(uimm as i32, rs1_prime, 0x3, rd_prime, 0x03))
+        }
+        // C.FSD -> FSD rs2', uimm(rs1')
+        0b101 => {
+            let uimm = (((insn_u >> 10) & 0x7) << 3) | (((insn_u >> 5) & 0x3) << 6);
+            let rs2_prime = 8 + ((insn_u >> 2) & 0x7);
+            let rs1_prime = 8 + ((insn_u >> 7) & 0x7);
+            Ok(encode_s(uimm as i32, rs2_prime, rs1_prime, 0x3, 0x27))
         }
         // C.SW -> SW rs2', uimm(rs1')
         0b110 => {
@@ -590,6 +688,14 @@ fn expand_q2(insn: u16, funct3: u16) -> Result<u32, Trap> {
                 | (((insn_u >> 2) & 0x3) << 6);
             Ok(encode_i(uimm as i32, 2, 0x2, rd, 0x03))
         }
+        // C.FLDSP: FLD rd, uimm(sp) - same immediate layout as C.LDSP
+        0b001 => {
+            let rd = (insn_u >> 7) & 0x1F;
+            let uimm = (((insn_u >> 12) & 0x1) << 5)
+                | (((insn_u >> 5) & 0x3) << 3)
+                | (((insn_u >> 2) & 0x7) << 6);
+            Ok(encode_i(uimm as i32, 2, 0x3, rd, 0x07))
+        }
         // C.LDSP: LD rd, uimm(sp) - uimm[5|4:3|8:6] scaled by 8
         0b011 => {
             let rd = (insn_u >> 7) & 0x1F;
@@ -628,6 +734,12 @@ fn expand_q2(insn: u16, funct3: u16) -> Result<u32, Trap> {
                 }
                 _ => Err(Trap::IllegalInstruction(insn as u64)),
             }
+        }
+        // C.FSDSP: FSD rs2, uimm(sp) - same immediate layout as C.SDSP
+        0b101 => {
+            let rs2 = (insn_u >> 2) & 0x1F;
+            let uimm = (((insn_u >> 10) & 0x7) << 3) | (((insn_u >> 7) & 0x7) << 6);
+            Ok(encode_s(uimm as i32, rs2, 2, 0x3, 0x27))
         }
         // C.SWSP: SW rs2, uimm(sp) - uimm[5:2|7:6] scaled by 4
         0b110 => {

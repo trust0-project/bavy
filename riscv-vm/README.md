@@ -4,7 +4,7 @@ A complete RISC-V 64-bit (RV64GC) virtual machine implementation in Rust, capabl
 
 ## Features
 
-- **Core**: Full RV64GC instruction set implementation (IMAFDC + Zicsr + Zifencei).
+- **Core**: RV64GC instruction set implementation (IMAFDC + Zicsr + Zifencei). Integer, atomic and compressed instructions run in a superblock engine with a devirtualized memory fast path; F/D floating-point executes in the interpreter (NaN boxing, all rounding modes for conversions, fcsr flags). Misaligned scalar accesses to RAM are handled in hardware style (no trap).
 - **Memory**: Sv39 Virtual Memory Management Unit (MMU) with TLB.
 - **Peripherals**:
   - **UART**: 16550-compatible serial console.

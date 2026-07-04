@@ -639,9 +639,16 @@ function runVmLoop(vm: any, nativeNetClient: any | null, workers: Worker[] = [])
     if (!running) return;
 
     try {
-      // Execute a batch of instructions
-      for (let i = 0; i < INSTRUCTIONS_PER_TICK; i++) {
-        vm.step();
+      // Execute a batch of instructions inside WASM (single boundary
+      // crossing; device polling and CLINT sync happen at chunk boundaries
+      // inside run_batch). Falls back to per-instruction step() for old
+      // package builds.
+      if (typeof vm.run_batch === 'function') {
+        vm.run_batch(INSTRUCTIONS_PER_TICK);
+      } else {
+        for (let i = 0; i < INSTRUCTIONS_PER_TICK; i++) {
+          vm.step();
+        }
       }
 
       // Drain output
@@ -942,8 +949,12 @@ async function runVmWithGui(vm: any, nativeNetClient: any | null, workers: Worke
     }
 
     try {
-      for (let i = 0; i < INSTRUCTIONS_PER_TICK; i++) {
-        vm.step();
+      if (typeof vm.run_batch === 'function') {
+        vm.run_batch(INSTRUCTIONS_PER_TICK);
+      } else {
+        for (let i = 0; i < INSTRUCTIONS_PER_TICK; i++) {
+          vm.step();
+        }
       }
 
       drainOutput();

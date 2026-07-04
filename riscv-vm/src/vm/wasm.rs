@@ -554,6 +554,8 @@ impl WasmVm {
                     // Push directly to input device if we have a reference
                     if let Some(ref input) = self.input_device {
                         input.push_key_event(linux_code, pressed);
+                        self.bus
+                            .raise_device_activity(crate::bus::DEVICE_ACTIVITY_VIRTIO);
                         return true;
                     }
                 }
@@ -578,6 +580,8 @@ impl WasmVm {
         if let Some(ref input) = self.input_device {
             // Send position update
             input.push_mouse_move(x as u16, y as u16);
+            self.bus
+                .raise_device_activity(crate::bus::DEVICE_ACTIVITY_VIRTIO);
             
             // Note: Button state changes are handled separately via send_mouse_button
             // This method just updates position
@@ -602,6 +606,8 @@ impl WasmVm {
                 _ => return false,
             };
             input.push_mouse_button(btn_code, pressed);
+            self.bus
+                .raise_device_activity(crate::bus::DEVICE_ACTIVITY_VIRTIO);
             return true;
         }
         false
@@ -619,6 +625,9 @@ impl WasmVm {
         if let Ok(mut touch) = self.bus.d1_touch.write() {
             if let Some(ref mut dev) = *touch {
                 dev.push_touch(x as u16, y as u16, pressed);
+                // Inject interrupt so kernel wakes up to process input
+                drop(touch); // Release lock before calling inject
+                self.bus.inject_input_interrupt();
                 return true;
             }
         }
@@ -647,6 +656,9 @@ impl WasmVm {
         if let Ok(mut touch) = self.bus.d1_touch.write() {
             if let Some(ref mut dev) = *touch {
                 dev.push_key(linux_code, pressed);
+                // Inject interrupt so kernel wakes up to process input
+                drop(touch); // Release lock before calling inject
+                self.bus.inject_input_interrupt();
                 return true;
             }
         }
@@ -674,6 +686,9 @@ impl WasmVm {
         if let Ok(mut touch) = self.bus.d1_touch.write() {
             if let Some(ref mut dev) = *touch {
                 dev.push_char(char_code as u8);
+                // Inject interrupt so kernel wakes up to process input
+                drop(touch); // Release lock before calling inject
+                self.bus.inject_input_interrupt();
                 return true;
             }
         }
@@ -797,33 +812,21 @@ impl WasmVm {
     /// Get a direct zero-copy view into the framebuffer in SharedArrayBuffer.
     /// 
     /// This eliminates all memory copies by creating a Uint8Array view directly
-    /// into the SharedArrayBuffer at the framebuffer offset. The browser can
-    /// pass this directly to WebGPU's writeTexture for zero-copy rendering.
-    /// 
-    /// Returns None if SharedArrayBuffer is not available (single-threaded mode).
+    /// into guest memory at the framebuffer offset. The browser can pass this
+    /// directly to WebGPU's writeTexture for zero-copy rendering.
+    ///
+    /// Works in both memory modes:
+    /// - SMP (SharedArrayBuffer): stable view into the SAB.
+    /// - Single-hart (linear memory): view into WASM linear memory. This view
+    ///   is invalidated whenever WASM memory grows, so consume it immediately
+    ///   and call this again each frame (do not cache it JS-side).
     pub fn get_framebuffer_view(&self) -> Option<js_sys::Uint8Array> {
-        // Get the SharedArrayBuffer
-        let sab = self.shared_buffer.as_ref()?;
-        
-        // Calculate framebuffer offset within SharedArrayBuffer
-        // DRAM starts at HEADER_SIZE (control + clint + uart regions)
-        // Framebuffer is at physical 0x8100_0000, DRAM base is 0x8000_0000
-        // So framebuffer offset within DRAM = 0x100_0000 (16MB)
+        // Framebuffer is at physical 0x8100_0000; DRAM base is 0x8000_0000,
+        // so the framebuffer offset within DRAM = 0x100_0000 (16MB).
         const FRAMEBUFFER_DRAM_OFFSET: usize = 0x0100_0000;
         const FB_SIZE: usize = 1024 * 768 * 4; // 3,145,728 bytes
-        
-        let dram_offset = crate::shared_mem::dram_offset();
-        let fb_sab_offset = dram_offset + FRAMEBUFFER_DRAM_OFFSET;
-        
-        // Create a Uint8Array view directly into SharedArrayBuffer at the fb offset
-        // This is zero-copy - the Uint8Array points to the same memory
-        let view = js_sys::Uint8Array::new_with_byte_offset_and_length(
-            sab,
-            fb_sab_offset as u32,
-            FB_SIZE as u32,
-        );
-        
-        Some(view)
+
+        self.bus.dram.js_view(FRAMEBUFFER_DRAM_OFFSET, FB_SIZE)
     }
 
     /// Get the dirty rectangle from the last frame flush.
@@ -1094,6 +1097,139 @@ impl WasmVm {
 
 
 
+    /// Poll devices, network bridges, timers and RTC.
+    ///
+    /// Called periodically from `step()` (every 100 instructions) and from
+    /// `run_batch()` at chunk boundaries. `elapsed_insns` is the number of
+    /// guest instructions executed since the last call (used to advance the
+    /// shared CLINT in multi-hart mode).
+    fn poll_devices_and_timers(&mut self, elapsed_insns: u32) {
+        use crate::bus::{DEVICE_ACTIVITY_EMAC, DEVICE_ACTIVITY_VIRTIO};
+
+        // Doorbell gating: skip expensive device polling (VirtIO queue walks,
+        // EMAC DMA descriptor reads behind RwLocks) unless the guest touched
+        // the device via MMIO or host-side ingress queued work for it.
+        let mut activity = self.bus.take_device_activity();
+
+        if activity & DEVICE_ACTIVITY_VIRTIO != 0 {
+            self.bus.poll_virtio();
+        }
+
+        // Bridge host-side network ingress. The receive-queue checks are
+        // cheap; delivery to the guest (poll_dma) is gated below.
+        if let Some(ref mut backend) = self.wt_backend {
+            use crate::net::NetworkBackend;
+
+            // Check for IP assignment from the relay
+            if let Some(ip) = backend.get_assigned_ip() {
+                if let Ok(mut emac) = self.bus.d1_emac.write() {
+                    if let Some(ref mut dev) = *emac {
+                        // Only set IP once (when it changes from None)
+                        if dev.get_ip().is_none() {
+                            dev.set_ip(ip);
+                            self.net_status = NetworkStatus::Connected;
+                        }
+                    }
+                }
+            }
+
+            // Bridge RX packets from WebTransport relay to D1 EMAC
+            while let Ok(Some(packet)) = backend.recv() {
+                if let Ok(mut emac) = self.bus.d1_emac.write() {
+                    if let Some(ref mut dev) = *emac {
+                        dev.queue_rx_packet(packet);
+                        activity |= DEVICE_ACTIVITY_EMAC;
+                    }
+                }
+            }
+        } else if let Some(ref backend) = self.external_net {
+            // Node.js mode: inject RX packets into the EMAC RX queue
+            if let Some(first) = backend.extract_rx_packet() {
+                if let Ok(mut emac) = self.bus.d1_emac.write() {
+                    if let Some(ref mut dev) = *emac {
+                        dev.queue_rx_packet(first);
+                        while let Some(packet) = backend.extract_rx_packet() {
+                            dev.queue_rx_packet(packet);
+                        }
+                        activity |= DEVICE_ACTIVITY_EMAC;
+                    }
+                }
+            }
+        }
+
+        if activity & DEVICE_ACTIVITY_EMAC != 0 {
+            if let Ok(mut emac) = self.bus.d1_emac.write() {
+                if let Some(ref mut emac) = *emac {
+                    // Poll DMA - reads TX from kernel DRAM and delivers RX to kernel
+                    emac.poll_dma(&self.bus.dram);
+
+                    // Forward TX packets that poll_dma just read from the kernel
+                    let tx_packets = emac.get_tx_packets();
+                    if !tx_packets.is_empty() {
+                        if let Some(ref backend) = self.wt_backend {
+                            use crate::net::NetworkBackend;
+                            for packet in tx_packets {
+                                let _ = backend.send(&packet);
+                            }
+                        } else if let Some(ref backend) = self.external_net {
+                            for packet in tx_packets {
+                                backend.queue_tx_packet(packet);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Update CLINT timer - use shared CLINT if available, otherwise local
+        if self.num_harts > 1 {
+            // Multi-hart SAB mode: advance by elapsed instruction count
+            if let Some(ref clint) = self.shared_clint {
+                clint.tick(elapsed_insns as u64);
+            }
+        } else if self.shared_clint.is_none() {
+            // Non-SAB single-hart mode: local CLINT (wall-clock based, no-op tick)
+            self.bus.clint.tick();
+        }
+        // Single-hart SAB mode: ticked per-step in step() / per-chunk in run_batch()
+
+        // Update RTC with current host time
+        let unix_secs = (js_sys::Date::now() / 1000.0) as u64;
+        self.bus.set_rtc_timestamp(unix_secs);
+        // Also write to shared memory so workers can read it
+        if let Some(ref ctrl) = self.shared_control {
+            ctrl.set_rtc_timestamp(unix_secs);
+        }
+
+        self.sync_clint_to_mip();
+    }
+
+    /// Sync CLINT interrupt state into the CPU's MIP register so timer and
+    /// software interrupts become visible to the S-mode kernel (SSIP/STIP).
+    ///
+    /// Mirrors the native execute_batch sync: uses the shared CLINT in SMP
+    /// mode and the local wall-clock CLINT otherwise. Without the local
+    /// fallback, SBI set_timer never delivers STIP in single-hart WASM mode.
+    #[inline]
+    fn sync_clint_to_mip(&mut self) {
+        const CSR_MIP: usize = 0x344;
+        let (msip, timer) = if let Some(ref clint) = self.shared_clint {
+            clint.check_interrupts(0)
+        } else {
+            self.bus.clint.check_interrupts_for_hart(0)
+        };
+        if msip || timer {
+            let mut mip = self.cpu.csrs[CSR_MIP];
+            if msip {
+                mip |= 1 << 1; // SSIP
+            }
+            if timer {
+                mip |= 1 << 5; // STIP
+            }
+            self.cpu.csrs[CSR_MIP] = mip;
+        }
+    }
+
     /// Execute one instruction on hart 0 (primary hart).
     ///
     /// In SMP mode, secondary harts run in Web Workers and execute in parallel.
@@ -1140,112 +1276,7 @@ impl WasmVm {
         // Poll every 100 instructions for good network responsiveness
         self.poll_counter = self.poll_counter.wrapping_add(1);
         if self.poll_counter % 100 == 0 {
-            self.bus.poll_virtio();
-            
-            // Poll D1 EMAC for DMA (if enabled) and bridge with external network
-            // First, handle WebTransport backend (browser mode)
-            if let Some(ref mut backend) = self.wt_backend {
-                use crate::net::NetworkBackend;
-                
-                // Check for IP assignment from the relay
-                if let Some(ip) = backend.get_assigned_ip() {
-                    if let Ok(mut emac) = self.bus.d1_emac.write() {
-                        if let Some(ref mut dev) = *emac {
-                            // Only set IP once (when it changes from None)
-                            if dev.get_ip().is_none() {
-                                dev.set_ip(ip);
-                                self.net_status = NetworkStatus::Connected;
-                            }
-                        }
-                    }
-                }
-                
-                // Bridge RX packets from WebTransport relay to D1 EMAC
-                while let Ok(Some(packet)) = backend.recv() {
-                    if let Ok(mut emac) = self.bus.d1_emac.write() {
-                        if let Some(ref mut dev) = *emac {
-                            dev.queue_rx_packet(packet);
-                        }
-                    }
-                }
-            }
-            
-            if let Ok(mut emac) = self.bus.d1_emac.write() {
-                if let Some(ref mut emac) = *emac {
-                    // Bridge RX from external_net (Node.js mode) if not using wt_backend
-                    if self.wt_backend.is_none() {
-                        if let Some(ref backend) = self.external_net {
-                            // Step 1: Inject RX packets from relay into D1 EMAC RX queue
-                            // (so poll_dma can deliver them to the kernel)
-                            while let Some(packet) = backend.extract_rx_packet() {
-                                emac.queue_rx_packet(packet);
-                            }
-                        }
-                    }
-                    
-                    // Step 2: Poll DMA - this reads TX from kernel DRAM and delivers RX to kernel
-                    emac.poll_dma(&self.bus.dram);
-                    
-                    // Step 3: Extract TX packets that poll_dma just read from kernel
-                    // and forward them to the relay
-                    let tx_packets = emac.get_tx_packets();
-                    if !tx_packets.is_empty() {
-                        // Try WebTransport backend first (browser mode)
-                        if let Some(ref backend) = self.wt_backend {
-                            use crate::net::NetworkBackend;
-                            for packet in tx_packets {
-                                let _ = backend.send(&packet);
-                            }
-                        } else if let Some(ref backend) = self.external_net {
-                            // Fallback to external_net (Node.js mode)
-                            for packet in tx_packets {
-                                backend.queue_tx_packet(packet);
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Update CLINT timer - use shared CLINT if available, otherwise local
-            // NOTE: In single-hart SAB mode (num_harts == 1 with shared_clint), we tick
-            // per-step in the fix block below instead of here, to avoid double-ticking.
-            if self.num_harts > 1 {
-                // Multi-hart SAB mode: tick periodically (every 100 steps)
-                if let Some(ref clint) = self.shared_clint {
-                    clint.tick(100);
-                }
-            } else if self.shared_clint.is_none() {
-                // Non-SAB single-hart mode: use local CLINT
-                self.bus.clint.tick();
-            }
-            // Single-hart SAB mode (num_harts == 1 with shared_clint): ticked per-step below
-            
-            // Update RTC with current host time
-            // js_sys::Date::now() returns milliseconds since Unix epoch
-            let unix_secs = (js_sys::Date::now() / 1000.0) as u64;
-            self.bus.set_rtc_timestamp(unix_secs);
-            // Also write to shared memory so workers can read it
-            if let Some(ref ctrl) = self.shared_control {
-                ctrl.set_rtc_timestamp(unix_secs);
-            }
-            
-            // Sync CLINT interrupt state to CPU's MIP during periodic poll.
-            // This ensures timer/software interrupts are visible when the kernel reads sip.
-            // Use direct CSR array access (bypassing privilege check - we're emulating hardware).
-            const CSR_MIP: usize = 0x344;
-            if let Some(ref clint) = self.shared_clint {
-                let (msip, timer) = clint.check_interrupts(0);
-                if msip || timer {
-                    let mut mip = self.cpu.csrs[CSR_MIP];
-                    if msip {
-                        mip |= 1 << 1; // SSIP
-                    }
-                    if timer {
-                        mip |= 1 << 5; // STIP
-                    }
-                    self.cpu.csrs[CSR_MIP] = mip;
-                }
-            }
+            self.poll_devices_and_timers(100);
         }
 
         // CRITICAL FIX: Single-hart SAB mode requires per-step timer ticking and interrupt sync.
@@ -1261,28 +1292,15 @@ impl WasmVm {
         //
         // Performance note: This adds ~2 atomic ops per step in single-hart SAB mode,
         // but this mode is typically used for debugging, not performance-critical workloads.
-        if self.num_harts == 1 {
+        if self.num_harts == 1 && self.shared_clint.is_some() {
+            // Tick the timer every step to ensure timer interrupts fire correctly.
+            // In multi-hart mode, the periodic tick every poll is sufficient
+            // because workers run in parallel. But in single-hart SAB, we need
+            // per-step ticking to avoid timing-related bugs.
             if let Some(ref clint) = self.shared_clint {
-                // Tick the timer every step to ensure timer interrupts fire correctly.
-                // In multi-hart mode, the periodic tick(100) every 100 steps is sufficient
-                // because workers run in parallel. But in single-hart SAB, we need per-step
-                // ticking to avoid timing-related bugs.
                 clint.tick(1);
-                
-                // Sync CLINT interrupt state to CPU's MIP register.
-                const CSR_MIP: usize = 0x344;
-                let (msip, timer) = clint.check_interrupts(0);
-                if msip || timer {
-                    let mut mip = self.cpu.csrs[CSR_MIP];
-                    if msip {
-                        mip |= 1 << 1; // SSIP
-                    }
-                    if timer {
-                        mip |= 1 << 5; // STIP
-                    }
-                    self.cpu.csrs[CSR_MIP] = mip;
-                }
             }
+            self.sync_clint_to_mip();
         }
 
         // Execute one instruction on hart 0 only
@@ -1531,10 +1549,108 @@ impl WasmVm {
         web_sys::console::log_1(&JsValue::from_str("[VM] All workers terminated"));
     }
 
-    /// Execute up to N instructions in a batch.
-    /// Returns the number of instructions actually executed.
-    /// This is more efficient than calling step() N times due to reduced
-    /// JS-WASM boundary crossings.
+    /// Execute up to N instructions in a batch with device polling, CLINT
+    /// sync, and RTC updates hoisted to chunk boundaries.
+    ///
+    /// This is the fast path for hart 0: the inner loop is a tight
+    /// `cpu.step()` with no per-instruction bookkeeping. Interrupt latency
+    /// is bounded by IRQ_SYNC_INTERVAL (shared-CLINT sync) and the CPU's own
+    /// internal 256-instruction interrupt poll.
+    ///
+    /// Returns the number of dispatcher steps executed (superblocks count as
+    /// one step; use `instret()` for true instruction counts). Returns early
+    /// on halt or WFI so the JS caller can pace execution.
+    pub fn run_batch(&mut self, max_steps: u32) -> u32 {
+        // Chunk sizes: device polling is expensive (RwLocks, JS calls),
+        // interrupt sync is cheap but latency-sensitive.
+        const IRQ_SYNC_INTERVAL: u32 = 1024;
+        const DEVICE_POLL_CHUNKS: u32 = 8; // poll devices every 8 IRQ chunks
+
+        if self.halted {
+            return 0;
+        }
+        // Check if workers reported halt
+        if let Some(ref control) = self.shared_control {
+            if control.is_halted() {
+                self.halted = true;
+                self.halt_code = control.halt_code();
+                return 0;
+            }
+        }
+
+        let mut executed = 0u32;
+        let mut chunk_index = 0u32;
+
+        while executed < max_steps {
+            // Chunk-boundary housekeeping
+            if chunk_index % DEVICE_POLL_CHUNKS == 0 {
+                self.poll_devices_and_timers(IRQ_SYNC_INTERVAL * DEVICE_POLL_CHUNKS);
+            } else {
+                if self.num_harts == 1 {
+                    if let Some(ref clint) = self.shared_clint {
+                        clint.tick(IRQ_SYNC_INTERVAL as u64);
+                    }
+                }
+                self.sync_clint_to_mip();
+            }
+            chunk_index += 1;
+
+            let chunk_end = (executed + IRQ_SYNC_INTERVAL).min(max_steps);
+            while executed < chunk_end {
+                match self.cpu.step(&self.bus) {
+                    Ok(()) => {
+                        executed += 1;
+                    }
+                    Err(Trap::RequestedTrap(code)) => {
+                        self.halted = true;
+                        self.halt_code = code;
+                        if let Some(ref control) = self.shared_control {
+                            control.signal_halted(code);
+                        }
+                        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+                            "[VM] Hart 0 requested halt (code: {:#x})",
+                            code
+                        )));
+                        return executed;
+                    }
+                    Err(Trap::Fatal(msg)) => {
+                        web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(&format!(
+                            "[VM] Fatal error: {} at PC=0x{:x}",
+                            msg, self.cpu.pc
+                        )));
+                        self.halted = true;
+                        if let Some(ref control) = self.shared_control {
+                            control.signal_halted(0xDEAD);
+                        }
+                        return executed;
+                    }
+                    Err(Trap::Wfi) => {
+                        // Guest is idle: advance PC, sync interrupts, and end
+                        // the batch so the JS caller can pace (rAF/setTimeout)
+                        // instead of burning the remaining budget.
+                        self.cpu.pc = self.cpu.pc.wrapping_add(4);
+                        executed += 1;
+                        self.sync_clint_to_mip();
+                        return executed;
+                    }
+                    Err(_) => {
+                        // Other architectural traps handled inside the CPU
+                        executed += 1;
+                    }
+                }
+            }
+        }
+
+        executed
+    }
+
+    /// Execute up to N instructions by looping `step()`.
+    ///
+    /// DEPRECATED for hot paths: prefer `run_batch`, which hoists device
+    /// polling and CLINT sync out of the instruction loop and returns early
+    /// on WFI. `step_n` keeps the historical contract that a return value
+    /// less than `count` means the VM halted (it never stops early on WFI),
+    /// which existing consumers rely on for halt detection.
     pub fn step_n(&mut self, count: u32) -> u32 {
         for i in 0..count {
             if !self.step() {
@@ -1542,6 +1658,23 @@ impl WasmVm {
             }
         }
         count
+    }
+
+    /// Total retired guest instructions on hart 0.
+    ///
+    /// Unlike step counts, this reflects real instructions (superblock
+    /// execution retires many instructions per step). Use for MIPS metrics.
+    pub fn instret(&self) -> f64 {
+        self.cpu.instret as f64
+    }
+
+    /// Reset hart 0 to bare machine mode at the entry point.
+    ///
+    /// Benchmark workloads (see `bench_workload`) are M-mode programs; this
+    /// undoes the S-mode boot setup that `new_with_harts` applies so they
+    /// run exactly like under the native bench runner.
+    pub fn reset_machine_mode(&mut self) {
+        self.cpu = cpu::Cpu::new(self.entry_pc, 0);
     }
 
     /// Check if the VM has halted (e.g., due to shutdown command).
@@ -1693,4 +1826,16 @@ impl WasmVm {
     pub fn get_uptime_ms(&self) -> u64 {
         self.bus.sysinfo.uptime_ms()
     }
+}
+
+/// Build a synthetic benchmark workload binary (see `bench` module).
+///
+/// Load the returned bytes as a raw "kernel" via `WasmVm::new_with_harts`
+/// and drive it with `step_n`; read `instret()` for MIPS accounting.
+/// Available workloads: nop, prime, memcpy, spinlock, ecall.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn bench_workload(name: &str) -> Result<Vec<u8>, JsValue> {
+    crate::bench::workload_binary(name, DRAM_BASE)
+        .ok_or_else(|| JsValue::from_str(&format!("unknown workload: {name}")))
 }

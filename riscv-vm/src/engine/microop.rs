@@ -10,6 +10,11 @@
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
 pub enum MicroOp {
+    /// Exit the block engine and let the interpreter execute the instruction
+    /// at block_start + pc_offset. Used for ops without a micro-op encoding
+    /// (currently the F/D floating-point instructions).
+    InterpOp { pc_offset: u16 },
+
     // ═══════════════════════════════════════════════════════════════════════
     // ALU Operations (Register-Immediate)
     // ═══════════════════════════════════════════════════════════════════════
@@ -510,6 +515,9 @@ impl MicroOp {
     /// Returns true if this op terminates the basic block.
     #[inline]
     pub fn is_terminator(&self) -> bool {
+        // Atomics (LR/SC/AMO) are NOT terminators: they execute inline in the
+        // block engine, so spinlock loops compile into full blocks instead of
+        // being chopped at every atomic op.
         matches!(
             self,
             MicroOp::Jal { .. }
@@ -525,25 +533,13 @@ impl MicroOp {
                 | MicroOp::Mret { .. }
                 | MicroOp::Sret { .. }
                 | MicroOp::SfenceVma { .. }
-                | MicroOp::LrW { .. }
-                | MicroOp::LrD { .. }
-                | MicroOp::ScW { .. }
-                | MicroOp::ScD { .. }
-                | MicroOp::AmoSwap { .. }
-                | MicroOp::AmoAdd { .. }
-                | MicroOp::AmoXor { .. }
-                | MicroOp::AmoAnd { .. }
-                | MicroOp::AmoOr { .. }
-                | MicroOp::AmoMin { .. }
-                | MicroOp::AmoMax { .. }
-                | MicroOp::AmoMinu { .. }
-                | MicroOp::AmoMaxu { .. }
                 | MicroOp::Csrrw { .. }
                 | MicroOp::Csrrs { .. }
                 | MicroOp::Csrrc { .. }
                 | MicroOp::Csrrwi { .. }
                 | MicroOp::Csrrsi { .. }
                 | MicroOp::Csrrci { .. }
+                | MicroOp::InterpOp { .. }
         )
     }
 

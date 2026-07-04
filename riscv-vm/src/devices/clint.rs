@@ -104,8 +104,13 @@ impl Default for HartWakeup {
 /// - The weak memory ordering matches RISC-V's memory model
 pub struct Clint {
     /// Start time in milliseconds for wall-clock based mtime.
-    /// mtime = (now_millis - start_time_ms) * 10_000 to get 10MHz tick rate.
+    /// mtime = base_ticks + (now_millis - start_time_ms) * 10_000.
     start_time_ms: AtomicU64,
+
+    /// Tick offset applied on top of the wall clock. Lets set_mtime() hit
+    /// exact values (wall-clock milliseconds alone can only represent
+    /// multiples of 10,000 ticks, breaking sub-millisecond timer tests).
+    base_ticks: AtomicU64,
 
     /// Per-hart Machine Software Interrupt Pending bits.
     /// Only bit 0 is meaningful for each entry.
@@ -139,6 +144,7 @@ impl Clint {
 
         Self {
             start_time_ms: AtomicU64::new(now_millis()),
+            base_ticks: AtomicU64::new(0),
             msip: [ZERO_U32; MAX_HARTS],
             mtimecmp: [MAX_U64; MAX_HARTS],
             num_harts: AtomicUsize::new(num_harts.min(MAX_HARTS)),
@@ -167,17 +173,14 @@ impl Clint {
         let start = self.start_time_ms.load(Ordering::Relaxed);
         let elapsed_ms = now_millis().saturating_sub(start);
         // Convert to 10MHz ticks (10,000 ticks per millisecond)
-        elapsed_ms * 10_000
+        self.base_ticks.load(Ordering::Relaxed) + elapsed_ms * 10_000
     }
 
-    /// Sets mtime to a specific value (used for snapshot restore).
-    /// Adjusts start_time_ms so that mtime() returns the specified value.
+    /// Sets mtime to a specific value (used for snapshot restore and tests).
+    /// Exact: mtime() returns precisely `val` immediately after this call.
     pub fn set_mtime(&self, val: u64) {
-        // val = elapsed_ms * 10_000, so elapsed_ms = val / 10_000
-        let target_elapsed_ms = val / 10_000;
-        // start_time_ms = now_millis - target_elapsed_ms
-        let new_start = now_millis().saturating_sub(target_elapsed_ms);
-        self.start_time_ms.store(new_start, Ordering::Relaxed);
+        self.start_time_ms.store(now_millis(), Ordering::Relaxed);
+        self.base_ticks.store(val, Ordering::Relaxed);
     }
 
     /// Advance mtime by one tick. 

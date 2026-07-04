@@ -58,6 +58,9 @@ impl CsrFile {
                 let mask = (1 << 1) | (1 << 5) | (1 << 9);
                 Ok(mip & mask)
             }
+            // fflags/frm are views into fcsr
+            CSR_FFLAGS => Ok(self.storage[CSR_FCSR as usize] & 0x1F),
+            CSR_FRM => Ok((self.storage[CSR_FCSR as usize] >> 5) & 0x7),
             _ => Ok(self.storage[addr as usize]),
         }
     }
@@ -92,6 +95,18 @@ impl CsrFile {
                 let mask = 1 << 1;
                 mip = (mip & !mask) | (val & mask);
                 self.storage[CSR_MIP as usize] = mip;
+            }
+            // fflags/frm are views into fcsr
+            CSR_FFLAGS => {
+                let fcsr = self.storage[CSR_FCSR as usize];
+                self.storage[CSR_FCSR as usize] = (fcsr & !0x1F) | (val & 0x1F);
+            }
+            CSR_FRM => {
+                let fcsr = self.storage[CSR_FCSR as usize];
+                self.storage[CSR_FCSR as usize] = (fcsr & !0xE0) | ((val & 0x7) << 5);
+            }
+            CSR_FCSR => {
+                self.storage[CSR_FCSR as usize] = val & 0xFF;
             }
             _ => {
                 self.storage[addr as usize] = val;
@@ -147,8 +162,17 @@ pub const CSR_SCAUSE: u16 = 0x142;
 pub const CSR_STVAL: u16 = 0x143;
 pub const CSR_SIP: u16 = 0x144;
 
+// Floating-point CSRs (F/D extensions)
+pub const CSR_FFLAGS: u16 = 0x001; // exception flags (fcsr[4:0])
+pub const CSR_FRM: u16 = 0x002; // rounding mode (fcsr[7:5])
+pub const CSR_FCSR: u16 = 0x003; // full FP control/status
+
 // Additional CSRs used by xv6 and Sstc
 pub const CSR_TIME: u16 = 0xC01; // time (read-only)
+pub const CSR_CYCLE: u16 = 0xC00; // cycle (read-only)
+pub const CSR_INSTRET: u16 = 0xC02; // instret (read-only)
+pub const CSR_MCYCLE: u16 = 0xB00; // mcycle
+pub const CSR_MINSTRET: u16 = 0xB02; // minstret
 pub const CSR_MENVCFG: u16 = 0x30A; // menvcfg (for Sstc enable bit 63)
 pub const CSR_STIMECMP: u16 = 0x14D; // stimecmp (Sstc)
 pub const CSR_MCOUNTEREN: u16 = 0x306;

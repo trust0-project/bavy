@@ -20,7 +20,15 @@ pub struct CpuSnapshot {
     pub pc: u64,
     pub mode: Mode,
     pub regs: [u64; 32],
+    /// Floating-point register file (F/D). Defaults to zero when restoring
+    /// snapshots taken before FP support existed.
+    #[serde(default = "default_fregs")]
+    pub fregs: [u64; 32],
     pub csrs: HashMap<u16, u64>,
+}
+
+fn default_fregs() -> [u64; 32] {
+    [0; 32]
 }
 
 /// Serializable device state bundle.
@@ -70,6 +78,7 @@ pub struct MemRegionSnapshot {
     pub hash: String,
     pub data: Option<Vec<u8>>,
 }
+
 
 
 

@@ -3,6 +3,16 @@ use super::csr::{
     CSR_MENVCFG, CSR_MEPC, CSR_MHARTID, CSR_MIP, CSR_MSTATUS, CSR_SATP, CSR_SEPC, CSR_STIMECMP,
     CSR_TIME,
 };
+
+/// FP helpers report IllegalInstruction with a zero payload; fill in the
+/// actual instruction bits for accurate mtval reporting.
+#[inline]
+fn normalize_fp_trap(trap: crate::Trap, insn_raw: u32) -> crate::Trap {
+    match trap {
+        crate::Trap::IllegalInstruction(0) => crate::Trap::IllegalInstruction(insn_raw as u64),
+        other => other,
+    }
+}
 use crate::Mode;
 use crate::Trap;
 use crate::bus::Bus;
@@ -69,7 +79,10 @@ impl Cpu {
     /// dispatch overhead for hot code paths.
     fn try_execute_block(&mut self, bus: &dyn Bus) -> Option<Result<(), Trap>> {
         let mut current_pc = self.pc;
-        const MAX_CHAIN_DEPTH: u32 = 16; // Limit chaining to avoid starvation
+        // Chain limit bounds interrupt latency: chained blocks skip the
+        // dispatcher's interrupt poll. 64 blocks x <=64 ops sits well inside
+        // the 256-instruction poll budget used elsewhere.
+        const MAX_CHAIN_DEPTH: u32 = 64;
         let mut chain_count = 0u32;
 
         loop {
@@ -747,20 +760,16 @@ impl Cpu {
                 // LR/SC vs AMO op distinguished by funct5
                 match funct5 {
                     0b00010 => {
-                        // LR.W / LR.D
-                        let loaded = if is_word {
-                            match bus.read32(pa) {
-                                Ok(v) => v as i32 as i64 as u64,
-                                Err(e) => return self.handle_trap(e, pc, Some(insn_raw)),
-                            }
-                        } else {
-                            match bus.read64(pa) {
-                                Ok(v) => v,
-                                Err(e) => return self.handle_trap(e, pc, Some(insn_raw)),
-                            }
+                        // LR.W / LR.D - acquire-ordered so lr.aq/sc.rl lock
+                        // sequences work with relaxed plain data accesses.
+                        // The observed value is remembered for CAS-based SC.
+                        let loaded = match bus.atomic_load(pa, is_word) {
+                            Ok(v) => v,
+                            Err(e) => return self.handle_trap(e, pc, Some(insn_raw)),
                         };
                         self.write_reg(rd, loaded);
                         self.reservation = Some(Self::reservation_granule(addr));
+                        self.reservation_value = loaded;
                     }
                     0b00011 => {
                         // SC.W / SC.D
@@ -781,17 +790,16 @@ impl Cpu {
                         }
                         let granule = Self::reservation_granule(addr);
                         if self.reservation == Some(granule) {
-                            // Successful store
+                            // SC succeeds only if memory still holds the value
+                            // observed at LR time (host compare-exchange).
+                            // This is what makes concurrent SCs from other
+                            // harts fail; per-hart reservations alone cannot.
                             let val = self.read_reg(rs2);
-                            let res = if is_word {
-                                bus.write32(pa, val as u32)
-                            } else {
-                                bus.write64(pa, val)
-                            };
-                            if let Err(e) = res {
-                                return self.handle_trap(e, pc, Some(insn_raw));
+                            match bus.atomic_cas(pa, self.reservation_value, val, is_word) {
+                                Ok(true) => self.write_reg(rd, 0),
+                                Ok(false) => self.write_reg(rd, 1),
+                                Err(e) => return self.handle_trap(e, pc, Some(insn_raw)),
                             }
-                            self.write_reg(rd, 0);
                             self.reservation = None;
                         } else {
                             // Failed store, no memory access
@@ -938,6 +946,7 @@ impl Cpu {
                                             // SBI handled the call, advance PC and continue
                                             next_pc = pc.wrapping_add(insn_len as u64);
                                             self.pc = next_pc;
+                                            self.instret = self.instret.wrapping_add(1);
                                             return Ok(());
                                         }
                                     }
@@ -1022,9 +1031,18 @@ impl Cpu {
                     // Zicsr: CSRRW/CSRRS/CSRRC
                     1 | 2 | 3 | 5 | 6 | 7 => {
                         let csr_addr = (imm & 0xFFF) as u16;
+                        use super::csr::{CSR_CYCLE, CSR_INSTRET, CSR_MCYCLE, CSR_MINSTRET};
                         // Dynamic read for time CSR to reflect CLINT MTIME.
                         let old = if csr_addr == CSR_TIME {
                             bus.read64(CLINT_BASE + MTIME_OFFSET).unwrap_or(0)
+                        } else if csr_addr == CSR_INSTRET
+                            || csr_addr == CSR_MINSTRET
+                            || csr_addr == CSR_CYCLE
+                            || csr_addr == CSR_MCYCLE
+                        {
+                            // Retired-instruction counter; this emulator models
+                            // one cycle per instruction, so cycle == instret.
+                            self.instret
                         } else {
                             match self.read_csr(csr_addr) {
                                 Ok(v) => v,
@@ -1100,11 +1118,66 @@ impl Cpu {
                 }
             }
             Op::Fence => {
-                // NOP
+                // Guest FENCE orders memory across harts. With relaxed plain
+                // data accesses this must be a real host fence, not a no-op:
+                // Rust code compiled for RISC-V emits `fence` instructions
+                // for Acquire/Release atomics on plain loads/stores.
+                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            }
+
+            // ── F/D extensions ──
+            Op::LoadFp {
+                rd,
+                rs1,
+                imm,
+                funct3,
+            } => {
+                if let Err(e) = self.exec_load_fp(bus, rd, rs1, imm, funct3, pc) {
+                    let e = normalize_fp_trap(e, insn_raw);
+                    return self.handle_trap(e, pc, Some(insn_raw));
+                }
+            }
+            Op::StoreFp {
+                rs1,
+                rs2,
+                imm,
+                funct3,
+            } => {
+                if let Err(e) = self.exec_store_fp(bus, rs1, rs2, imm, funct3, pc) {
+                    let e = normalize_fp_trap(e, insn_raw);
+                    return self.handle_trap(e, pc, Some(insn_raw));
+                }
+            }
+            Op::OpFp {
+                rd,
+                rs1,
+                rs2,
+                funct7,
+                rm,
+            } => {
+                if let Err(e) = self.exec_op_fp(rd, rs1, rs2, funct7, rm) {
+                    let e = normalize_fp_trap(e, insn_raw);
+                    return self.handle_trap(e, pc, Some(insn_raw));
+                }
+            }
+            Op::FmaFp {
+                rd,
+                rs1,
+                rs2,
+                rs3,
+                kind,
+                fmt,
+                ..
+            } => {
+                if let Err(e) = self.exec_fma_fp(rd, rs1, rs2, rs3, kind, fmt) {
+                    let e = normalize_fp_trap(e, insn_raw);
+                    return self.handle_trap(e, pc, Some(insn_raw));
+                }
             }
         }
 
         self.pc = next_pc;
+        self.instret = self.instret.wrapping_add(1);
         Ok(())
     }
 }

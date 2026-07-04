@@ -228,6 +228,7 @@ impl Emulator {
             pc: self.cpu.pc,
             mode: self.cpu.mode,
             regs: self.cpu.regs,
+            fregs: self.cpu.fregs,
             csrs: self.cpu.export_csrs(),
         };
 
@@ -294,6 +295,7 @@ impl Emulator {
         self.cpu.pc = snapshot.cpu.pc;
         self.cpu.mode = snapshot.cpu.mode;
         self.cpu.regs = snapshot.cpu.regs;
+        self.cpu.fregs = snapshot.cpu.fregs;
         self.cpu.import_csrs(&snapshot.cpu.csrs);
         self.trapped = false;
         self.last_trap = None;
@@ -450,7 +452,16 @@ mod tests {
             emu2.cpu.read_reg(Register::X5)
         );
         assert_eq!(emu.bus.dram.get_data(), emu2.bus.dram.get_data());
-        assert_eq!(emu.bus.clint.mtime(), emu2.bus.clint.mtime());
+        // mtime is wall-clock based: both instances tick in real time, and
+        // the restored clock re-bases at restore time. The clocks diverge by
+        // however long serialize+deserialize took, so compare with tolerance
+        // (100ms = 1M ticks at 10MHz) rather than exactly.
+        let t1 = emu.bus.clint.mtime();
+        let t2 = emu2.bus.clint.mtime();
+        assert!(
+            t1.abs_diff(t2) < 1_000_000,
+            "mtime diverged too far after restore: {t1} vs {t2}"
+        );
         assert_eq!(
             emu.bus.clint.get_mtimecmp_array(),
             emu2.bus.clint.get_mtimecmp_array()
