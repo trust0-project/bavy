@@ -105,9 +105,8 @@ impl WorkerState {
         // Create bus view of shared DRAM
         let dram_offset = shared_mem::dram_offset();
         let shared_clint_for_bus = SharedClint::new(&sab_for_registry);
-        // Workers read from shared UART input (is_worker = true)
         let bus = SystemBus::from_shared_buffer(
-            sab_for_registry.clone(), dram_offset, shared_clint_for_bus, true, hart_id, registry_arc,
+            sab_for_registry.clone(), dram_offset, shared_clint_for_bus, hart_id, registry_arc,
         );
 
         // Create worker's own registry view for lifecycle polling

@@ -845,12 +845,41 @@ async function runVmWithGui(vm: any, nativeNetClient: any | null, workers: Worke
       }
     }
 
+    // Restore terminal state
+    if (process.stdin.isTTY && (process.stdin as any).setRawMode) {
+      (process.stdin as any).setRawMode(false);
+    }
+    process.stdin.pause();
+
     process.exit(code);
   };
 
   // Handle Ctrl+C
   process.on('SIGINT', () => {
     shutdown(0);
+  });
+
+  // Wire stdin to the UART so the console shell works alongside the GUI
+  // window (same mapping as headless mode).
+  if (process.stdin.isTTY && (process.stdin as any).setRawMode) {
+    (process.stdin as any).setRawMode(true);
+  }
+  process.stdin.resume();
+  process.stdin.on('data', (chunk) => {
+    for (const byte of chunk as any as Uint8Array) {
+      if (byte === 3) {
+        // Ctrl+C - terminate the VM and exit
+        shutdown(0);
+        return;
+      }
+      if (byte === 13) {
+        vm.input(10);
+      } else if (byte === 127 || byte === 8) {
+        vm.input(8);
+      } else {
+        vm.input(byte);
+      }
+    }
   });
 
   const INSTRUCTIONS_PER_TICK = 100_000;
@@ -916,11 +945,16 @@ async function runVmWithGui(vm: any, nativeNetClient: any | null, workers: Worke
     if (!window) return;
 
     try {
-      // Check frame version in guest memory
-      const gpuFrame = typeof vm.get_gpu_frame === 'function' ? vm.get_gpu_frame() : null;
+      // Check the frame version FIRST - only copy the 3MB framebuffer out of
+      // the VM when the kernel actually flushed a new frame. Copying it every
+      // tick stalls the main thread (especially in SMP/SharedArrayBuffer mode).
       const frameVersion = typeof vm.get_gpu_frame_version === 'function' ? vm.get_gpu_frame_version() : 0;
+      if (frameVersion === lastFrameVersion) {
+        return;
+      }
 
-      if (gpuFrame && frameVersion !== lastFrameVersion) {
+      const gpuFrame = typeof vm.get_gpu_frame === 'function' ? vm.get_gpu_frame() : null;
+      if (gpuFrame) {
         lastFrameVersion = frameVersion;
 
         // Convert RGBA to BGRA for SDL

@@ -351,6 +351,10 @@ fn run_with_gui(mut vm: NativeVm, scale_factor: u8) -> Result<(), Box<dyn std::e
             break;
         }
 
+        // Track whether any input was queued this frame so we can raise the
+        // PLIC input line once (the kernel's input path is interrupt-gated)
+        let mut input_queued = false;
+
         // Handle mouse/touch input
         let mouse_pressed = window.get_mouse_down(MouseButton::Left);
         if let Some((mx, my)) = window.get_mouse_pos(MouseMode::Clamp) {
@@ -363,6 +367,7 @@ fn run_with_gui(mut vm: NativeVm, scale_factor: u8) -> Result<(), Box<dyn std::e
                 if let Ok(mut touch) = bus.d1_touch.write() {
                     if let Some(ref mut dev) = *touch {
                         dev.push_touch(x as u16, y as u16, true);
+                        input_queued = true;
                     }
                 }
             } else if !mouse_pressed && last_mouse_pressed {
@@ -370,6 +375,7 @@ fn run_with_gui(mut vm: NativeVm, scale_factor: u8) -> Result<(), Box<dyn std::e
                 if let Ok(mut touch) = bus.d1_touch.write() {
                     if let Some(ref mut dev) = *touch {
                         dev.push_touch(x as u16, y as u16, false);
+                        input_queued = true;
                     }
                 }
             }
@@ -381,6 +387,7 @@ fn run_with_gui(mut vm: NativeVm, scale_factor: u8) -> Result<(), Box<dyn std::e
         for key in keys {
                 if let Ok(mut touch) = bus.d1_touch.write() {
                     if let Some(ref mut dev) = *touch {
+                        input_queued = true;
                         // Map minifb Key to character or special key event
                         match key {
                             // Special keys - send as key events
@@ -452,6 +459,12 @@ fn run_with_gui(mut vm: NativeVm, scale_factor: u8) -> Result<(), Box<dyn std::e
                     }
                 }
             }
+
+        // Raise the PLIC input line so the kernel's interrupt-gated input
+        // path (gpuid) wakes up and drains the queues
+        if input_queued {
+            bus.inject_input_interrupt();
+        }
 
         // Drain UART output to console
         for byte in bus.uart.drain_output() {

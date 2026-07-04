@@ -253,12 +253,10 @@ impl WasmVm {
             let registry_arc: std::sync::Arc<dyn crate::hart_registry::HartRegistry> = 
                 std::sync::Arc::new(registry);
             
-            // Main thread (hart 0) reads from local UART, not shared input
             let bus = SystemBus::from_shared_buffer(
                 sab.clone(),
                 dram_offset,
                 shared_clint_for_bus,
-                false,
                 0,  // hart_id for main thread
                 registry_arc,
             );
@@ -1762,14 +1760,17 @@ impl WasmVm {
     }
 
     /// Push an input byte to the UART.
-    /// In SMP mode, this also writes to the shared input buffer so workers can receive it.
+    ///
+    /// In SMP mode there is a single shared input ring consumed by whichever
+    /// hart runs the shell (the bus routes RBR/LSR reads of every hart,
+    /// including hart 0, to the ring). Pushing to the local FIFO as well
+    /// would duplicate the stream and leave stale bytes behind.
     pub fn input(&mut self, byte: u8) {
-        // Push to local UART for hart 0
-        self.bus.uart.push_input(byte);
-
-        // Also push to shared input buffer for workers to receive
         if let Some(ref shared_input) = self.shared_uart_input {
             let _ = shared_input.write_byte(byte);
+        } else {
+            // Single-hart mode: hart 0 reads from the local UART FIFO
+            self.bus.uart.push_input(byte);
         }
     }
 

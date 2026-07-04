@@ -414,6 +414,9 @@ impl NativeVm {
         if let Ok(mut touch) = self.bus.d1_touch.write() {
             if let Some(ref mut dev) = *touch {
                 dev.push_touch(x as u16, y as u16, pressed);
+                // Raise the PLIC input line so the kernel wakes up and polls
+                drop(touch);
+                self.bus.inject_input_interrupt();
                 return true;
             }
         }

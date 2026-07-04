@@ -574,8 +574,6 @@ impl SystemBus {
     /// * `buffer` - The full SharedArrayBuffer containing control + CLINT + UART + DRAM regions
     /// * `dram_offset` - Byte offset where DRAM region starts within the buffer
     /// * `shared_clint` - SharedClint accessor for the shared CLINT region
-    /// * `is_worker` - If true, enables shared UART input for receiving keyboard input.
-    ///                 Main thread (hart 0) should pass false since it reads from local UART.
     /// * `hart_id` - Hart ID for this bus (used for VirtIO proxy slot allocation)
     /// * `registry` - Hart registry for HSM lifecycle management
     ///
@@ -586,7 +584,6 @@ impl SystemBus {
         buffer: SharedArrayBuffer,
         dram_offset: usize,
         shared_clint: crate::shared_mem::wasm::SharedClint,
-        is_worker: bool,
         hart_id: usize,
         registry: Arc<dyn HartRegistry>,
     ) -> Self {
@@ -595,15 +592,14 @@ impl SystemBus {
         let num_harts = shared_clint.num_harts();
         let clint = Clint::with_harts(num_harts);
 
-        // Create shared UART output for workers to send output to main thread
+        // Create shared UART output so any hart's output reaches the host
         let shared_uart_output = crate::shared_mem::wasm::SharedUartOutput::new(&buffer);
 
-        // Create shared UART input only for workers - main thread reads from local UART
-        let shared_uart_input = if is_worker {
-            Some(crate::shared_mem::wasm::SharedUartInput::new(&buffer))
-        } else {
-            None
-        };
+        // All harts (including hart 0) consume console input from the single
+        // shared ring. The shell daemon can be scheduled on any hart; a split
+        // between hart 0's local FIFO and the workers' shared ring would make
+        // each hart see a different input stream (stale/duplicated bytes).
+        let shared_uart_input = Some(crate::shared_mem::wasm::SharedUartInput::new(&buffer));
 
         // Create shared control for D1 EMAC IP and other shared state
         let shared_control = crate::shared_mem::wasm::SharedControl::new(&buffer);
@@ -656,6 +652,34 @@ impl SystemBus {
         self.check_interrupts_for_hart(0)
     }
 
+    /// Refresh the level-triggered D1 touch IRQ line (source 2) from device state.
+    ///
+    /// `inject_input_interrupt()` raises the line when the host queues an
+    /// event; this drops it again once the kernel has drained and acked all
+    /// queues. Without this the line stays high forever and the kernel takes
+    /// an endless interrupt storm after the first input event.
+    ///
+    /// Uses `try_write` so the hot interrupt-poll path never blocks on the
+    /// device lock; a skipped refresh just delays the level drop by one poll.
+    #[inline]
+    fn refresh_touch_irq_level(&self) {
+        const D1_TOUCH_IRQ: u32 = 2;
+        // Only meaningful when the pending bit is set; avoids taking the
+        // device lock on every poll while there is no input activity.
+        if (self.plic.pending_cached() & (1 << D1_TOUCH_IRQ)) == 0 {
+            return;
+        }
+        if let Ok(touch) = self.d1_touch.try_write() {
+            let level = match &*touch {
+                Some(dev) => dev.has_pending_events(),
+                None => false,
+            };
+            if !level {
+                self.plic.set_source_level(D1_TOUCH_IRQ, false);
+            }
+        }
+    }
+
     /// Check interrupts for a specific hart.
     ///
     /// Each hart has its own:
@@ -686,6 +710,9 @@ impl SystemBus {
                 self.plic.set_source_level(irq, dev.is_interrupting());
             }
         }
+
+        // Drop the D1 touch IRQ line once its queues are drained
+        self.refresh_touch_irq_level();
 
         // Calculate MIP bits for this hart
         let mut mip: u64 = 0;
@@ -770,6 +797,9 @@ impl SystemBus {
                     self.plic.set_source_level(irq, dev.is_interrupting());
                 }
             }
+
+            // Drop the D1 touch IRQ line once its queues are drained
+            self.refresh_touch_irq_level();
         }
 
         // SEIP (Supervisor External Interrupt) - Bit 9

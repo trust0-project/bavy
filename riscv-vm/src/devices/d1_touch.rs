@@ -128,14 +128,6 @@ impl D1TouchEmulated {
     
     /// Push a keyboard event (called from host/JS)
     pub fn push_key(&mut self, key_code: u16, pressed: bool) {
-        #[cfg(target_arch = "wasm32")]
-        {
-            use wasm_bindgen::JsValue;
-            web_sys::console::log_1(&JsValue::from_str(&format!(
-                "[D1 Touch] push_key: code={} pressed={} queue_len={}",
-                key_code, pressed, self.key_event_queue.len()
-            )));
-        }
         self.key_event_queue.push(QueuedKeyEvent {
             key_code,
             pressed,
@@ -183,6 +175,19 @@ impl D1TouchEmulated {
     /// Check if interrupt is pending
     pub fn is_int_pending(&self) -> bool {
         self.pending_int
+    }
+
+    /// True while the device still has undelivered input for the guest.
+    ///
+    /// Used by the bus to drive the level-triggered PLIC line: the line stays
+    /// high until the kernel has drained and acknowledged every queue, then
+    /// drops so the interrupt doesn't fire forever.
+    pub fn has_pending_events(&self) -> bool {
+        self.pending_int
+            || self.buffer_ready
+            || !self.event_queue.is_empty()
+            || !self.key_event_queue.is_empty()
+            || !self.char_queue.is_empty()
     }
 
     /// Clear interrupt flag (after host reads status)
@@ -327,17 +332,7 @@ impl D1TouchEmulated {
             0x118 => self.y_resolution as u32,
             
             // Keyboard event count
-            0x11C => {
-                let count = self.key_event_queue.len() as u32;
-                #[cfg(target_arch = "wasm32")]
-                if count > 0 {
-                    use wasm_bindgen::JsValue;
-                    web_sys::console::log_1(&JsValue::from_str(&format!(
-                        "[D1 Touch] MMIO read KEY_COUNT={}", count
-                    )));
-                }
-                count
-            }
+            0x11C => self.key_event_queue.len() as u32,
             
             // Keyboard key code (peek front of queue)
             0x120 => {
