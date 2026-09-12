@@ -1,3 +1,13 @@
+## 0.7.6 (2026-09-12)
+
+### 🩹 Fixes
+
+- performance improvements Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([cbdfbcc](https://github.com/trust0-project/bavy/commit/cbdfbcc))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.7.5 (2026-07-04)
 
 ### 🩹 Fixes
