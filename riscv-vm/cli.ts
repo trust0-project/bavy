@@ -30,6 +30,40 @@ const DEFAULT_CERT_HASH =
   process.env.RELAY_CERT_HASH || '';
 
 /**
+ * Guest board: virt is QEMU-virt at 10 MHz; d1 is Allwinner D1 at 24 MHz.
+ */
+function isVirtMachine(machine?: string): boolean {
+  if (!machine) return true;
+  switch (machine.trim().toLowerCase()) {
+    case 'virt':
+    case 'qemu':
+    case 'qemu-virt':
+    case 'riscv-virtio':
+      return true;
+    default:
+      return false;
+  }
+}
+
+function isD1Machine(machine?: string): boolean {
+  if (!machine) return false;
+  switch (machine.trim().toLowerCase()) {
+    case 'd1':
+    case 'sun20i-d1':
+    case 'allwinner,sun20i-d1':
+    case 'lichee':
+    case 'lichee-rv':
+      return true;
+    default:
+      return false;
+  }
+}
+
+function timebaseHz(machine?: string): number {
+  return isD1Machine(machine) ? 24_000_000 : 10_000_000;
+}
+
+/**
  * Auto-detect the number of harts based on CPU cores.
  * Uses all available cores since idle harts sleep via WFI (no CPU waste).
  */
@@ -323,6 +357,8 @@ async function createVm(
     debug?: boolean;
     enableGpu?: boolean;
     mountPath?: string;
+    /** Guest board: virt (10 MHz) or d1 (24 MHz). */
+    machine?: string;
   },
 ) {
   let sdcardBytes: Uint8Array;
@@ -371,11 +407,16 @@ async function createVm(
     throw new Error('WasmVm class not found in wasm module');
   }
 
-  // Create VM with requested number of harts
+  // Create VM with requested number of harts / board.
+  // Non-virt boards use new_with_machine; virt keeps new / new_with_harts.
   const requestedHarts = options?.harts;
-  const vm = (requestedHarts !== undefined && requestedHarts >= 1 && VmCtor.new_with_harts)
-    ? VmCtor.new_with_harts(kernelBytes, requestedHarts)
-    : new VmCtor(kernelBytes);
+  const machine = options?.machine;
+  const virt = isVirtMachine(machine);
+  const vm = (!virt && typeof (VmCtor as any).new_with_machine === 'function')
+    ? (VmCtor as any).new_with_machine(kernelBytes, requestedHarts ?? 0, machine)
+    : (requestedHarts !== undefined && requestedHarts >= 1 && VmCtor.new_with_harts)
+      ? VmCtor.new_with_harts(kernelBytes, requestedHarts)
+      : new VmCtor(kernelBytes);
 
   // Load entire SD card as block device (for filesystem partition access)
   if (typeof vm.load_disk === 'function') {
@@ -1016,8 +1057,15 @@ async function runVmWithGui(vm: any, nativeNetClient: any | null, workers: Worke
 /**
  * Print banner matching native VM output
  */
-function printBanner(sdcardPath: string, numHarts: number, netWebtransport?: string, enableGpu = false) {
+function printBanner(
+  sdcardPath: string,
+  numHarts: number,
+  netWebtransport?: string,
+  enableGpu = false,
+  machine?: string,
+) {
   const sdcardName = path.basename(sdcardPath);
+  const machineLabel = `${machine ?? 'virt'} (${timebaseHz(machine)} Hz)`;
 
   console.log();
   console.log('╔══════════════════════════════════════════════════════════════╗');
@@ -1029,6 +1077,7 @@ function printBanner(sdcardPath: string, numHarts: number, netWebtransport?: str
   console.log('╠══════════════════════════════════════════════════════════════╣');
   console.log(`║  SD Card: ${sdcardName.padEnd(50)} ║`);
   console.log(`║  Harts:   ${String(numHarts).padEnd(50)} ║`);
+  console.log(`║  Machine: ${machineLabel.padEnd(50)} ║`);
   if (netWebtransport) {
     console.log(`║  Network: ${netWebtransport.padEnd(50)} ║`);
   }
@@ -1048,6 +1097,11 @@ const argv = (yargs(hideBin(process.argv)) as any)
     alias: 'n',
     type: 'number',
     describe: 'Number of harts (omit or 0 = auto-detect as CPU/2, >= 1 = explicit count)',
+  })
+  .option('machine', {
+    type: 'string',
+    describe: 'Guest board: virt (QEMU-virt, 10 MHz timebase) or d1 (Allwinner, 24 MHz)',
+    default: 'virt',
   })
   .option('net-webtransport', {
     type: 'string',
@@ -1078,18 +1132,24 @@ const argv = (yargs(hideBin(process.argv)) as any)
 (async () => {
   const sdcardPath = argv.sdcard as string;
   const hartsArg = argv.harts as number | undefined;
+  const machineArg = (argv.machine as string | undefined) || 'virt';
   const netWebtransport = argv['net-webtransport'] as string | undefined;
   const certHash = argv['cert-hash'] as string | undefined;
   const mountPath = argv.mount as string | undefined;
   const debug = argv.debug as boolean;
   const enableGpu = argv['enable-gpu'] as boolean;
 
+  if (!isVirtMachine(machineArg) && !isD1Machine(machineArg)) {
+    console.error(`[CLI] unknown machine ${JSON.stringify(machineArg)}; expected virt or d1`);
+    process.exit(1);
+  }
+
   // Hart count logic:
-  // - undefined or 0: auto-detect (cpu/2)
+  // - undefined or 0: auto-detect (cpu/2) on virt; D1 stays at 1
   // - >= 1: use the user-specified value (capped at available CPUs)
   let numHarts: number;
   if (hartsArg === undefined || hartsArg === 0) {
-    numHarts = detectHartCount();
+    numHarts = isD1Machine(machineArg) ? 1 : detectHartCount();
   } else if (hartsArg >= 1) {
     // Respect user-specified count, but cap at available CPUs for sanity
     const maxHarts = os.cpus().length;
@@ -1100,11 +1160,11 @@ const argv = (yargs(hideBin(process.argv)) as any)
   } else {
     // Invalid value (negative), fall back to auto-detect
     console.error(`[CLI] Warning: invalid harts value ${hartsArg}, using auto-detect`);
-    numHarts = detectHartCount();
+    numHarts = isD1Machine(machineArg) ? 1 : detectHartCount();
   }
 
   // Print banner
-  printBanner(sdcardPath, numHarts, netWebtransport, enableGpu);
+  printBanner(sdcardPath, numHarts, netWebtransport, enableGpu, machineArg);
 
   try {
     const { vm, nativeNetClient, workers } = await createVm(sdcardPath, {
@@ -1114,6 +1174,7 @@ const argv = (yargs(hideBin(process.argv)) as any)
       debug,
       enableGpu,
       mountPath,
+      machine: machineArg,
     });
 
 

@@ -152,6 +152,16 @@ impl BlockCache {
             .count()
     }
 
+    /// Number of currently valid blocks that have a compiled JIT function.
+    pub fn jitted_count(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|s| {
+                s.valid && s.block.generation == self.generation && s.block.jit_fn.is_some()
+            })
+            .count()
+    }
+
     /// Get cache statistics as a tuple: (hits, misses, size, hit_rate).
     pub fn stats(&self) -> (u64, u64, usize, f64) {
         let total = self.hits + self.misses;

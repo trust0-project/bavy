@@ -16,10 +16,12 @@
 //!   gate for any Tier-2 JIT: a JIT block is only trusted once it produces
 //!   bit-identical results to the interpreter across the test corpus.
 //!
-//! The Tier-2 code generator itself (Cranelift on native, `wasm-encoder` in
-//! the browser) is not yet wired in; this module is the tier-agnostic
-//! foundation it plugs into, and the differential rig already exercises
-//! Tier 1 against Tier 0 so the superblock engine is continuously validated.
+//! Native Cranelift (`native`, feature `jit`) lowers a safe integer/control-flow
+//! subset of MicroOp to host code. Browser/Node should reuse that same IR via
+//! `wasm-encoder` later — not a third interpreter.
+
+/// Odd JIT return values are side-exits. Guest instruction PCs are always even.
+pub const JIT_SIDE_EXIT: u64 = 1;
 
 /// Promotion thresholds for tiered execution.
 #[derive(Clone, Copy, Debug)]
@@ -50,6 +52,11 @@ impl HotnessPolicy {
         exec_count >= self.jit_threshold
     }
 }
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "jit"))]
+pub mod native;
+
+pub mod wasm;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub mod difftest;

@@ -27,36 +27,45 @@ pub const HCB_SIZE: usize = 32;
 // Hart States (SBI HSM compliant)
 // ============================================================================
 
-/// Hart states per SBI HSM specification.
+/// Hart states per SBI HSM v2.0 (numeric values are ABI).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum HartState {
-    /// Hart is not executing (initial state for secondary harts).
-    Stopped = 0,
-    /// Hart start has been requested, but hart hasn't acknowledged.
-    StartPending = 1,
-    /// Hart is actively executing.
-    Started = 2,
-    /// Hart stop has been requested, but hart hasn't acknowledged.
+    /// Hart is currently executing.
+    Started = 0,
+    /// Hart is stopped and waiting for `sbi_hart_start`.
+    Stopped = 1,
+    /// Hart start requested; not yet acknowledged.
+    StartPending = 2,
+    /// Hart stop requested; not yet acknowledged.
     StopPending = 3,
-    /// Hart is in low-power suspended state.
+    /// Low-power suspend.
     Suspended = 4,
-    /// Hart resume from suspend requested, but hart hasn't acknowledged.
+    /// Transitioning into suspend.
     SuspendPending = 5,
+    /// Transitioning out of suspend.
+    ResumePending = 6,
 }
 
 impl HartState {
     /// Convert from raw u32 value (for atomic reads).
     pub fn from_u32(val: u32) -> Self {
         match val {
-            0 => HartState::Stopped,
-            1 => HartState::StartPending,
-            2 => HartState::Started,
+            0 => HartState::Started,
+            1 => HartState::Stopped,
+            2 => HartState::StartPending,
             3 => HartState::StopPending,
             4 => HartState::Suspended,
             5 => HartState::SuspendPending,
-            _ => HartState::Stopped, // Default to stopped for invalid values
+            6 => HartState::ResumePending,
+            _ => HartState::Stopped,
         }
+    }
+
+    /// SBI `sbi_hart_get_status` value (same as the discriminant).
+    #[inline]
+    pub fn sbi_status(self) -> i64 {
+        self as i64
     }
 }
 

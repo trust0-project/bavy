@@ -319,7 +319,8 @@ impl HartRegistry for WasmHartRegistry {
             return Err(HartError::InvalidHart);
         }
 
-        // Try to transition STARTED -> STOP_PENDING
+        // Try to transition STARTED -> STOP_PENDING, then STOPPED so
+        // `wait_for_start` / `start_hart` (which expect STOPPED) can proceed.
         if !self.cas_state(hart_id, HartState::Started, HartState::StopPending) {
             let current = self.load_state(hart_id);
             return match current {
@@ -328,6 +329,7 @@ impl HartRegistry for WasmHartRegistry {
             };
         }
 
+        self.store_state(hart_id, HartState::Stopped);
         self.notify(hart_id);
         Ok(())
     }

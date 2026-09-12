@@ -163,6 +163,16 @@ impl WorkerState {
             return WorkerStepResult::Halted;
         }
 
+        // Re-arm HSM wait if this hart was stopped after previously starting.
+        if self.started
+            && matches!(
+                self.registry.get_state(self.hart_id),
+                HartState::Stopped | HartState::StopPending
+            )
+        {
+            self.started = false;
+        }
+
         // OpenSBI-compliant Hart Lifecycle using HartRegistry
         //
         // Secondary harts poll their HCB state until the kernel calls
@@ -214,10 +224,8 @@ impl WorkerState {
             }
         }
 
-        // CRITICAL: Sync CLINT interrupt state to CPU's MIP at EVERY batch start.
-        // This ensures that when the kernel executes `csrr sip`, it immediately sees
-        // SSIP/STIP reflecting the current CLINT MSIP/MTIP state. Without this,
-        // the kernel may read an outdated SIP and miss interrupts (race condition).
+        // Sync hardware mip (MSIP=3 / MTIP=7) so `csrr sip` sees the aliased
+        // supervisor bits only when software/Sstc set 1/5; CLINT uses 3/7.
         self.deliver_interrupts();
 
         // Execute batch of instructions with reduced atomic operation frequency
@@ -249,83 +257,43 @@ impl WorkerState {
                     return WorkerStepResult::Shutdown;
                 }
                 Err(Trap::Wfi) => {
-                    // WFI executed: advance PC (4 bytes) and check if we can sleep
                     self.cpu.pc = self.cpu.pc.wrapping_add(4);
                     self.wfi_count += 1;
 
-                    // If interrupts are pending, deliver them so the CPU can handle them
-                    // This is critical - without delivery, the guest loops on WFI forever
-                    let (msip, timer) = self.clint.check_interrupts(self.hart_id);
-                    if msip || timer {
-                        // Deliver interrupts to the CPU so it can take the trap
-                        self.deliver_interrupts();
-                        
-                        // Check if the CPU can actually take this interrupt (not masked)
-                        if self.cpu.check_pending_interrupt().is_some() {
-                            // Interrupt is enabled - continue to take trap
-                            continue;
-                        } else {
-                            // Interrupt is pending but masked - yield host briefly
-                            // to avoid busy-spin when guest is polling with interrupts disabled
-                            let view = &self.clint.view;
-                            let index = self.clint.msip_index(self.hart_id);
-                            let _ = js_sys::Atomics::wait_with_timeout(view, index, 0, 1.0);
-                            continue;
-                        }
-                    }
-
-                    // No pending interrupts - we MUST sleep to save CPU.
-                    // Calculate wait timeout based on next timer interrupt.
-                    let now = self.clint.mtime();
-                    let trigger = self.clint.get_mtimecmp(self.hart_id);
-
-                    // Calculate timeout, defaulting to at least 1ms to prevent spin
-                    // Use 10,000 ticks per ms (10MHz CLINT frequency)
-                    //
-                    // Use 100ms timeout for idle harts to save CPU. If an IPI arrives,
-                    // Atomics.notify will wake us immediately, so long timeout is fine.
-                    let timeout_ms = if trigger > now {
-                         let diff = trigger - now;
-                         let ms = diff / 10_000;
-                         // Cap at 100ms to balance responsiveness vs CPU usage
-                         if ms > 100 { 100 } else { ms.max(1) as i32 }
-                    } else {
-                        // Timer already passed or disabled - sleep longer
-                        // to prevent spinning when truly idle
-                        100
-                    };
-                    // ========================================================
-                    // PRE-WAIT MSIP CHECK (Race Condition Fix)
-                    // ========================================================
-                    // Re-check MSIP immediately before sleeping. This handles the
-                    // race where Hart 0 sends an IPI after our check_interrupts()
-                    // call above but before we enter Atomics.wait().
-                    let pre_wait_msip = self.clint.get_msip(self.hart_id);
-                    if pre_wait_msip != 0 {
-                        // IPI arrived between check and wait - deliver immediately
-                        self.deliver_interrupts();
+                    self.deliver_interrupts();
+                    self.cpu.force_irq_poll();
+                    if self.cpu.check_pending_interrupt().is_some() {
                         continue;
                     }
 
-                    // Wait on MSIP word using Atomics.wait
-                    // If MSIP becomes 1 (IPI), returns "not-equal" immediately.
-                    // If MSIP stays 0, blocks until timeout.
+                    // No takeable interrupt — sleep until IPI or timer.
+                    let now = self.clint.mtime();
+                    let trigger = self.clint.get_mtimecmp(self.hart_id);
+
+                    let timeout_ms = if trigger > now {
+                         let diff = trigger - now;
+                         let ms = diff / 10_000;
+                         if ms > 100 { 100 } else { ms.max(1) as i32 }
+                    } else {
+                        100
+                    };
+                    let pre_wait_msip = self.clint.get_msip(self.hart_id);
+                    if pre_wait_msip != 0 {
+                        self.deliver_interrupts();
+                        self.cpu.force_irq_poll();
+                        continue;
+                    }
+
                     let view = &self.clint.view;
                     let index = self.clint.msip_index(self.hart_id);
                     let _ = js_sys::Atomics::wait_with_timeout(view, index, 0, timeout_ms.into());
 
-                    // After waking (IPI, timer, or timeout), check if an interrupt is pending
-                    // CRITICAL: We must check and deliver here, not just return Wfi!
-                    // Otherwise IPIs that arrived via Atomics.notify() get ignored.
-                    let (msip_after, timer_after) = self.clint.check_interrupts(self.hart_id);
-                    if msip_after || timer_after {
-                        // IPI or timer woke us - deliver the interrupt and continue
-                        self.deliver_interrupts();
+                    self.deliver_interrupts();
+                    self.cpu.force_irq_poll();
+                    if self.cpu.check_pending_interrupt().is_some() {
                         continue;
                     }
 
-                    // No pending interrupts - return Wfi to signal TypeScript to yield briefly
-                    // This prevents busy-looping when the hart is truly idle
                     return WorkerStepResult::Wfi;
                 }
                 Err(Trap::Fatal(msg)) => {
@@ -333,12 +301,25 @@ impl WorkerState {
                     return WorkerStepResult::Error;
                 }
                 Err(Trap::EnvironmentCallFromS) => {
-                    // CRITICAL FIX: Workers must invoke SBI handler for ecall instructions!
-                    if crate::sbi::handle_sbi_call(&mut self.cpu, &self.bus) {
-                        self.cpu.pc = self.cpu.pc.wrapping_add(4);
-                        self.step_count += 1;
-                    } else {
-                        self.step_count += 1;
+                    // Fallback if ECALL was not intercepted inside step().
+                    match crate::sbi::handle_sbi_call(&mut self.cpu, &self.bus) {
+                        Ok(crate::sbi::SbiCallResult::Handled) => {
+                            self.cpu.pc = self.cpu.pc.wrapping_add(4);
+                            self.step_count += 1;
+                        }
+                        Ok(crate::sbi::SbiCallResult::Restarted) => {
+                            self.step_count += 1;
+                        }
+                        Ok(crate::sbi::SbiCallResult::Unhandled) => {
+                            self.step_count += 1;
+                        }
+                        Err(Trap::RequestedTrap(code)) => {
+                            self.control.signal_halted(code);
+                            return WorkerStepResult::Shutdown;
+                        }
+                        Err(_) => {
+                            self.step_count += 1;
+                        }
                     }
                 }
                 Err(trap) => {
@@ -354,26 +335,10 @@ impl WorkerState {
         WorkerStepResult::Continue
     }
 
-    /// Check and deliver interrupts from shared CLINT.
-    /// Separated into its own method to allow periodic calling during batch execution.
+    /// Write CLINT/PLIC pending bits into mip (MSIP=3, MTIP=7, SEIP=9, MEIP=11).
     #[inline]
     fn deliver_interrupts(&mut self) {
-        let (msip_pending, timer_pending) = self.clint.check_interrupts(self.hart_id);
-        if msip_pending || timer_pending {
-            // Access MIP CSR directly (bypassing privilege check since we're emulating
-            // hardware interrupt delivery, not guest code). MIP is at CSR address 0x344.
-            const CSR_MIP: usize = 0x344;
-            let mut mip = self.cpu.csrs[CSR_MIP];
-            
-            if msip_pending {
-                mip |= 1 << 1; // SSIP - Supervisor Software Interrupt
-            }
-            if timer_pending {
-                mip |= 1 << 5; // STIP - Supervisor Timer Interrupt
-            }
-            
-            self.cpu.csrs[CSR_MIP] = mip;
-        }
+        self.cpu.sync_hw_mip(&self.bus);
     }
 
     /// Get the total step count.
@@ -440,10 +405,10 @@ pub fn worker_check_interrupts(hart_id: usize, shared_mem: JsValue) -> u64 {
     let (msip, timer) = clint.check_interrupts(hart_id);
 
     if msip {
-        mip |= 1 << 1; // SSIP - Supervisor Software Interrupt (for S-mode kernel)
+        mip |= 1 << 3; // MSIP
     }
     if timer {
-        mip |= 1 << 5; // STIP - Supervisor Timer Interrupt (for S-mode kernel)
+        mip |= 1 << 7; // MTIP
     }
 
     mip

@@ -455,11 +455,12 @@ mod tests {
         // mtime is wall-clock based: both instances tick in real time, and
         // the restored clock re-bases at restore time. The clocks diverge by
         // however long serialize+deserialize took, so compare with tolerance
-        // (100ms = 1M ticks at 10MHz) rather than exactly.
+        // (500ms = 5M ticks at 10MHz) rather than exactly. Debug SHA-256 of 1 MiB
+        // DRAM plus bincode routinely exceeds 100ms.
         let t1 = emu.bus.clint.mtime();
         let t2 = emu2.bus.clint.mtime();
         assert!(
-            t1.abs_diff(t2) < 1_000_000,
+            t1.abs_diff(t2) < 5_000_000,
             "mtime diverged too far after restore: {t1} vs {t2}"
         );
         assert_eq!(

@@ -33,6 +33,39 @@ pub fn handle(cpu: &Cpu, bus: &dyn Bus, fid: u64) -> SbiRet {
     }
 }
 
+/// Raise MSIP for every hart selected by `hart_mask` / `hart_mask_base`.
+///
+/// `hart_mask_base == -1` means all harts (bits in `hart_mask` are ignored).
+pub(crate) fn send_ipi_to_mask(bus: &dyn Bus, hart_mask: u64, hart_mask_base: i64) -> SbiRet {
+    if hart_mask_base == -1 {
+        for hart in 0..64 {
+            let msip_addr = CLINT_BASE + MSIP_OFFSET + (hart as u64) * 4;
+            let _ = bus.write32(msip_addr, 1);
+        }
+        return SbiRet::ok();
+    }
+
+    if hart_mask_base < 0 {
+        return SbiRet::invalid_param();
+    }
+
+    log::debug!(
+        "SBI_IPI: send_ipi hart_mask=0x{:x}, base={}",
+        hart_mask,
+        hart_mask_base
+    );
+    for bit in 0..64 {
+        if (hart_mask & (1u64 << bit)) != 0 {
+            let hart_id = hart_mask_base as u64 + bit;
+            let msip_addr = CLINT_BASE + MSIP_OFFSET + hart_id * 4;
+            log::debug!("SBI_IPI: Setting MSIP for hart {}", hart_id);
+            let _ = bus.write32(msip_addr, 1);
+        }
+    }
+
+    SbiRet::ok()
+}
+
 /// Send IPI (FID 0)
 ///
 /// Sends an IPI to all harts specified in the hart mask.
@@ -47,33 +80,7 @@ pub fn handle(cpu: &Cpu, bus: &dyn Bus, fid: u64) -> SbiRet {
 fn send_ipi(cpu: &Cpu, bus: &dyn Bus) -> SbiRet {
     let hart_mask = cpu.read_reg(Register::X10); // a0
     let hart_mask_base = cpu.read_reg(Register::X11) as i64; // a1
-
-    // Special case: hart_mask_base == -1 means all harts
-    if hart_mask_base == -1 {
-        // Send IPI to all harts (assume max 64 harts)
-        for hart in 0..64 {
-            let msip_addr = CLINT_BASE + MSIP_OFFSET + (hart as u64) * 4;
-            let _ = bus.write32(msip_addr, 1);
-        }
-        return SbiRet::ok();
-    }
-
-    if hart_mask_base < 0 {
-        return SbiRet::invalid_param();
-    }
-
-    // Set MSIP for each target hart
-    log::debug!("SBI_IPI: send_ipi hart_mask=0x{:x}, base={}", hart_mask, hart_mask_base);
-    for bit in 0..64 {
-        if (hart_mask & (1 << bit)) != 0 {
-            let hart_id = hart_mask_base as u64 + bit;
-            let msip_addr = CLINT_BASE + MSIP_OFFSET + hart_id * 4;
-            log::debug!("SBI_IPI: Setting MSIP for hart {}", hart_id);
-            let _ = bus.write32(msip_addr, 1);
-        }
-    }
-
-    SbiRet::ok()
+    send_ipi_to_mask(bus, hart_mask, hart_mask_base)
 }
 
 // ============================================================================

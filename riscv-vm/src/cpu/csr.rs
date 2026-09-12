@@ -5,6 +5,29 @@ use super::types::Trap;
 
 pub use super::types::Mode;
 
+/// sstatus writable subset of mstatus: SIE, SPIE, SPP, FS, SUM, MXR.
+/// SD (63) and UXL (33:32) are not software-writable here (hardwired / read-only).
+const SSTATUS_WMASK: u64 =
+    (1 << 1) | (1 << 5) | (1 << 8) | (3 << 13) | (1 << 18) | (1 << 19);
+
+/// mstatus/sstatus.FS == Dirty.
+pub const MSTATUS_FS_DIRTY: u64 = 0b11 << 13;
+/// mstatus/sstatus.SD (RV64 bit 63): set when FS/XS/VS is Dirty.
+pub const MSTATUS_SD: u64 = 1 << 63;
+/// sstatus.UXL = 2 (64-bit) at bits 33:32.
+pub const MSTATUS_UXL_64: u64 = 2 << 32;
+
+/// CSR address encoding: bits [11:10] == 0b11 means read-only.
+#[inline]
+fn csr_is_read_only(addr: u16) -> bool {
+    (addr >> 10) & 0x3 == 0x3
+}
+
+#[inline]
+fn fs_field(mstatus: u64) -> u64 {
+    (mstatus >> 13) & 0x3
+}
+
 /// Compact CSR storage with privilege-aware access helpers.
 pub struct CsrFile {
     storage: [u64; 4096],
@@ -43,11 +66,8 @@ impl CsrFile {
         }
 
         match addr {
-            CSR_SSTATUS => {
-                let mstatus = self.storage[CSR_MSTATUS as usize];
-                let mask = (1 << 1) | (1 << 5) | (1 << 8) | (3 << 13) | (1 << 18) | (1 << 19);
-                Ok(mstatus & mask)
-            }
+            CSR_MSTATUS => Ok(self.read_mstatus()),
+            CSR_SSTATUS => Ok(self.read_sstatus()),
             CSR_SIE => {
                 let mie = self.storage[CSR_MIE as usize];
                 let mask = (1 << 1) | (1 << 5) | (1 << 9);
@@ -58,17 +78,26 @@ impl CsrFile {
                 let mask = (1 << 1) | (1 << 5) | (1 << 9);
                 Ok(mip & mask)
             }
-            // fflags/frm are views into fcsr
-            CSR_FFLAGS => Ok(self.storage[CSR_FCSR as usize] & 0x1F),
-            CSR_FRM => Ok((self.storage[CSR_FCSR as usize] >> 5) & 0x7),
+            // fflags/frm are views into fcsr; illegal while FS is Off.
+            CSR_FFLAGS => {
+                self.check_fp_csr(addr)?;
+                Ok(self.storage[CSR_FCSR as usize] & 0x1F)
+            }
+            CSR_FRM => {
+                self.check_fp_csr(addr)?;
+                Ok((self.storage[CSR_FCSR as usize] >> 5) & 0x7)
+            }
+            CSR_FCSR => {
+                self.check_fp_csr(addr)?;
+                Ok(self.storage[CSR_FCSR as usize])
+            }
             _ => Ok(self.storage[addr as usize]),
         }
     }
 
     pub fn write(&mut self, addr: u16, val: u64, mode: Mode) -> Result<(), Trap> {
-        let read_only = (addr >> 10) & 0x3 == 0x3;
-        if read_only {
-            return Ok(());
+        if csr_is_read_only(addr) {
+            return Err(Trap::IllegalInstruction(addr as u64));
         }
 
         let required_priv = (addr >> 8) & 0x3;
@@ -78,11 +107,14 @@ impl CsrFile {
         }
 
         match addr {
+            CSR_MSTATUS => {
+                self.write_mstatus(val);
+            }
             CSR_SSTATUS => {
                 let mut mstatus = self.storage[CSR_MSTATUS as usize];
-                let mask = (1 << 1) | (1 << 5) | (1 << 8) | (3 << 13) | (1 << 18) | (1 << 19);
-                mstatus = (mstatus & !mask) | (val & mask);
+                mstatus = (mstatus & !SSTATUS_WMASK) | (val & SSTATUS_WMASK);
                 self.storage[CSR_MSTATUS as usize] = mstatus;
+                self.sync_sd();
             }
             CSR_SIE => {
                 let mut mie = self.storage[CSR_MIE as usize];
@@ -96,17 +128,23 @@ impl CsrFile {
                 mip = (mip & !mask) | (val & mask);
                 self.storage[CSR_MIP as usize] = mip;
             }
-            // fflags/frm are views into fcsr
+            // fflags/frm are views into fcsr; a write dirties FS.
             CSR_FFLAGS => {
+                self.check_fp_csr(addr)?;
                 let fcsr = self.storage[CSR_FCSR as usize];
                 self.storage[CSR_FCSR as usize] = (fcsr & !0x1F) | (val & 0x1F);
+                self.mark_fs_dirty();
             }
             CSR_FRM => {
+                self.check_fp_csr(addr)?;
                 let fcsr = self.storage[CSR_FCSR as usize];
                 self.storage[CSR_FCSR as usize] = (fcsr & !0xE0) | ((val & 0x7) << 5);
+                self.mark_fs_dirty();
             }
             CSR_FCSR => {
+                self.check_fp_csr(addr)?;
                 self.storage[CSR_FCSR as usize] = val & 0xFF;
+                self.mark_fs_dirty();
             }
             _ => {
                 self.storage[addr as usize] = val;
@@ -114,6 +152,59 @@ impl CsrFile {
         }
 
         Ok(())
+    }
+
+    /// Mark mstatus.FS Dirty and SD after any FP register / fcsr write.
+    pub(crate) fn mark_fs_dirty(&mut self) {
+        self.storage[CSR_MSTATUS as usize] |= MSTATUS_FS_DIRTY | MSTATUS_SD;
+    }
+
+    #[inline]
+    fn check_fp_csr(&self, addr: u16) -> Result<(), Trap> {
+        if fs_field(self.storage[CSR_MSTATUS as usize]) == 0 {
+            return Err(Trap::IllegalInstruction(addr as u64));
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn sync_sd(&mut self) {
+        let mstatus = &mut self.storage[CSR_MSTATUS as usize];
+        if fs_field(*mstatus) == 3 {
+            *mstatus |= MSTATUS_SD;
+        } else {
+            *mstatus &= !MSTATUS_SD;
+        }
+    }
+
+    fn read_mstatus(&self) -> u64 {
+        let mut v = self.storage[CSR_MSTATUS as usize];
+        if fs_field(v) == 3 {
+            v |= MSTATUS_SD;
+        } else {
+            v &= !MSTATUS_SD;
+        }
+        v
+    }
+
+    fn read_sstatus(&self) -> u64 {
+        let mstatus = self.storage[CSR_MSTATUS as usize];
+        let mut val = mstatus & SSTATUS_WMASK;
+        val |= MSTATUS_UXL_64;
+        if fs_field(mstatus) == 3 {
+            val |= MSTATUS_SD;
+        }
+        val
+    }
+
+    fn write_mstatus(&mut self, val: u64) {
+        // SD is read-only; recomputed from FS. UXL is not forced here so
+        // existing mstatus CSR tests that write small immediates still match.
+        let mut v = val & !MSTATUS_SD;
+        if fs_field(v) == 3 {
+            v |= MSTATUS_SD;
+        }
+        self.storage[CSR_MSTATUS as usize] = v;
     }
 }
 
@@ -197,4 +288,73 @@ pub const CSR_PMPADDR5: u16 = 0x3B5;
 pub const CSR_PMPADDR6: u16 = 0x3B6;
 pub const CSR_PMPADDR7: u16 = 0x3B7;
 // Additional pmpaddr8-15 available at 0x3B8-0x3BF
+
+/// Read-only CSRs (csr[11:10]==0b11) that must trap on write.
+pub const READ_ONLY_CSRS: &[u16] = &[
+    CSR_CYCLE,
+    CSR_TIME,
+    CSR_INSTRET,
+    CSR_MVENDORID,
+    CSR_MARCHID,
+    CSR_MIMPID,
+    CSR_MHARTID,
+];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sstatus_read_includes_uxl() {
+        let mut csrs = CsrFile::new();
+        csrs[CSR_MSTATUS as usize] = 1 << 13; // FS = Initial
+        let sstatus = csrs.read(CSR_SSTATUS, Mode::Machine).unwrap();
+        assert_eq!((sstatus >> 32) & 3, 2, "UXL must be 2 (RV64)");
+        assert_eq!(sstatus & MSTATUS_SD, 0, "SD clear while FS is not Dirty");
+        assert_eq!((sstatus >> 13) & 3, 1);
+    }
+
+    #[test]
+    fn sstatus_read_includes_sd_when_fs_dirty() {
+        let mut csrs = CsrFile::new();
+        csrs[CSR_MSTATUS as usize] = MSTATUS_FS_DIRTY;
+        let sstatus = csrs.read(CSR_SSTATUS, Mode::Machine).unwrap();
+        assert_eq!((sstatus >> 13) & 3, 3);
+        assert_ne!(sstatus & MSTATUS_SD, 0);
+        assert_eq!((sstatus >> 32) & 3, 2);
+        let mstatus = csrs.read(CSR_MSTATUS, Mode::Machine).unwrap();
+        assert_ne!(mstatus & MSTATUS_SD, 0);
+    }
+
+    #[test]
+    fn read_only_csr_writes_are_illegal() {
+        let mut csrs = CsrFile::new();
+        for &addr in READ_ONLY_CSRS {
+            let err = csrs.write(addr, 0xDEAD, Mode::Machine);
+            assert!(
+                matches!(err, Err(Trap::IllegalInstruction(a)) if a == addr as u64),
+                "write to {addr:#x} should be IllegalInstruction, got {err:?}"
+            );
+        }
+        // Encoding catch-all: any csr[11:10]==0b11
+        assert!(matches!(
+            csrs.write(0xC03, 1, Mode::Machine),
+            Err(Trap::IllegalInstruction(0xC03))
+        ));
+        // Writable CSRs still succeed (mcycle/minstret are MRW, not URO).
+        assert!(csrs.write(CSR_MSTATUS, 1 << 3, Mode::Machine).is_ok());
+        assert!(csrs.write(CSR_MCYCLE, 1, Mode::Machine).is_ok());
+        assert!(csrs.write(CSR_MINSTRET, 1, Mode::Machine).is_ok());
+    }
+
+    #[test]
+    fn fcsr_write_dirties_fs() {
+        let mut csrs = CsrFile::new();
+        csrs[CSR_MSTATUS as usize] = 1 << 13; // Initial
+        csrs.write(CSR_FCSR, 0x1, Mode::Machine).unwrap();
+        let mstatus = csrs.read(CSR_MSTATUS, Mode::Machine).unwrap();
+        assert_eq!(mstatus & MSTATUS_FS_DIRTY, MSTATUS_FS_DIRTY);
+        assert_ne!(mstatus & MSTATUS_SD, 0);
+    }
+}
 

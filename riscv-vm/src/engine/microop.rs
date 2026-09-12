@@ -12,7 +12,7 @@
 pub enum MicroOp {
     /// Exit the block engine and let the interpreter execute the instruction
     /// at block_start + pc_offset. Used for ops without a micro-op encoding
-    /// (currently the F/D floating-point instructions).
+    /// (rare FP: FDIV/FSQRT/FCVT/FMA, and any future extension).
     InterpOp { pc_offset: u16 },
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -220,6 +220,22 @@ pub enum MicroOp {
         pc_offset: u16,
     },
 
+    /// FLW: f[rd] = NaN-box(mem[rs1 + imm][31:0]); dirties FS
+    Flw {
+        rd: u8,
+        rs1: u8,
+        imm: i64,
+        pc_offset: u16,
+    },
+
+    /// FLD: f[rd] = mem[rs1 + imm][63:0]; dirties FS
+    Fld {
+        rd: u8,
+        rs1: u8,
+        imm: i64,
+        pc_offset: u16,
+    },
+
     // ═══════════════════════════════════════════════════════════════════════
     // Store Operations
     // Stores require address translation and may trap
@@ -253,6 +269,32 @@ pub enum MicroOp {
         rs1: u8,
         rs2: u8,
         imm: i64,
+        pc_offset: u16,
+    },
+
+    /// FSW: mem[rs1 + imm][31:0] = f[rs2]
+    Fsw {
+        rs1: u8,
+        rs2: u8,
+        imm: i64,
+        pc_offset: u16,
+    },
+
+    /// FSD: mem[rs1 + imm][63:0] = f[rs2]
+    Fsd {
+        rs1: u8,
+        rs2: u8,
+        imm: i64,
+        pc_offset: u16,
+    },
+
+    /// Fast-path OP-FP (FADD/FSUB/FMUL/FMV/FCLASS). Rare ops stay InterpOp.
+    OpFp {
+        rd: u8,
+        rs1: u8,
+        rs2: u8,
+        funct7: u8,
+        rm: u8,
         pc_offset: u16,
     },
 
@@ -394,14 +436,18 @@ pub enum MicroOp {
     /// SRET - Return from supervisor trap
     Sret { pc_offset: u16 },
 
-    /// WFI - Wait for interrupt
+    /// WFI - Wait for interrupt (terminates block)
     Wfi { pc_offset: u16 },
 
     /// SFENCE.VMA - TLB flush (invalidates block cache)
     SfenceVma { pc_offset: u16 },
 
-    /// FENCE - Memory barrier (no-op in our model)
+    /// FENCE - Memory barrier (SeqCst on the host; does not terminate)
     Fence,
+
+    /// FENCE.I - Instruction-fetch barrier (Zifencei). Terminates the block
+    /// so the executor can drop stale superblocks before fetching again.
+    FenceI { pc_offset: u16 },
 
     // ═══════════════════════════════════════════════════════════════════════
     // Atomic Operations (A-Extension)
@@ -532,7 +578,9 @@ impl MicroOp {
                 | MicroOp::Ebreak { .. }
                 | MicroOp::Mret { .. }
                 | MicroOp::Sret { .. }
+                | MicroOp::Wfi { .. }
                 | MicroOp::SfenceVma { .. }
+                | MicroOp::FenceI { .. }
                 | MicroOp::Csrrw { .. }
                 | MicroOp::Csrrs { .. }
                 | MicroOp::Csrrc { .. }
@@ -559,6 +607,11 @@ impl MicroOp {
                 | MicroOp::Sh { .. }
                 | MicroOp::Sw { .. }
                 | MicroOp::Sd { .. }
+                | MicroOp::Flw { .. }
+                | MicroOp::Fld { .. }
+                | MicroOp::Fsw { .. }
+                | MicroOp::Fsd { .. }
+                | MicroOp::OpFp { .. }
                 | MicroOp::Ecall { .. }
                 | MicroOp::Ebreak { .. }
                 | MicroOp::Csrrw { .. }
@@ -582,10 +635,15 @@ impl MicroOp {
             | MicroOp::Lw { pc_offset, .. }
             | MicroOp::Lwu { pc_offset, .. }
             | MicroOp::Ld { pc_offset, .. }
+            | MicroOp::Flw { pc_offset, .. }
+            | MicroOp::Fld { pc_offset, .. }
             | MicroOp::Sb { pc_offset, .. }
             | MicroOp::Sh { pc_offset, .. }
             | MicroOp::Sw { pc_offset, .. }
             | MicroOp::Sd { pc_offset, .. }
+            | MicroOp::Fsw { pc_offset, .. }
+            | MicroOp::Fsd { pc_offset, .. }
+            | MicroOp::OpFp { pc_offset, .. }
             | MicroOp::Jal { pc_offset, .. }
             | MicroOp::Jalr { pc_offset, .. }
             | MicroOp::Beq { pc_offset, .. }
@@ -606,6 +664,7 @@ impl MicroOp {
             | MicroOp::Sret { pc_offset }
             | MicroOp::Wfi { pc_offset }
             | MicroOp::SfenceVma { pc_offset }
+            | MicroOp::FenceI { pc_offset }
             | MicroOp::LrW { pc_offset, .. }
             | MicroOp::LrD { pc_offset, .. }
             | MicroOp::ScW { pc_offset, .. }
@@ -659,6 +718,26 @@ mod tests {
             .is_terminator()
         );
         assert!(MicroOp::Ecall { pc_offset: 0 }.is_terminator());
+        assert!(MicroOp::Wfi { pc_offset: 0 }.is_terminator());
+        assert!(MicroOp::FenceI { pc_offset: 0 }.is_terminator());
+        assert!(!MicroOp::Fence.is_terminator());
+        assert!(!MicroOp::Flw {
+            rd: 1,
+            rs1: 0,
+            imm: 0,
+            pc_offset: 0
+        }
+        .is_terminator());
+        assert!(!MicroOp::OpFp {
+            rd: 1,
+            rs1: 1,
+            rs2: 1,
+            funct7: 0x01,
+            rm: 7,
+            pc_offset: 0
+        }
+        .is_terminator());
+        assert!(MicroOp::InterpOp { pc_offset: 0 }.is_terminator());
         assert!(
             !MicroOp::Addi {
                 rd: 1,

@@ -2,6 +2,7 @@ use crate::Trap;
 use crate::bus::{DRAM_BASE, SystemBus};
 use crate::cpu;
 use crate::loader::load_elf_wasm;
+use crate::machine::Machine;
 use crate::shared_mem;
 use std::sync::Arc;
 use wasm_bindgen::prelude::*;
@@ -152,6 +153,19 @@ pub struct WasmVm {
     input_device: Option<Arc<crate::devices::virtio::VirtioInput>>,
     /// WebTransport backend for browser-based networking (stores connection state)
     wt_backend: Option<crate::net::webtransport::WebTransportBackend>,
+    /// Guest board identity (virt vs d1). Default virt.
+    machine: Machine,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl WasmVm {
+    /// Framebuffer protocol addresses are virt DRAM-relative (`0x8100_0000`).
+    fn virt_fb_dram_offset(&self, phys: u64) -> Option<u64> {
+        if self.machine != Machine::Virt {
+            return None;
+        }
+        phys.checked_sub(self.bus.dram_base())
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -166,7 +180,7 @@ impl WasmVm {
     /// Use `new_with_harts()` to specify a custom hart count.
     #[wasm_bindgen(constructor)]
     pub fn new(kernel: &[u8]) -> Result<WasmVm, JsValue> {
-        Self::create_vm_internal(kernel, None)
+        Self::create_vm_internal(kernel, None, Machine::Virt)
     }
 
     /// Create a new VM instance with a specified number of harts.
@@ -180,31 +194,62 @@ impl WasmVm {
         } else {
             Some(num_harts)
         };
-        Self::create_vm_internal(kernel, harts)
+        Self::create_vm_internal(kernel, harts, Machine::Virt)
     }
 
-    /// Internal constructor with optional hart count.
-    fn create_vm_internal(kernel: &[u8], num_harts: Option<usize>) -> Result<WasmVm, JsValue> {
+    /// Create a VM for an explicit guest board (`virt` = 10 MHz, `d1` = 24 MHz).
+    ///
+    /// # Arguments
+    /// * `kernel` - ELF or raw kernel
+    /// * `num_harts` - Number of harts (0 = auto-detect, then clamped)
+    /// * `machine` - `virt` / `d1` (see [`Machine::parse`])
+    pub fn new_with_machine(
+        kernel: &[u8],
+        num_harts: usize,
+        machine: &str,
+    ) -> Result<WasmVm, JsValue> {
+        let machine = Machine::parse(machine).ok_or_else(|| {
+            JsValue::from_str(&format!(
+                "unknown machine {:?}; expected virt or d1",
+                machine
+            ))
+        })?;
+        let harts = if num_harts == 0 {
+            None
+        } else {
+            Some(num_harts)
+        };
+        Self::create_vm_internal(kernel, harts, machine)
+    }
+
+    /// Internal constructor with optional hart count and board identity.
+    fn create_vm_internal(
+        kernel: &[u8],
+        num_harts: Option<usize>,
+        machine: Machine,
+    ) -> Result<WasmVm, JsValue> {
         // Set up panic hook for better error messages in the browser console
         console_error_panic_hook::set_once();
 
         web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
-            "[VM] Creating new VM, kernel size: {} bytes",
-            kernel.len()
+            "[VM] Creating new VM, kernel size: {} bytes, machine {} (timebase {} Hz)",
+            kernel.len(),
+            machine.as_str(),
+            machine.timebase_hz()
         )));
 
-        const DRAM_SIZE: usize = 512 * 1024 * 1024; // 512 MiB
+        let map = machine.memory_map();
 
-        // Detect or use specified hart count
-        let mut num_harts = num_harts.unwrap_or_else(detect_hart_count);
-
-        // Check if SharedArrayBuffer is available for true parallelism
+        // Detect or use specified hart count, then clamp for SAB / D1.
+        // Without SAB this must be 1 *before* DTB and CLINT are programmed.
+        let requested = num_harts.unwrap_or_else(detect_hart_count);
         let sab_available = check_shared_array_buffer_available();
+        let num_harts = machine.clamp_harts(requested, sab_available);
 
         // Only use SharedArrayBuffer when we have 2+ harts.
         // Single-hart mode doesn't benefit from SAB and has known timing issues
         // with the SAB-backed bus. Using standard DRAM for 1 hart is simpler and
-        // more reliable.
+        // more reliable. D1 is uniprocessor, so it never takes this path.
         let use_sab = sab_available && num_harts > 1;
 
         if use_sab {
@@ -231,7 +276,7 @@ impl WasmVm {
             shared_uart_input,
         ) = if use_sab {
             // Create SharedArrayBuffer for shared memory
-            let total_size = shared_mem::total_shared_size(DRAM_SIZE);
+            let total_size = shared_mem::total_shared_size(map.dram_size);
             let sab = js_sys::SharedArrayBuffer::new(total_size as u32);
 
             // Initialize shared memory regions
@@ -279,7 +324,7 @@ impl WasmVm {
             // Create a simple registry for non-SMP mode
             let registry: std::sync::Arc<dyn crate::hart_registry::HartRegistry> = 
                 std::sync::Arc::new(crate::hart_registry::wasm::WasmHartRegistry::new_standalone(1));
-            let bus = SystemBus::with_registry(DRAM_BASE, DRAM_SIZE, registry);
+            let bus = SystemBus::with_registry(map.dram_base, map.dram_size, registry);
             (bus, None, None, None, None, None)
         };
 
@@ -301,27 +346,25 @@ impl WasmVm {
             bus.dram
                 .load(kernel, 0)
                 .map_err(|e| JsValue::from_str(&format!("Failed to load kernel: {}", e)))?;
-            DRAM_BASE
+            map.dram_base
         };
 
         // Set hart count in CLINT (native CLINT in bus)
         bus.set_num_harts(num_harts);
 
-        // Generate and write DTB to DRAM for OpenSBI compliance
-        // D1 EMAC is always enabled for kernel probing
-        let d1_config = crate::dtb::D1DeviceConfig {
-            has_display: false, // Will be updated via enable_gpu()
-            has_mmc: false,     // Will be updated via load_disk()
-            has_emac: true,     // Always enabled for kernel probing
-            has_touch: true,    // Touch input always enabled
-            has_audio: false,   // Will be updated via enable_audio()
-        };
-        let dtb = crate::dtb::generate_dtb(num_harts, DRAM_SIZE as u64, &d1_config);
-        let dtb_address = crate::dtb::write_dtb_to_dram(&bus.dram, &dtb);
+        // Transitional: attach D1 EMAC on both machines so the current kernel
+        // can probe MMIO. DTB only advertises D1 nodes on Machine::D1.
+        {
+            use crate::devices::d1_emac::D1EmacEmulated;
+            let emac = D1EmacEmulated::new();
+            *bus.d1_emac.write().unwrap() = Some(emac);
+        }
+
+        let dtb_address = bus.refresh_dtb(num_harts);
 
         web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
-            "[VM] Generated DTB ({} bytes) at 0x{:x}",
-            dtb.len(), dtb_address
+            "[VM] Generated DTB at 0x{:x}",
+            dtb_address
         )));
 
         // Create primary CPU (hart 0)
@@ -360,6 +403,7 @@ impl WasmVm {
             external_net: None,
             input_device: None,
             wt_backend: None,
+            machine,
         })
     }
 
@@ -370,13 +414,14 @@ impl WasmVm {
         
         let mmc = D1MmcEmulated::new(disk_image.to_vec());
         *self.bus.d1_mmc.write().unwrap() = Some(mmc);
-        
+        let dtb = self.bus.refresh_dtb(self.num_harts);
+
         // Verify the device is attached
         let attached = self.bus.d1_mmc.read().unwrap().is_some();
-        
+
         web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
-            "[VM] D1 MMC loaded with {} byte disk image, attached={}",
-            disk_image.len(), attached
+            "[VM] D1 MMC loaded with {} byte disk image, attached={}, dtb=0x{:x}",
+            disk_image.len(), attached, dtb
         )));
     }
 
@@ -398,9 +443,10 @@ impl WasmVm {
 
         *self.bus.d1_display.write().unwrap() = Some(display);
         *self.bus.d1_touch.write().unwrap() = Some(touch);
-        
+        let dtb = self.bus.refresh_dtb(self.num_harts);
+
         web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
-            "[VM] D1 Display enabled (1024x768)"
+            &format!("[VM] D1 Display enabled (1024x768, dtb=0x{:x})", dtb)
         ));
     }
 
@@ -414,9 +460,10 @@ impl WasmVm {
         
         let audio = D1AudioEmulated::new();
         *self.bus.d1_audio.write().unwrap() = Some(audio);
-        
+        let dtb = self.bus.refresh_dtb(self.num_harts);
+
         web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
-            "[VM] D1 Audio Codec enabled"
+            &format!("[VM] D1 Audio Codec enabled (dtb=0x{:x})", dtb)
         ));
     }
 
@@ -433,9 +480,10 @@ impl WasmVm {
         
         let emac = D1EmacEmulated::new();
         *self.bus.d1_emac.write().unwrap() = Some(emac);
-        
+        let dtb = self.bus.refresh_dtb(self.num_harts);
+
         web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
-            "[VM] D1 EMAC device enabled"
+            &format!("[VM] D1 EMAC device enabled (dtb=0x{:x})", dtb)
         ));
     }
 
@@ -500,9 +548,10 @@ impl WasmVm {
         
         // Add to bus - the bus will use the same Arc
         self.bus.virtio_devices.push(Box::new(ArcVirtioInputWrapper(Arc::clone(&input))));
-        
+        let dtb = self.bus.refresh_dtb(self.num_harts);
+
         web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
-            "[VM] VirtIO Input device enabled"
+            &format!("[VM] VirtIO Input device enabled (dtb=0x{:x})", dtb)
         ));
     }
 
@@ -525,12 +574,12 @@ impl WasmVm {
         
         let p9_device = VirtioP9Wasm::new(host_path, mount_tag);
         self.bus.virtio_devices.push(Box::new(p9_device));
-        
+        let dtb = self.bus.refresh_dtb(self.num_harts);
+
         web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
-            &format!("[VM] VirtIO 9P enabled: {} (tag: {})", host_path, mount_tag)
+            &format!("[VM] VirtIO 9P enabled: {} (tag: {}, dtb=0x{:x})", host_path, mount_tag, dtb)
         ));
     }
-
 
     /// Send a keyboard event to the guest.
     ///
@@ -748,11 +797,14 @@ impl WasmVm {
     /// Returns a u32 that increments each time the kernel flushes dirty pixels.
     /// Browser can compare this to skip fetching unchanged frames.
     pub fn get_gpu_frame_version(&self) -> u32 {
-        // Frame version is stored at 0x80FF_FFFC by the kernel
+        // Frame version is stored at 0x80FF_FFFC by the kernel (virt DRAM-relative)
         const FRAME_VERSION_PHYS_ADDR: u64 = 0x80FF_FFFC;
-        
-        let dram_offset = FRAME_VERSION_PHYS_ADDR - crate::bus::DRAM_BASE;
-        
+
+        let dram_offset = match self.virt_fb_dram_offset(FRAME_VERSION_PHYS_ADDR) {
+            Some(off) => off,
+            None => return 0,
+        };
+
         match self.bus.dram.load_32(dram_offset) {
             Ok(version) => version,
             Err(_) => 0,
@@ -773,9 +825,11 @@ impl WasmVm {
         const FB_WIDTH: u32 = 1024;
         const FB_HEIGHT: u32 = 768;
         const FB_SIZE: usize = (FB_WIDTH * FB_HEIGHT * 4) as usize; // RGBA = 4 bytes/pixel
-        
-        // Try to read from guest DRAM at the fixed framebuffer address
-        let dram_offset = (FRAMEBUFFER_PHYS_ADDR - crate::bus::DRAM_BASE) as usize;
+
+        let dram_offset = match self.virt_fb_dram_offset(FRAMEBUFFER_PHYS_ADDR) {
+            Some(off) => off as usize,
+            None => return None,
+        };
         
         // Debug: Check first few pixels to see if there's any data
         match self.bus.dram.read_range(dram_offset, FB_SIZE) {
@@ -819,8 +873,11 @@ impl WasmVm {
     ///   is invalidated whenever WASM memory grows, so consume it immediately
     ///   and call this again each frame (do not cache it JS-side).
     pub fn get_framebuffer_view(&self) -> Option<js_sys::Uint8Array> {
-        // Framebuffer is at physical 0x8100_0000; DRAM base is 0x8000_0000,
-        // so the framebuffer offset within DRAM = 0x100_0000 (16MB).
+        // Framebuffer is at physical 0x8100_0000 on virt (DRAM + 16 MiB).
+        // Do not scrape a D1 physical address with the virt constant.
+        if self.machine != Machine::Virt {
+            return None;
+        }
         const FRAMEBUFFER_DRAM_OFFSET: usize = 0x0100_0000;
         const FB_SIZE: usize = 1024 * 768 * 4; // 3,145,728 bytes
 
@@ -835,8 +892,8 @@ impl WasmVm {
     pub fn get_gpu_dirty_rect(&self) -> Option<js_sys::Uint32Array> {
         // Dirty rect is stored at 0x80FF_FFE0 by the kernel (4 x u32)
         const DIRTY_RECT_PHYS_ADDR: u64 = 0x80FF_FFE0;
-        
-        let dram_offset = DIRTY_RECT_PHYS_ADDR - crate::bus::DRAM_BASE;
+
+        let dram_offset = self.virt_fb_dram_offset(DIRTY_RECT_PHYS_ADDR)?;
         
         // Read 4 u32 values: min_x, min_y, max_x, max_y
         let min_x = self.bus.dram.load_32(dram_offset).ok()?;
@@ -1202,30 +1259,11 @@ impl WasmVm {
         self.sync_clint_to_mip();
     }
 
-    /// Sync CLINT interrupt state into the CPU's MIP register so timer and
-    /// software interrupts become visible to the S-mode kernel (SSIP/STIP).
-    ///
-    /// Mirrors the native execute_batch sync: uses the shared CLINT in SMP
-    /// mode and the local wall-clock CLINT otherwise. Without the local
-    /// fallback, SBI set_timer never delivers STIP in single-hart WASM mode.
+    /// Sync CLINT/PLIC pending bits into mip using the same mask as `Cpu::step`
+    /// (MSIP=3, MTIP=7, SEIP=9, MEIP=11). Does not inject SSIP/STIP (1/5).
     #[inline]
     fn sync_clint_to_mip(&mut self) {
-        const CSR_MIP: usize = 0x344;
-        let (msip, timer) = if let Some(ref clint) = self.shared_clint {
-            clint.check_interrupts(0)
-        } else {
-            self.bus.clint.check_interrupts_for_hart(0)
-        };
-        if msip || timer {
-            let mut mip = self.cpu.csrs[CSR_MIP];
-            if msip {
-                mip |= 1 << 1; // SSIP
-            }
-            if timer {
-                mip |= 1 << 5; // STIP
-            }
-            self.cpu.csrs[CSR_MIP] = mip;
-        }
+        self.cpu.sync_hw_mip(&self.bus);
     }
 
     /// Execute one instruction on hart 0 (primary hart).
@@ -1330,52 +1368,38 @@ impl WasmVm {
                 return false;
             }
             Err(Trap::Wfi) => {
-                // WFI: Advance PC and sleep if no interrupts pending
+                // WFI: Advance PC and sleep if no takeable interrupt.
                 self.cpu.pc = self.cpu.pc.wrapping_add(4);
-                
-                // Check for pending interrupts via shared CLINT if available
+                self.cpu.sync_hw_mip(&self.bus);
+                self.cpu.force_irq_poll();
+                if self.cpu.check_pending_interrupt().is_some() {
+                    return true;
+                }
+
                 if let Some(ref clint) = self.shared_clint {
                     let (msip, timer) = clint.check_interrupts(0);
                     if msip || timer {
-                        // Deliver interrupts directly to MIP CSR
-                        const CSR_MIP: usize = 0x344;
-                        let mut mip = self.cpu.csrs[CSR_MIP];
-                        if msip { mip |= 1 << 1; } // SSIP
-                        if timer { mip |= 1 << 5; } // STIP
-                        self.cpu.csrs[CSR_MIP] = mip;
-                        
-                        // Check if the CPU can actually take this interrupt (not masked)
-                        if self.cpu.check_pending_interrupt().is_some() {
-                            // Interrupt is enabled - return immediately to take trap
-                            return true;
-                        } else {
-                            // Interrupt is pending but masked - yield host briefly
-                            // to avoid busy-spin when guest is polling with interrupts disabled
-                            let view = &clint.view;
-                            let index = clint.msip_index(0);
-                            let _ = js_sys::Atomics::wait_with_timeout(view, index, 0, 1.0);
-                            return true;
-                        }
-                    }
-                    
-                    // Calculate timeout based on timer
-                    let now = clint.mtime();
-                    let trigger = clint.get_mtimecmp(0);
-                    let timeout_ms = if trigger > now {
-                        let diff = trigger - now;
-                        let ms = diff / 10_000; // 10MHz CLINT
-                        if ms > 100 { 100 } else { ms.max(1) as i32 }
+                        // Pending in CLINT but masked — yield so we don't busy-spin.
+                        let view = &clint.view;
+                        let index = clint.msip_index(0);
+                        let _ = js_sys::Atomics::wait_with_timeout(view, index, 0, 1.0);
                     } else {
-                        1 // Minimum sleep to prevent spin
-                    };
-                    // Use Atomics.wait to sleep
-                    let view = &clint.view;
-                    let index = clint.msip_index(0);
-                    let _ = js_sys::Atomics::wait_with_timeout(view, index, 0, timeout_ms.into());
-                } else {
-                    // No shared CLINT - just yield briefly
-                    // This shouldn't happen in SMP mode, but fallback for safety
+                        let now = clint.mtime();
+                        let trigger = clint.get_mtimecmp(0);
+                        let timeout_ms = if trigger > now {
+                            let diff = trigger - now;
+                            let ms = diff / 10_000; // 10MHz CLINT
+                            if ms > 100 { 100 } else { ms.max(1) as i32 }
+                        } else {
+                            1
+                        };
+                        let view = &clint.view;
+                        let index = clint.msip_index(0);
+                        let _ = js_sys::Atomics::wait_with_timeout(view, index, 0, timeout_ms.into());
+                    }
                 }
+                self.cpu.sync_hw_mip(&self.bus);
+                self.cpu.force_irq_poll();
             }
             Err(_trap) => {
                 // Other architectural traps handled by CPU

@@ -1,8 +1,8 @@
 use crate::Trap;
-use crate::devices::clint::{CLINT_BASE, CLINT_SIZE, Clint};
-use crate::devices::plic::{PLIC_BASE, PLIC_SIZE, Plic, UART_IRQ, VIRTIO0_IRQ};
+use crate::devices::clint::Clint;
+use crate::devices::plic::{Plic, UART_IRQ, VIRTIO0_IRQ};
 use crate::devices::sysinfo::{SYSINFO_BASE, SYSINFO_SIZE, SysInfo};
-use crate::devices::uart::{UART_BASE, UART_SIZE, Uart};
+use crate::devices::uart::Uart;
 use crate::devices::virtio::VirtioDevice;
 use crate::dram::Dram;
 use crate::hart_registry::HartRegistry;
@@ -87,70 +87,60 @@ struct DeviceRegion {
     device: DeviceId,
 }
 
-/// Sorted device regions for binary search.
-/// CRITICAL: Must be sorted by `base` address in ascending order!
-const DEVICE_REGIONS: [DeviceRegion; 20] = [
-    // 0x0010_0000 - TEST_FINISHER
+/// Virt-only leftover gadgets. UART / PLIC / CLINT are **not** in this table:
+/// their windows move with `Machine` and would mis-decode D1 (UART at
+/// `0x1000_0000` is the T-Head PLIC; `0x0200_0000` is GPIO, not CLINT).
+const VIRT_GADGET_REGIONS: [DeviceRegion; 9] = [
     DeviceRegion { base: TEST_FINISHER_BASE, size: TEST_FINISHER_SIZE, device: DeviceId::TestFinisher },
-    // 0x0011_0000 - SYSINFO
     DeviceRegion { base: SYSINFO_BASE, size: SYSINFO_SIZE, device: DeviceId::SysInfo },
-    // 0x0200_0000 - CLINT
-    DeviceRegion { base: CLINT_BASE, size: CLINT_SIZE, device: DeviceId::Clint },
-    // 0x0203_0000 - D1_AUDIO
-    DeviceRegion { base: D1_AUDIO_BASE, size: D1_AUDIO_SIZE, device: DeviceId::D1Audio },
-    // 0x0250_2000 - D1_I2C2/TOUCH
-    DeviceRegion { base: D1_I2C2_BASE, size: D1_I2C2_SIZE, device: DeviceId::D1Touch },
-    // 0x0402_0000 - D1_MMC0
-    DeviceRegion { base: D1_MMC0_BASE, size: D1_MMC0_SIZE, device: DeviceId::D1Mmc0 },
-    // 0x0450_0000 - D1_EMAC
-    DeviceRegion { base: D1_EMAC_BASE, size: D1_EMAC_SIZE, device: DeviceId::D1Emac },
-    // 0x0510_0000 - D1_DE
-    DeviceRegion { base: D1_DE_BASE, size: D1_DE_SIZE, device: DeviceId::D1De },
-    // 0x0545_0000 - D1_MIPI_DSI
-    DeviceRegion { base: D1_MIPI_DSI_BASE, size: D1_MIPI_DSI_SIZE, device: DeviceId::D1MipiDsi },
-    // 0x0545_1000 - D1_DPHY
-    DeviceRegion { base: D1_DPHY_BASE, size: D1_DPHY_SIZE, device: DeviceId::D1Dphy },
-    // 0x0546_1000 - D1_TCON_LCD0
-    DeviceRegion { base: D1_TCON_LCD0, size: D1_TCON_SIZE, device: DeviceId::D1TconLcd },
-    // 0x0C00_0000 - PLIC
-    DeviceRegion { base: PLIC_BASE, size: PLIC_SIZE, device: DeviceId::Plic },
-    // 0x1000_0000 - UART
-    DeviceRegion { base: UART_BASE, size: UART_SIZE, device: DeviceId::Uart },
-    // 0x1000_1000 - VIRTIO Slot 0
     DeviceRegion { base: VIRTIO_BASE, size: VIRTIO_STRIDE, device: DeviceId::VirtioSlot0 },
-    // 0x1000_2000 - VIRTIO Slot 1
     DeviceRegion { base: VIRTIO_BASE + VIRTIO_STRIDE, size: VIRTIO_STRIDE, device: DeviceId::VirtioSlot1 },
-    // 0x1000_3000 - VIRTIO Slot 2
     DeviceRegion { base: VIRTIO_BASE + 2 * VIRTIO_STRIDE, size: VIRTIO_STRIDE, device: DeviceId::VirtioSlot2 },
-    // 0x1000_4000 - VIRTIO Slot 3
     DeviceRegion { base: VIRTIO_BASE + 3 * VIRTIO_STRIDE, size: VIRTIO_STRIDE, device: DeviceId::VirtioSlot3 },
-    // 0x1000_5000 - VIRTIO Slot 4
     DeviceRegion { base: VIRTIO_BASE + 4 * VIRTIO_STRIDE, size: VIRTIO_STRIDE, device: DeviceId::VirtioSlot4 },
-    // 0x1000_6000 - VIRTIO Slot 5
     DeviceRegion { base: VIRTIO_BASE + 5 * VIRTIO_STRIDE, size: VIRTIO_STRIDE, device: DeviceId::VirtioSlot5 },
-    // 0x1010_0000 - RTC
     DeviceRegion { base: RTC_BASE, size: RTC_SIZE, device: DeviceId::Rtc },
 ];
 
-/// Look up the device responsible for an MMIO address.
-/// Uses binary search for O(log N) complexity.
-/// Returns (DeviceId, offset_within_device) or None if unmapped.
+/// D1 SoC peripherals (same physical addresses on every machine today).
+const D1_DEVICE_REGIONS: [DeviceRegion; 8] = [
+    DeviceRegion { base: D1_AUDIO_BASE, size: D1_AUDIO_SIZE, device: DeviceId::D1Audio },
+    DeviceRegion { base: D1_I2C2_BASE, size: D1_I2C2_SIZE, device: DeviceId::D1Touch },
+    DeviceRegion { base: D1_MMC0_BASE, size: D1_MMC0_SIZE, device: DeviceId::D1Mmc0 },
+    DeviceRegion { base: D1_EMAC_BASE, size: D1_EMAC_SIZE, device: DeviceId::D1Emac },
+    DeviceRegion { base: D1_DE_BASE, size: D1_DE_SIZE, device: DeviceId::D1De },
+    DeviceRegion { base: D1_MIPI_DSI_BASE, size: D1_MIPI_DSI_SIZE, device: DeviceId::D1MipiDsi },
+    DeviceRegion { base: D1_DPHY_BASE, size: D1_DPHY_SIZE, device: DeviceId::D1Dphy },
+    DeviceRegion { base: D1_TCON_LCD0, size: D1_TCON_SIZE, device: DeviceId::D1TconLcd },
+];
+
+/// Binary-search a sorted region table. Returns (id, byte offset from base).
 #[inline]
-fn lookup_device(addr: u64) -> Option<(DeviceId, u64)> {
-    // Binary search: find the rightmost region with base <= addr
-    let idx = DEVICE_REGIONS.partition_point(|r| r.base <= addr);
-    
-    // partition_point returns the first index where base > addr,
-    // so we need the previous index
+fn lookup_regions(addr: u64, regions: &[DeviceRegion]) -> Option<(DeviceId, u64)> {
+    let idx = regions.partition_point(|r| r.base <= addr);
     if idx == 0 {
         return None;
     }
-    
-    let region = &DEVICE_REGIONS[idx - 1];
+    let region = &regions[idx - 1];
     if addr >= region.base && addr < region.base + region.size {
         Some((region.device, addr - region.base))
     } else {
         None
+    }
+}
+
+impl DeviceId {
+    #[inline]
+    fn virtio_slot(self) -> Option<usize> {
+        match self {
+            Self::VirtioSlot0 => Some(0),
+            Self::VirtioSlot1 => Some(1),
+            Self::VirtioSlot2 => Some(2),
+            Self::VirtioSlot3 => Some(3),
+            Self::VirtioSlot4 => Some(4),
+            Self::VirtioSlot5 => Some(5),
+            _ => None,
+        }
     }
 }
 
@@ -471,6 +461,15 @@ pub trait Bus: Send + Sync {
     /// Get the hart registry for HSM lifecycle operations.
     /// Used by SBI HSM extension to manage hart start/stop.
     fn hart_registry(&self) -> &dyn HartRegistry;
+
+    /// Monotonic sequence bumped by SBI RFENCE / FENCE.I / SFENCE.VMA.
+    /// Each hart compares this to `Cpu::fence_seq` and flushes TLB + blocks.
+    fn fence_seq(&self) -> u32 {
+        0
+    }
+
+    /// Bump [`Bus::fence_seq`] so remote (and local) harts drop stale blocks.
+    fn bump_fence_seq(&self) {}
 }
 
 // A simple system bus that just wraps DRAM for now (Phase 1)
@@ -512,8 +511,14 @@ pub struct SystemBus {
     /// while the guest hasn't touched the device.
     pub device_activity: std::sync::atomic::AtomicU32,
 
+    /// Guest board identity (map, DTB, UART/PLIC bases).
+    pub machine: crate::machine::Machine,
+
     /// Hart lifecycle registry for SBI HSM operations
     registry: Arc<dyn HartRegistry>,
+
+    /// Bumped on SFENCE.VMA / FENCE.I / SBI RFENCE so every hart drops caches.
+    fence_seq: std::sync::atomic::AtomicU32,
 }
 
 /// Device activity bit: guest wrote a VirtIO MMIO register.
@@ -560,6 +565,9 @@ impl SystemBus {
             shared_control: None,
             rtc_timestamp: std::sync::atomic::AtomicU64::new(0),
             device_activity: std::sync::atomic::AtomicU32::new(DEVICE_ACTIVITY_VIRTIO | DEVICE_ACTIVITY_EMAC),
+            machine: crate::machine::Machine::from_dram_base(dram_base)
+                .unwrap_or(crate::machine::Machine::Virt),
+            fence_seq: std::sync::atomic::AtomicU32::new(0),
             registry,
         }
     }
@@ -622,6 +630,8 @@ impl SystemBus {
             shared_control: Some(shared_control),
             rtc_timestamp: std::sync::atomic::AtomicU64::new(0),
             device_activity: std::sync::atomic::AtomicU32::new(DEVICE_ACTIVITY_VIRTIO | DEVICE_ACTIVITY_EMAC),
+            machine: crate::machine::Machine::Virt,
+            fence_seq: std::sync::atomic::AtomicU32::new(0),
             registry,
         }
     }
@@ -632,6 +642,84 @@ impl SystemBus {
 
     pub fn dram_size(&self) -> usize {
         self.dram.size()
+    }
+
+    /// Map `addr` onto a 16550 register index (0..=7) if it falls in this
+    /// machine's UART window. D1 uses a stride of 4 (DesignWare APB).
+    #[inline]
+    fn uart_reg_index(&self, addr: u64) -> Option<u64> {
+        let uart = self.machine.memory_map().uart;
+        if addr >= uart.base && addr < uart.base + uart.size {
+            Some(uart.reg_index(addr - uart.base))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn plic_offset(&self, addr: u64) -> Option<u64> {
+        let plic = self.machine.memory_map().plic;
+        if addr >= plic.base && addr < plic.base + plic.size {
+            Some(addr - plic.base)
+        } else {
+            None
+        }
+    }
+
+    /// CLINT window, or `None` on D1 (`0x0200_0000` is GPIO, not CLINT).
+    #[inline]
+    fn clint_offset(&self, addr: u64) -> Option<u64> {
+        let clint = self.machine.memory_map().clint?;
+        if addr >= clint.base && addr < clint.base + clint.size {
+            Some(addr - clint.base)
+        } else {
+            None
+        }
+    }
+
+    /// Machine-aware MMIO decode. UART/PLIC/CLINT use the helpers above so D1
+    /// is not routed through the virt-only gadget table. For `Uart` the
+    /// returned offset is a 16550 register index, not a byte offset.
+    #[inline]
+    fn lookup_device(&self, addr: u64) -> Option<(DeviceId, u64)> {
+        if let Some(offset) = self.clint_offset(addr) {
+            return Some((DeviceId::Clint, offset));
+        }
+        if let Some(offset) = self.plic_offset(addr) {
+            return Some((DeviceId::Plic, offset));
+        }
+        if let Some(offset) = self.uart_reg_index(addr) {
+            return Some((DeviceId::Uart, offset));
+        }
+        if self.machine == crate::machine::Machine::Virt {
+            if let Some(hit) = lookup_regions(addr, &VIRT_GADGET_REGIONS) {
+                return Some(hit);
+            }
+        }
+        lookup_regions(addr, &D1_DEVICE_REGIONS)
+    }
+
+    /// Snapshot of devices currently sitting on the bus (for DTB regeneration).
+    pub fn attached_devices(&self) -> crate::machine::AttachedDevices {
+        crate::machine::AttachedDevices {
+            has_display: self.d1_display.read().map(|g| g.is_some()).unwrap_or(false),
+            has_mmc: self.d1_mmc.read().map(|g| g.is_some()).unwrap_or(false),
+            has_emac: self.d1_emac.read().map(|g| g.is_some()).unwrap_or(false),
+            has_touch: self.d1_touch.read().map(|g| g.is_some()).unwrap_or(false),
+            has_audio: self.d1_audio.read().map(|g| g.is_some()).unwrap_or(false),
+            virtio_count: self.virtio_devices.len(),
+        }
+    }
+
+    /// Rewrite the guest DTB from live attachments. Returns the DTB physical address.
+    pub fn refresh_dtb(&self, num_harts: usize) -> u64 {
+        let dtb = crate::dtb::generate_for(
+            self.machine,
+            num_harts,
+            self.dram.size() as u64,
+            &self.attached_devices(),
+        );
+        crate::dtb::write_dtb_to_dram(&self.dram, &dtb)
     }
 
     /// Set the number of harts (called by emulator at init).
@@ -720,12 +808,11 @@ impl SystemBus {
         // Get CLINT interrupts in a single lock acquisition
         let (msip, timer) = self.clint.check_interrupts_for_hart(hart_id);
 
-        // MSIP (Machine Software Interrupt) - Bit 3
+        // Canonical hardware mip: CLINT MSIP → bit 3, timer → bit 7.
+        // Do not inject SSIP/STIP (1/5); sip already aliases 1/5/9 from mip.
         if msip {
             mip |= 1 << 3;
         }
-
-        // MTIP (Machine Timer Interrupt) - Bit 7
         if timer {
             mip |= 1 << 7;
         }
@@ -769,17 +856,14 @@ impl SystemBus {
             self.clint.check_interrupts_for_hart(hart_id)
         };
 
-        // MSIP (Machine Software Interrupt) - Bit 3
+        // Canonical hardware mip: CLINT MSIP → bit 3, timer → bit 7.
+        // Do not inject SSIP/STIP (1/5); sip already aliases 1/5/9 from mip.
         if msip {
             mip |= 1 << 3;
         }
-
-        // MTIP (Machine Timer Interrupt) - Bit 7
         if timer {
             mip |= 1 << 7;
         }
-
-        // Hart 0 handles devices - advance timer and update PLIC
         // Workers (hart 1+) don't have virtio_devices, so PLIC checks are safe but no-op
         if hart_id == 0 {
             // Advance local CLINT timer from hart 0 only
@@ -819,17 +903,6 @@ impl SystemBus {
         }
 
         mip
-    }
-
-    fn get_virtio_device(&self, addr: u64) -> Option<(usize, u64)> {
-        if addr >= VIRTIO_BASE {
-            let offset = addr - VIRTIO_BASE;
-            let idx = (offset / VIRTIO_STRIDE) as usize;
-            if idx < self.virtio_devices.len() {
-                return Some((idx, offset % VIRTIO_STRIDE));
-            }
-        }
-        None
     }
 
     /// Check if an address is in the VirtIO MMIO region (even if no device present).
@@ -952,83 +1025,54 @@ impl SystemBus {
 
     #[cold]
     fn read8_slow(&self, addr: u64) -> Result<u8, Trap> {
-        // Test finisher region: reads are harmless and return zero.
-        if addr >= TEST_FINISHER_BASE && addr < TEST_FINISHER_BASE + TEST_FINISHER_SIZE {
-            return Ok(0);
-        }
-
-        // SysInfo device
-        if addr >= SYSINFO_BASE && addr < SYSINFO_BASE + SYSINFO_SIZE {
-            let offset = addr - SYSINFO_BASE;
-            let val = self.sysinfo.load(offset, 1);
-            return Ok(val as u8);
-        }
-
-        if addr >= CLINT_BASE && addr < CLINT_BASE + CLINT_SIZE {
-            let offset = addr - CLINT_BASE;
-            let val = self.clint_load(offset, 1);
-            return Ok(val as u8);
-        }
-
-        if addr >= PLIC_BASE && addr < PLIC_BASE + PLIC_SIZE {
-            let offset = addr - PLIC_BASE;
-            let val = self
+        match self.lookup_device(addr) {
+            Some((DeviceId::TestFinisher, _)) => Ok(0),
+            Some((DeviceId::SysInfo, offset)) => Ok(self.sysinfo.load(offset, 1) as u8),
+            Some((DeviceId::Clint, offset)) => Ok(self.clint_load(offset, 1) as u8),
+            Some((DeviceId::Plic, offset)) => self
                 .plic
                 .load(offset, 1)
-                .map_err(|_| Trap::LoadAccessFault(addr))?;
-            return Ok(val as u8);
-        }
-
-        if addr >= UART_BASE && addr < UART_BASE + UART_SIZE {
-            let offset = addr - UART_BASE;
-            // For workers with shared UART input, route reads to shared buffer
-            #[cfg(target_arch = "wasm32")]
-            if let Some(ref shared_uart) = self.shared_uart_input {
-                if offset == 0 {
-                    // Offset 0 is RBR (Receiver Buffer Register) - the data input
-                    // Read from shared buffer (input from main thread)
-                    if let Some(byte) = shared_uart.read_byte() {
-                        return Ok(byte);
-                    } else {
-                        // No data available - return 0
-                        return Ok(0);
+                .map(|v| v as u8)
+                .map_err(|_| Trap::LoadAccessFault(addr)),
+            Some((DeviceId::Uart, offset)) => {
+                #[cfg(target_arch = "wasm32")]
+                if let Some(ref shared_uart) = self.shared_uart_input {
+                    if offset == 0 {
+                        return Ok(shared_uart.read_byte().unwrap_or(0));
+                    } else if offset == 5 {
+                        let mut lsr: u8 = 0x60;
+                        if shared_uart.has_data() {
+                            lsr |= 0x01;
+                        }
+                        return Ok(lsr);
                     }
-                } else if offset == 5 {
-                    // Offset 5 is LSR (Line Status Register)
-                    // For workers, we need to check shared input for Data Ready bit
-                    let mut lsr: u8 = 0x60; // TX empty bits always set
-                    if shared_uart.has_data() {
-                        lsr |= 0x01; // Data Ready bit
-                    }
-                    return Ok(lsr);
+                }
+                self.uart
+                    .load(offset, 1)
+                    .map(|v| v as u8)
+                    .map_err(|_| Trap::LoadAccessFault(addr))
+            }
+            Some((id, offset)) if id.virtio_slot().is_some() => {
+                let idx = id.virtio_slot().unwrap();
+                if idx >= self.virtio_devices.len() {
+                    return Ok(0);
+                }
+                let aligned = offset & !3;
+                let word = self.virtio_devices[idx]
+                    .read(aligned)
+                    .map_err(|_| Trap::LoadAccessFault(addr))?;
+                let shift = ((offset & 3) * 8) as u64;
+                Ok(((word >> shift) & 0xff) as u8)
+            }
+            Some(_) => Err(Trap::LoadAccessFault(addr)),
+            None => {
+                if self.is_virtio_region(addr).is_some() {
+                    Ok(0)
+                } else {
+                    Err(Trap::LoadAccessFault(addr))
                 }
             }
-            // Fall through to local UART for main thread or other registers
-            let val = self
-                .uart
-                .load(offset, 1)
-                .map_err(|_| Trap::LoadAccessFault(addr))?;
-            return Ok(val as u8);
         }
-
-        if let Some((idx, offset)) = self.get_virtio_device(addr) {
-            // Emulate narrow MMIO reads by extracting from the 32-bit register value
-            let aligned = offset & !3;
-            let word = self.virtio_devices[idx]
-                .read(aligned)
-                .map_err(|_| Trap::LoadAccessFault(addr))?;
-            let shift = ((offset & 3) * 8) as u64;
-            return Ok(((word >> shift) & 0xff) as u8);
-        }
-
-
-
-        // Unmapped VirtIO slots return 0 (allows safe probing)
-        if self.is_virtio_region(addr).is_some() {
-            return Ok(0);
-        }
-
-        Err(Trap::LoadAccessFault(addr))
     }
 
     #[cold]
@@ -1036,57 +1080,41 @@ impl SystemBus {
         if addr % 2 != 0 {
             return Err(Trap::LoadAddressMisaligned(addr));
         }
-        if addr >= TEST_FINISHER_BASE && addr < TEST_FINISHER_BASE + TEST_FINISHER_SIZE {
-            return Ok(0);
-        }
-
-        if addr >= SYSINFO_BASE && addr < SYSINFO_BASE + SYSINFO_SIZE {
-            let offset = addr - SYSINFO_BASE;
-            let val = self.sysinfo.load(offset, 2);
-            return Ok(val as u16);
-        }
-
-        if addr >= CLINT_BASE && addr < CLINT_BASE + CLINT_SIZE {
-            let offset = addr - CLINT_BASE;
-            let val = self.clint_load(offset, 2);
-            return Ok(val as u16);
-        }
-
-        if addr >= PLIC_BASE && addr < PLIC_BASE + PLIC_SIZE {
-            let offset = addr - PLIC_BASE;
-            let val = self
+        match self.lookup_device(addr) {
+            Some((DeviceId::TestFinisher, _)) => Ok(0),
+            Some((DeviceId::SysInfo, offset)) => Ok(self.sysinfo.load(offset, 2) as u16),
+            Some((DeviceId::Clint, offset)) => Ok(self.clint_load(offset, 2) as u16),
+            Some((DeviceId::Plic, offset)) => self
                 .plic
                 .load(offset, 2)
-                .map_err(|_| Trap::LoadAccessFault(addr))?;
-            return Ok(val as u16);
-        }
-
-        if addr >= UART_BASE && addr < UART_BASE + UART_SIZE {
-            let offset = addr - UART_BASE;
-            let val = self
+                .map(|v| v as u16)
+                .map_err(|_| Trap::LoadAccessFault(addr)),
+            Some((DeviceId::Uart, offset)) => self
                 .uart
-                .load(offset, 2)
-                .map_err(|_| Trap::LoadAccessFault(addr))?;
-            return Ok(val as u16);
+                .load(offset, 1)
+                .map(|v| v as u16)
+                .map_err(|_| Trap::LoadAccessFault(addr)),
+            Some((id, offset)) if id.virtio_slot().is_some() => {
+                let idx = id.virtio_slot().unwrap();
+                if idx >= self.virtio_devices.len() {
+                    return Ok(0);
+                }
+                let aligned = offset & !3;
+                let word = self.virtio_devices[idx]
+                    .read(aligned)
+                    .map_err(|_| Trap::LoadAccessFault(addr))?;
+                let shift = ((offset & 3) * 8) as u64;
+                Ok(((word >> shift) & 0xffff) as u16)
+            }
+            Some(_) => Err(Trap::LoadAccessFault(addr)),
+            None => {
+                if self.is_virtio_region(addr).is_some() {
+                    Ok(0)
+                } else {
+                    Err(Trap::LoadAccessFault(addr))
+                }
+            }
         }
-
-        if let Some((idx, offset)) = self.get_virtio_device(addr) {
-            let aligned = offset & !3;
-            let word = self.virtio_devices[idx]
-                .read(aligned)
-                .map_err(|_| Trap::LoadAccessFault(addr))?;
-            let shift = ((offset & 3) * 8) as u64;
-            return Ok(((word >> shift) & 0xffff) as u16);
-        }
-
-
-
-        // Unmapped VirtIO slots return 0 (allows safe probing)
-        if self.is_virtio_region(addr).is_some() {
-            return Ok(0);
-        }
-
-        Err(Trap::LoadAccessFault(addr))
     }
 
     #[cold]
@@ -1094,193 +1122,127 @@ impl SystemBus {
         if addr % 4 != 0 {
             return Err(Trap::LoadAddressMisaligned(addr));
         }
-        if addr >= TEST_FINISHER_BASE && addr < TEST_FINISHER_BASE + TEST_FINISHER_SIZE {
-            return Ok(0);
-        }
-
-        if addr >= SYSINFO_BASE && addr < SYSINFO_BASE + SYSINFO_SIZE {
-            let offset = addr - SYSINFO_BASE;
-            let val = self.sysinfo.load(offset, 4);
-            return Ok(val as u32);
-        }
-
-        // RTC device - provides host timestamp to guest
-        if addr >= RTC_BASE && addr < RTC_BASE + RTC_SIZE {
-            // For WASM workers, read from shared control region
-            // For main thread or native builds, use local atomic
-            #[cfg(target_arch = "wasm32")]
-            let ts = if let Some(ref ctrl) = self.shared_control {
-                ctrl.get_rtc_timestamp()
-            } else {
-                self.rtc_timestamp.load(std::sync::atomic::Ordering::Relaxed)
-            };
-            #[cfg(not(target_arch = "wasm32"))]
-            let ts = self.rtc_timestamp.load(std::sync::atomic::Ordering::Relaxed);
-            
-            let offset = addr - RTC_BASE;
-            return Ok(match offset {
-                0 => (ts & 0xFFFFFFFF) as u32,        // Low 32 bits
-                4 => ((ts >> 32) & 0xFFFFFFFF) as u32, // High 32 bits
-                _ => 0,
-            });
-        }
-
-        if addr >= CLINT_BASE && addr < CLINT_BASE + CLINT_SIZE {
-            let offset = addr - CLINT_BASE;
-            let val = self.clint_load(offset, 4);
-            return Ok(val as u32);
-        }
-
-        if addr >= PLIC_BASE && addr < PLIC_BASE + PLIC_SIZE {
-            let offset = addr - PLIC_BASE;
-            let val = self
+        match self.lookup_device(addr) {
+            Some((DeviceId::TestFinisher, _)) => Ok(0),
+            Some((DeviceId::SysInfo, offset)) => Ok(self.sysinfo.load(offset, 4) as u32),
+            Some((DeviceId::Rtc, offset)) => {
+                #[cfg(target_arch = "wasm32")]
+                let ts = if let Some(ref ctrl) = self.shared_control {
+                    ctrl.get_rtc_timestamp()
+                } else {
+                    self.rtc_timestamp.load(std::sync::atomic::Ordering::Relaxed)
+                };
+                #[cfg(not(target_arch = "wasm32"))]
+                let ts = self.rtc_timestamp.load(std::sync::atomic::Ordering::Relaxed);
+                Ok(match offset {
+                    0 => (ts & 0xFFFFFFFF) as u32,
+                    4 => ((ts >> 32) & 0xFFFFFFFF) as u32,
+                    _ => 0,
+                })
+            }
+            Some((DeviceId::Clint, offset)) => Ok(self.clint_load(offset, 4) as u32),
+            Some((DeviceId::Plic, offset)) => self
                 .plic
                 .load(offset, 4)
-                .map_err(|_| Trap::LoadAccessFault(addr))?;
-            return Ok(val as u32);
-        }
-
-        if addr >= UART_BASE && addr < UART_BASE + UART_SIZE {
-            let offset = addr - UART_BASE;
-            let val = self
+                .map(|v| v as u32)
+                .map_err(|_| Trap::LoadAccessFault(addr)),
+            Some((DeviceId::Uart, offset)) => self
                 .uart
-                .load(offset, 4)
-                .map_err(|_| Trap::LoadAccessFault(addr))?;
-            return Ok(val as u32);
-        }
-
-        // D1 MMC Controller (0x0402_0000 - 0x0402_0FFF)
-        if addr >= D1_MMC0_BASE && addr < D1_MMC0_BASE + D1_MMC0_SIZE {
-            // DEBUG: Log first MMC access to trace device visibility
-            static MMC_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-            if !MMC_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                let device_present = self.d1_mmc.read().map(|g| g.is_some()).unwrap_or(false);
-                #[cfg(target_arch = "wasm32")]
-                web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
-                    "[BUS MMC DEBUG] First read at 0x{:x}, device present: {}",
-                    addr, device_present
-                )));
-            }
-            
-            if let Ok(mut mmc) = self.d1_mmc.write() {
-                if let Some(ref mut dev) = *mmc {
-                    return Ok(dev.mmio_read32(addr));
+                .load(offset, 1)
+                .map(|v| v as u32)
+                .map_err(|_| Trap::LoadAccessFault(addr)),
+            Some((DeviceId::D1Mmc0, _)) => {
+                static MMC_LOGGED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !MMC_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    let device_present = self.d1_mmc.read().map(|g| g.is_some()).unwrap_or(false);
+                    #[cfg(target_arch = "wasm32")]
+                    web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+                        "[BUS MMC DEBUG] First read at 0x{:x}, device present: {}",
+                        addr, device_present
+                    )));
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let _ = device_present;
                 }
-            }
-            return Ok(0); // Device not initialized
-        }
-
-        // D1 EMAC Controller (0x0450_0000 - 0x0450_0FFF)
-        if addr >= D1_EMAC_BASE && addr < D1_EMAC_BASE + D1_EMAC_SIZE {
-            // Try local D1 EMAC device first (main thread)
-            if let Ok(emac) = self.d1_emac.read() {
-                if let Some(ref dev) = *emac {
-                    return Ok(dev.mmio_read32(addr));
-                }
-            }
-            
-            // For workers without local D1 EMAC: use shared memory for IP config
-            #[cfg(target_arch = "wasm32")]
-            {
-                let offset = addr & 0xFFF;
-                // IP config register at offset 0x100
-                if offset == 0x100 {
-                    if let Some(ref ctrl) = self.shared_control {
-                        return Ok(ctrl.get_d1_emac_ip_packed());
+                if let Ok(mut mmc) = self.d1_mmc.write() {
+                    if let Some(ref mut dev) = *mmc {
+                        return Ok(dev.mmio_read32(addr));
                     }
                 }
+                Ok(0)
             }
-            
-            return Ok(0);
-        }
-
-        // D1 I2C2 / Touch Controller (0x0250_2000 - 0x0250_23FF)
-        if addr >= D1_I2C2_BASE && addr < D1_I2C2_BASE + D1_I2C2_SIZE {
-            let offset = addr - D1_I2C2_BASE;
-            
-            // Special handling for cancellation flag (offset 0x130)
-            // This reads from SharedArrayBuffer so workers can see main thread's cancellation request
-            #[cfg(target_arch = "wasm32")]
-            if offset == 0x130 {
-                if let Some(ref control) = self.shared_control {
-                    return Ok(if control.is_cancel_requested() { 1 } else { 0 });
+            Some((DeviceId::D1Emac, _)) => {
+                if let Ok(emac) = self.d1_emac.read() {
+                    if let Some(ref dev) = *emac {
+                        return Ok(dev.mmio_read32(addr));
+                    }
                 }
-                return Ok(0);
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let offset = addr & 0xFFF;
+                    if offset == 0x100 {
+                        if let Some(ref ctrl) = self.shared_control {
+                            return Ok(ctrl.get_d1_emac_ip_packed());
+                        }
+                    }
+                }
+                Ok(0)
             }
-            
-            if let Ok(mut touch) = self.d1_touch.write() {
-                if let Some(ref mut dev) = *touch {
-                    return Ok(dev.mmio_read32(addr));
+            Some((DeviceId::D1Touch, offset)) => {
+                #[cfg(target_arch = "wasm32")]
+                if offset == 0x130 {
+                    if let Some(ref control) = self.shared_control {
+                        return Ok(if control.is_cancel_requested() { 1 } else { 0 });
+                    }
+                    return Ok(0);
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                let _ = offset;
+                if let Ok(mut touch) = self.d1_touch.write() {
+                    if let Some(ref mut dev) = *touch {
+                        return Ok(dev.mmio_read32(addr));
+                    }
+                }
+                Ok(0)
+            }
+            Some((DeviceId::D1Audio, _)) => {
+                if let Ok(audio) = self.d1_audio.read() {
+                    if let Some(ref dev) = *audio {
+                        return Ok(dev.mmio_read32(addr));
+                    }
+                }
+                Ok(0)
+            }
+            Some((DeviceId::D1De, _))
+            | Some((DeviceId::D1TconLcd, _))
+            | Some((DeviceId::D1MipiDsi, _))
+            | Some((DeviceId::D1Dphy, _)) => {
+                if let Ok(disp) = self.d1_display.read() {
+                    if let Some(ref dev) = *disp {
+                        return Ok(dev.mmio_read32(addr));
+                    }
+                }
+                Ok(0)
+            }
+            Some((id, offset)) if id.virtio_slot().is_some() => {
+                let idx = id.virtio_slot().unwrap();
+                if idx >= self.virtio_devices.len() {
+                    return Ok(0);
+                }
+                self.virtio_devices[idx]
+                    .read(offset)
+                    .map(|v| v as u32)
+                    .map_err(|_| Trap::LoadAccessFault(addr))
+            }
+            Some(_) => Err(Trap::LoadAccessFault(addr)),
+            None => {
+                if self.is_virtio_region(addr).is_some() {
+                    Ok(0)
+                } else {
+                    Err(Trap::LoadAccessFault(addr))
                 }
             }
-            return Ok(0);
         }
-
-        // D1 Audio Codec (0x0203_0000 - 0x0203_0FFF)
-        if addr >= D1_AUDIO_BASE && addr < D1_AUDIO_BASE + D1_AUDIO_SIZE {
-            if let Ok(audio) = self.d1_audio.read() {
-                if let Some(ref dev) = *audio {
-                    return Ok(dev.mmio_read32(addr));
-                }
-            }
-            return Ok(0);
-        }
-
-        // D1 Display Engine (0x0510_0000 - 0x051F_FFFF)
-        if addr >= D1_DE_BASE && addr < D1_DE_BASE + D1_DE_SIZE {
-            if let Ok(disp) = self.d1_display.read() {
-                if let Some(ref dev) = *disp {
-                    return Ok(dev.mmio_read32(addr));
-                }
-            }
-            return Ok(0);
-        }
-
-        // D1 TCON LCD (0x0546_1000 - 0x0546_1FFF)
-        if addr >= D1_TCON_LCD0 && addr < D1_TCON_LCD0 + D1_TCON_SIZE {
-            if let Ok(disp) = self.d1_display.read() {
-                if let Some(ref dev) = *disp {
-                    return Ok(dev.mmio_read32(addr));
-                }
-            }
-            return Ok(0);
-        }
-
-        // D1 MIPI DSI (0x0545_0000 - 0x0545_0FFF) - stub
-        if addr >= D1_MIPI_DSI_BASE && addr < D1_MIPI_DSI_BASE + D1_MIPI_DSI_SIZE {
-            if let Ok(disp) = self.d1_display.read() {
-                if let Some(ref dev) = *disp {
-                    return Ok(dev.mmio_read32(addr));
-                }
-            }
-            return Ok(0);
-        }
-
-        // D1 D-PHY (0x0545_1000 - 0x0545_1FFF) - stub
-        if addr >= D1_DPHY_BASE && addr < D1_DPHY_BASE + D1_DPHY_SIZE {
-            if let Ok(disp) = self.d1_display.read() {
-                if let Some(ref dev) = *disp {
-                    return Ok(dev.mmio_read32(addr));
-                }
-            }
-            return Ok(0);
-        }
-
-        if let Some((idx, offset)) = self.get_virtio_device(addr) {
-            let val = self.virtio_devices[idx]
-                .read(offset)
-                .map_err(|_| Trap::LoadAccessFault(addr))?;
-            return Ok(val as u32);
-        }
-
-
-
-        // Unmapped VirtIO slots return 0 (allows safe probing)
-        if self.is_virtio_region(addr).is_some() {
-            return Ok(0);
-        }
-
-        Err(Trap::LoadAccessFault(addr))
     }
 
     #[cold]
@@ -1288,113 +1250,81 @@ impl SystemBus {
         if addr % 8 != 0 {
             return Err(Trap::LoadAddressMisaligned(addr));
         }
-        if addr >= TEST_FINISHER_BASE && addr < TEST_FINISHER_BASE + TEST_FINISHER_SIZE {
-            return Ok(0);
-        }
-
-        if addr >= SYSINFO_BASE && addr < SYSINFO_BASE + SYSINFO_SIZE {
-            let offset = addr - SYSINFO_BASE;
-            let val = self.sysinfo.load(offset, 8);
-            return Ok(val);
-        }
-
-        if addr >= CLINT_BASE && addr < CLINT_BASE + CLINT_SIZE {
-            let offset = addr - CLINT_BASE;
-            let val = self.clint_load(offset, 8);
-            return Ok(val);
-        }
-
-        if addr >= PLIC_BASE && addr < PLIC_BASE + PLIC_SIZE {
-            let offset = addr - PLIC_BASE;
-            let val = self
+        match self.lookup_device(addr) {
+            Some((DeviceId::TestFinisher, _)) => Ok(0),
+            Some((DeviceId::SysInfo, offset)) => Ok(self.sysinfo.load(offset, 8)),
+            Some((DeviceId::Clint, offset)) => Ok(self.clint_load(offset, 8)),
+            Some((DeviceId::Plic, offset)) => self
                 .plic
                 .load(offset, 8)
-                .map_err(|_| Trap::LoadAccessFault(addr))?;
-            return Ok(val);
-        }
-
-        if addr >= UART_BASE && addr < UART_BASE + UART_SIZE {
-            let offset = addr - UART_BASE;
-            let val = self
+                .map_err(|_| Trap::LoadAccessFault(addr)),
+            Some((DeviceId::Uart, offset)) => self
                 .uart
-                .load(offset, 8)
-                .map_err(|_| Trap::LoadAccessFault(addr))?;
-            return Ok(val);
+                .load(offset, 1)
+                .map_err(|_| Trap::LoadAccessFault(addr)),
+            Some((id, offset)) if id.virtio_slot().is_some() => {
+                let idx = id.virtio_slot().unwrap();
+                if idx >= self.virtio_devices.len() {
+                    return Ok(0);
+                }
+                let low = self.virtio_devices[idx]
+                    .read(offset)
+                    .map_err(|_| Trap::LoadAccessFault(addr))?;
+                let high = self.virtio_devices[idx]
+                    .read(offset + 4)
+                    .map_err(|_| Trap::LoadAccessFault(addr + 4))?;
+                Ok((low as u64) | ((high as u64) << 32))
+            }
+            Some(_) => Err(Trap::LoadAccessFault(addr)),
+            None => {
+                if self.is_virtio_region(addr).is_some() {
+                    Ok(0)
+                } else {
+                    Err(Trap::LoadAccessFault(addr))
+                }
+            }
         }
-
-        if let Some((idx, offset)) = self.get_virtio_device(addr) {
-            let low = self.virtio_devices[idx]
-                .read(offset)
-                .map_err(|_| Trap::LoadAccessFault(addr))?;
-            let high = self.virtio_devices[idx]
-                .read(offset + 4)
-                .map_err(|_| Trap::LoadAccessFault(addr + 4))?;
-            return Ok((low as u64) | ((high as u64) << 32));
-        }
-
-
-
-        // Unmapped VirtIO slots return 0 (allows safe probing)
-        if self.is_virtio_region(addr).is_some() {
-            return Ok(0);
-        }
-
-        Err(Trap::LoadAccessFault(addr))
     }
 
     #[cold]
     fn write8_slow(&self, addr: u64, val: u8) -> Result<(), Trap> {
-        // Any write in the test finisher region signals a requested trap to the host.
-        if addr >= TEST_FINISHER_BASE && addr < TEST_FINISHER_BASE + TEST_FINISHER_SIZE {
-            return Err(Trap::RequestedTrap(val as u64));
-        }
-
-        if addr >= SYSINFO_BASE && addr < SYSINFO_BASE + SYSINFO_SIZE {
-            let offset = addr - SYSINFO_BASE;
-            self.sysinfo.store(offset, 1, val as u64);
-            return Ok(());
-        }
-
-        if addr >= CLINT_BASE && addr < CLINT_BASE + CLINT_SIZE {
-            let offset = addr - CLINT_BASE;
-            self.clint_store(offset, 1, val as u64);
-            return Ok(());
-        }
-
-        if addr >= PLIC_BASE && addr < PLIC_BASE + PLIC_SIZE {
-            let offset = addr - PLIC_BASE;
-            self.plic
+        match self.lookup_device(addr) {
+            Some((DeviceId::TestFinisher, _)) => Err(Trap::RequestedTrap(val as u64)),
+            Some((DeviceId::SysInfo, offset)) => {
+                self.sysinfo.store(offset, 1, val as u64);
+                Ok(())
+            }
+            Some((DeviceId::Clint, offset)) => {
+                self.clint_store(offset, 1, val as u64);
+                Ok(())
+            }
+            Some((DeviceId::Plic, offset)) => self
+                .plic
                 .store(offset, 1, val as u64)
-                .map_err(|_| Trap::StoreAccessFault(addr))?;
-            return Ok(());
-        }
-
-        if addr >= UART_BASE && addr < UART_BASE + UART_SIZE {
-            let offset = addr - UART_BASE;
-            // For workers with shared UART output, route THR writes to shared buffer
-            #[cfg(target_arch = "wasm32")]
-            if offset == 0 {
-                // Offset 0 is THR (Transmit Holding Register) - the data output
-                if let Some(ref shared_uart) = self.shared_uart_output {
-                    // Write to shared buffer so main thread can read it
-                    let _ = shared_uart.write_byte(val);
-                    return Ok(());
+                .map_err(|_| Trap::StoreAccessFault(addr)),
+            Some((DeviceId::Uart, offset)) => {
+                #[cfg(target_arch = "wasm32")]
+                if offset == 0 {
+                    if let Some(ref shared_uart) = self.shared_uart_output {
+                        let _ = shared_uart.write_byte(val);
+                        return Ok(());
+                    }
+                }
+                self.uart
+                    .store(offset, 1, val as u64)
+                    .map_err(|_| Trap::StoreAccessFault(addr))
+            }
+            Some((id, _)) if id.virtio_slot().is_some() => {
+                let idx = id.virtio_slot().unwrap();
+                if idx < self.virtio_devices.len() {
+                    Ok(())
+                } else {
+                    Err(Trap::StoreAccessFault(addr))
                 }
             }
-            // Fall through to local UART for main thread or non-THR registers
-            self.uart
-                .store(offset, 1, val as u64)
-                .map_err(|_| Trap::StoreAccessFault(addr))?;
-            return Ok(());
+            Some(_) => Err(Trap::StoreAccessFault(addr)),
+            None => Err(Trap::StoreAccessFault(addr)),
         }
-
-        if let Some((_idx, _offset)) = self.get_virtio_device(addr) {
-            // VirtIO registers are 32-bit. Byte writes are not strictly supported by the spec for all registers.
-            // We ignore them for now to be safe.
-            return Ok(());
-        }
-
-        Err(Trap::StoreAccessFault(addr))
     }
 
     #[cold]
@@ -1402,43 +1332,35 @@ impl SystemBus {
         if addr % 2 != 0 {
             return Err(Trap::StoreAddressMisaligned(addr));
         }
-        if addr >= TEST_FINISHER_BASE && addr < TEST_FINISHER_BASE + TEST_FINISHER_SIZE {
-            return Err(Trap::RequestedTrap(val as u64));
-        }
-
-        if addr >= SYSINFO_BASE && addr < SYSINFO_BASE + SYSINFO_SIZE {
-            let offset = addr - SYSINFO_BASE;
-            self.sysinfo.store(offset, 2, val as u64);
-            return Ok(());
-        }
-
-        if addr >= CLINT_BASE && addr < CLINT_BASE + CLINT_SIZE {
-            let offset = addr - CLINT_BASE;
-            self.clint_store(offset, 2, val as u64);
-            return Ok(());
-        }
-
-        if addr >= PLIC_BASE && addr < PLIC_BASE + PLIC_SIZE {
-            let offset = addr - PLIC_BASE;
-            self.plic
+        match self.lookup_device(addr) {
+            Some((DeviceId::TestFinisher, _)) => Err(Trap::RequestedTrap(val as u64)),
+            Some((DeviceId::SysInfo, offset)) => {
+                self.sysinfo.store(offset, 2, val as u64);
+                Ok(())
+            }
+            Some((DeviceId::Clint, offset)) => {
+                self.clint_store(offset, 2, val as u64);
+                Ok(())
+            }
+            Some((DeviceId::Plic, offset)) => self
+                .plic
                 .store(offset, 2, val as u64)
-                .map_err(|_| Trap::StoreAccessFault(addr))?;
-            return Ok(());
+                .map_err(|_| Trap::StoreAccessFault(addr)),
+            Some((DeviceId::Uart, offset)) => self
+                .uart
+                .store(offset, 1, val as u64)
+                .map_err(|_| Trap::StoreAccessFault(addr)),
+            Some((id, _)) if id.virtio_slot().is_some() => {
+                let idx = id.virtio_slot().unwrap();
+                if idx < self.virtio_devices.len() {
+                    Ok(())
+                } else {
+                    Err(Trap::StoreAccessFault(addr))
+                }
+            }
+            Some(_) => Err(Trap::StoreAccessFault(addr)),
+            None => Err(Trap::StoreAccessFault(addr)),
         }
-
-        if addr >= UART_BASE && addr < UART_BASE + UART_SIZE {
-            let offset = addr - UART_BASE;
-            self.uart
-                .store(offset, 2, val as u64)
-                .map_err(|_| Trap::StoreAccessFault(addr))?;
-            return Ok(());
-        }
-
-        if let Some((_idx, _offset)) = self.get_virtio_device(addr) {
-            return Ok(());
-        }
-
-        Err(Trap::StoreAccessFault(addr))
     }
 
     #[cold]
@@ -1446,149 +1368,93 @@ impl SystemBus {
         if addr % 4 != 0 {
             return Err(Trap::StoreAddressMisaligned(addr));
         }
-        if addr >= TEST_FINISHER_BASE && addr < TEST_FINISHER_BASE + TEST_FINISHER_SIZE {
-            return Err(Trap::RequestedTrap(val as u64));
-        }
-
-        if addr >= SYSINFO_BASE && addr < SYSINFO_BASE + SYSINFO_SIZE {
-            let offset = addr - SYSINFO_BASE;
-            self.sysinfo.store(offset, 4, val as u64);
-            return Ok(());
-        }
-
-        if addr >= CLINT_BASE && addr < CLINT_BASE + CLINT_SIZE {
-            let offset = addr - CLINT_BASE;
-            self.clint_store(offset, 4, val as u64);
-            return Ok(());
-        }
-
-        if addr >= PLIC_BASE && addr < PLIC_BASE + PLIC_SIZE {
-            let offset = addr - PLIC_BASE;
-            self.plic
+        match self.lookup_device(addr) {
+            Some((DeviceId::TestFinisher, _)) => Err(Trap::RequestedTrap(val as u64)),
+            Some((DeviceId::SysInfo, offset)) => {
+                self.sysinfo.store(offset, 4, val as u64);
+                Ok(())
+            }
+            Some((DeviceId::Clint, offset)) => {
+                self.clint_store(offset, 4, val as u64);
+                Ok(())
+            }
+            Some((DeviceId::Plic, offset)) => self
+                .plic
                 .store(offset, 4, val as u64)
-                .map_err(|_| Trap::StoreAccessFault(addr))?;
-            return Ok(());
-        }
-
-        if addr >= UART_BASE && addr < UART_BASE + UART_SIZE {
-            let offset = addr - UART_BASE;
-            self.uart
-                .store(offset, 4, val as u64)
-                .map_err(|_| Trap::StoreAccessFault(addr))?;
-            return Ok(());
-        }
-
-        // D1 MMC Controller (0x0402_0000 - 0x0402_0FFF)
-        if addr >= D1_MMC0_BASE && addr < D1_MMC0_BASE + D1_MMC0_SIZE {
-            if let Ok(mut mmc) = self.d1_mmc.write() {
-                if let Some(ref mut dev) = *mmc {
-                    dev.mmio_write32(addr, val);
+                .map_err(|_| Trap::StoreAccessFault(addr)),
+            Some((DeviceId::Uart, offset)) => self
+                .uart
+                .store(offset, 1, val as u64)
+                .map_err(|_| Trap::StoreAccessFault(addr)),
+            Some((DeviceId::D1Mmc0, _)) => {
+                if let Ok(mut mmc) = self.d1_mmc.write() {
+                    if let Some(ref mut dev) = *mmc {
+                        dev.mmio_write32(addr, val);
+                    }
+                }
+                Ok(())
+            }
+            Some((DeviceId::D1Emac, _)) => {
+                self.device_activity.fetch_or(
+                    DEVICE_ACTIVITY_EMAC,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                if let Ok(mut emac) = self.d1_emac.write() {
+                    if let Some(ref mut dev) = *emac {
+                        dev.mmio_write32(addr, val);
+                    }
+                }
+                Ok(())
+            }
+            Some((DeviceId::D1Touch, _)) => {
+                if let Ok(mut touch) = self.d1_touch.write() {
+                    if let Some(ref mut dev) = *touch {
+                        dev.mmio_write32(addr, val);
+                    }
+                }
+                Ok(())
+            }
+            Some((DeviceId::D1Audio, _)) => {
+                if let Ok(mut audio) = self.d1_audio.write() {
+                    if let Some(ref mut dev) = *audio {
+                        dev.mmio_write32(addr, val);
+                    }
+                }
+                Ok(())
+            }
+            Some((DeviceId::D1De, _))
+            | Some((DeviceId::D1TconLcd, _))
+            | Some((DeviceId::D1MipiDsi, _))
+            | Some((DeviceId::D1Dphy, _)) => {
+                if let Ok(mut disp) = self.d1_display.write() {
+                    if let Some(ref mut dev) = *disp {
+                        dev.mmio_write32(addr, val);
+                    }
+                }
+                Ok(())
+            }
+            Some((id, offset)) if id.virtio_slot().is_some() => {
+                let idx = id.virtio_slot().unwrap();
+                if idx >= self.virtio_devices.len() {
                     return Ok(());
                 }
+                self.device_activity.fetch_or(
+                    DEVICE_ACTIVITY_VIRTIO,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                self.virtio_devices[idx]
+                    .write(offset, val as u64, &self.dram)
+                    .map_err(|_| Trap::StoreAccessFault(addr))
             }
-            return Ok(()); // Device not initialized - ignore write
-        }
-
-        // D1 EMAC Controller (0x0450_0000 - 0x0450_0FFF)
-        if addr >= D1_EMAC_BASE && addr < D1_EMAC_BASE + D1_EMAC_SIZE {
-            self.device_activity.fetch_or(
-                DEVICE_ACTIVITY_EMAC,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            if let Ok(mut emac) = self.d1_emac.write() {
-                if let Some(ref mut dev) = *emac {
-                    dev.mmio_write32(addr, val);
-                    return Ok(());
+            Some(_) => Err(Trap::StoreAccessFault(addr)),
+            None => {
+                if self.is_virtio_region(addr).is_some() {
+                    Ok(())
+                } else {
+                    Err(Trap::StoreAccessFault(addr))
                 }
             }
-            return Ok(());
         }
-
-        // D1 I2C2 / Touch Controller (0x0250_2000 - 0x0250_23FF)
-        if addr >= D1_I2C2_BASE && addr < D1_I2C2_BASE + D1_I2C2_SIZE {
-            if let Ok(mut touch) = self.d1_touch.write() {
-                if let Some(ref mut dev) = *touch {
-                    dev.mmio_write32(addr, val);
-                    return Ok(());
-                }
-            }
-            return Ok(());
-        }
-
-        // D1 Audio Codec (0x0203_0000 - 0x0203_0FFF)
-        if addr >= D1_AUDIO_BASE && addr < D1_AUDIO_BASE + D1_AUDIO_SIZE {
-            if let Ok(mut audio) = self.d1_audio.write() {
-                if let Some(ref mut dev) = *audio {
-                    dev.mmio_write32(addr, val);
-                    return Ok(());
-                }
-            }
-            return Ok(());
-        }
-
-        // D1 Display Engine (0x0510_0000 - 0x051F_FFFF)
-        if addr >= D1_DE_BASE && addr < D1_DE_BASE + D1_DE_SIZE {
-            if let Ok(mut disp) = self.d1_display.write() {
-                if let Some(ref mut dev) = *disp {
-                    dev.mmio_write32(addr, val);
-                    return Ok(());
-                }
-            }
-            return Ok(());
-        }
-
-        // D1 TCON LCD (0x0546_1000 - 0x0546_1FFF)
-        if addr >= D1_TCON_LCD0 && addr < D1_TCON_LCD0 + D1_TCON_SIZE {
-            if let Ok(mut disp) = self.d1_display.write() {
-                if let Some(ref mut dev) = *disp {
-                    dev.mmio_write32(addr, val);
-                    return Ok(());
-                }
-            }
-            return Ok(());
-        }
-
-        // D1 MIPI DSI (0x0545_0000 - 0x0545_0FFF) - stub
-        if addr >= D1_MIPI_DSI_BASE && addr < D1_MIPI_DSI_BASE + D1_MIPI_DSI_SIZE {
-            if let Ok(mut disp) = self.d1_display.write() {
-                if let Some(ref mut dev) = *disp {
-                    dev.mmio_write32(addr, val);
-                    return Ok(());
-                }
-            }
-            return Ok(());
-        }
-
-        // D1 D-PHY (0x0545_1000 - 0x0545_1FFF) - stub
-        if addr >= D1_DPHY_BASE && addr < D1_DPHY_BASE + D1_DPHY_SIZE {
-            if let Ok(mut disp) = self.d1_display.write() {
-                if let Some(ref mut dev) = *disp {
-                    dev.mmio_write32(addr, val);
-                    return Ok(());
-                }
-            }
-            return Ok(());
-        }
-
-        if let Some((idx, offset)) = self.get_virtio_device(addr) {
-            self.device_activity.fetch_or(
-                DEVICE_ACTIVITY_VIRTIO,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            self.virtio_devices[idx]
-                .write(offset, val as u64, &self.dram)
-                .map_err(|_| Trap::StoreAccessFault(addr))?;
-            return Ok(());
-        }
-
-
-
-        // Writes to unmapped VirtIO slots are silently ignored (allows safe probing)
-        if self.is_virtio_region(addr).is_some() {
-            return Ok(());
-        }
-
-        Err(Trap::StoreAccessFault(addr))
     }
 
     #[cold]
@@ -1596,50 +1462,34 @@ impl SystemBus {
         if addr % 8 != 0 {
             return Err(Trap::StoreAddressMisaligned(addr));
         }
-        if addr >= TEST_FINISHER_BASE && addr < TEST_FINISHER_BASE + TEST_FINISHER_SIZE {
-            return Err(Trap::RequestedTrap(val));
-        }
-
-        if addr >= SYSINFO_BASE && addr < SYSINFO_BASE + SYSINFO_SIZE {
-            let offset = addr - SYSINFO_BASE;
-            self.sysinfo.store(offset, 8, val);
-            return Ok(());
-        }
-
-        if addr >= CLINT_BASE && addr < CLINT_BASE + CLINT_SIZE {
-            let offset = addr - CLINT_BASE;
-            self.clint_store(offset, 8, val);
-            return Ok(());
-        }
-
-        if addr >= PLIC_BASE && addr < PLIC_BASE + PLIC_SIZE {
-            let offset = addr - PLIC_BASE;
-            self.plic
+        match self.lookup_device(addr) {
+            Some((DeviceId::TestFinisher, _)) => Err(Trap::RequestedTrap(val)),
+            Some((DeviceId::SysInfo, offset)) => {
+                self.sysinfo.store(offset, 8, val);
+                Ok(())
+            }
+            Some((DeviceId::Clint, offset)) => {
+                self.clint_store(offset, 8, val);
+                Ok(())
+            }
+            Some((DeviceId::Plic, offset)) => self
+                .plic
                 .store(offset, 8, val)
-                .map_err(|_| Trap::StoreAccessFault(addr))?;
-            return Ok(());
+                .map_err(|_| Trap::StoreAccessFault(addr)),
+            Some((DeviceId::Uart, offset)) => self
+                .uart
+                .store(offset, 1, val)
+                .map_err(|_| Trap::StoreAccessFault(addr)),
+            Some((id, _)) if id.virtio_slot().is_some() => Ok(()),
+            Some(_) => Err(Trap::StoreAccessFault(addr)),
+            None => {
+                if self.is_virtio_region(addr).is_some() {
+                    Ok(())
+                } else {
+                    Err(Trap::StoreAccessFault(addr))
+                }
+            }
         }
-
-        if addr >= UART_BASE && addr < UART_BASE + UART_SIZE {
-            let offset = addr - UART_BASE;
-            self.uart
-                .store(offset, 8, val)
-                .map_err(|_| Trap::StoreAccessFault(addr))?;
-            return Ok(());
-        }
-
-        if let Some((_idx, _offset)) = self.get_virtio_device(addr) {
-            // VirtIO registers are 32-bit. 64-bit writes are not typically supported directly via MMIO
-            // except for legacy queue PFN which is 32-bit anyway.
-            return Ok(());
-        }
-
-        // Writes to unmapped VirtIO slots are silently ignored (allows safe probing)
-        if self.is_virtio_region(addr).is_some() {
-            return Ok(());
-        }
-
-        Err(Trap::StoreAccessFault(addr))
     }
 }
 
@@ -2610,5 +2460,78 @@ impl Bus for SystemBus {
     #[inline]
     fn hart_registry(&self) -> &dyn HartRegistry {
         &*self.registry
+    }
+
+    fn fence_seq(&self) -> u32 {
+        self.fence_seq.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn bump_fence_seq(&self) {
+        self.fence_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::machine::{self, Machine};
+
+    #[test]
+    fn virt_mmio_windows_match_legacy_constants() {
+        let bus = SystemBus::new(machine::virt::DRAM_BASE, 1024 * 1024);
+        assert_eq!(bus.machine, Machine::Virt);
+        assert_eq!(bus.clint_offset(machine::virt::CLINT_BASE), Some(0));
+        assert_eq!(bus.plic_offset(machine::virt::PLIC_BASE), Some(0));
+        assert_eq!(bus.uart_reg_index(machine::virt::UART_BASE), Some(0));
+        assert_eq!(bus.uart_reg_index(machine::virt::UART_BASE + 5), Some(5));
+        assert_eq!(
+            bus.lookup_device(machine::virt::UART_BASE).map(|h| h.0),
+            Some(DeviceId::Uart)
+        );
+        assert_eq!(
+            bus.lookup_device(machine::virt::CLINT_BASE).map(|h| h.0),
+            Some(DeviceId::Clint)
+        );
+        assert_eq!(
+            bus.lookup_device(TEST_FINISHER_BASE).map(|h| h.0),
+            Some(DeviceId::TestFinisher)
+        );
+    }
+
+    #[test]
+    fn d1_does_not_decode_clint_at_gpio() {
+        let bus = SystemBus::new(machine::d1::DRAM_BASE, 1024 * 1024);
+        assert_eq!(bus.machine, Machine::D1);
+        // 0x0200_0000 is GPIO on D1, not CLINT.
+        assert!(bus.clint_offset(0x0200_0000).is_none());
+        assert_eq!(bus.uart_reg_index(machine::d1::UART_BASE), Some(0));
+        // DesignWare stride 4: LSR is register 5 at byte offset 0x14.
+        assert_eq!(
+            bus.uart_reg_index(machine::d1::UART_BASE + 5 * 4),
+            Some(5)
+        );
+        assert_eq!(bus.plic_offset(machine::d1::PLIC_BASE), Some(0));
+        // Virt UART base is inside the D1 PLIC window, not UART.
+        assert!(bus.uart_reg_index(machine::virt::UART_BASE).is_none());
+        assert!(bus.plic_offset(machine::virt::UART_BASE).is_some());
+        // lookup_device must not send D1 UART through the virt table.
+        assert_eq!(
+            bus.lookup_device(machine::d1::UART_BASE).map(|h| h.0),
+            Some(DeviceId::Uart)
+        );
+        assert_eq!(
+            bus.lookup_device(machine::virt::UART_BASE).map(|h| h.0),
+            Some(DeviceId::Plic)
+        );
+        assert!(bus.lookup_device(0x0200_0000).is_none());
+    }
+
+    #[test]
+    fn d1_uart_word_write_hits_16550_byte_regs() {
+        let bus = SystemBus::new(machine::d1::DRAM_BASE, 1024 * 1024);
+        Bus::write32(&bus, machine::d1::UART_BASE, b'Z' as u32).unwrap();
+        let out = bus.uart.drain_output();
+        assert_eq!(out, vec![b'Z']);
     }
 }

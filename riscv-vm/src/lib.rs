@@ -1,6 +1,7 @@
 pub mod bench;
 pub mod bus;
 pub mod cpu;
+pub mod machine;
 pub mod devices;
 pub mod jit;
 pub mod dram;
@@ -23,6 +24,7 @@ pub mod snapshot;
 pub mod vm;
 
 pub use cpu::{Mode, Trap, csr};
+pub use machine::{AttachedDevices, Machine, MemoryMap};
 
 
 #[cfg(all(feature = "napi", not(target_arch = "wasm32")))]

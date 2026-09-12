@@ -21,6 +21,7 @@ pub mod timer;
 
 use crate::bus::Bus;
 use crate::cpu::Cpu;
+use crate::cpu::Trap;
 use crate::engine::decoder::Register;
 
 // ============================================================================
@@ -137,6 +138,18 @@ impl SbiRet {
 // Main SBI Dispatcher
 // ============================================================================
 
+/// Outcome of an intercepted S-mode ECALL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SbiCallResult {
+    /// Known EID handled. a0/a1 written; caller should advance PC past ECALL.
+    Handled,
+    /// Unknown EID. Do not write a0/a1; trap to M-mode.
+    Unhandled,
+    /// `sbi_hart_stop` parked and a later start resumed this hart.
+    /// PC and a0/a1 already set; do not advance past the ECALL.
+    Restarted,
+}
+
 /// Handle an SBI call from S-mode.
 ///
 /// This function is called when the CPU is in S-mode and executes ECALL.
@@ -148,9 +161,11 @@ impl SbiRet {
 /// * `bus` - System bus for memory/device access
 ///
 /// # Returns
-/// * `true` if the SBI call was handled (PC should advance)
-/// * `false` if the call should trap to M-mode (unhandled)
-pub fn handle_sbi_call(cpu: &mut Cpu, bus: &dyn Bus) -> bool {
+/// * `Ok(Handled)` if the SBI call was handled (PC should advance)
+/// * `Ok(Unhandled)` if the call should trap to M-mode (unknown EID)
+/// * `Ok(Restarted)` if HSM stop/start already set PC
+/// * `Err(trap)` for SRST shutdown (`Trap::RequestedTrap`)
+pub fn handle_sbi_call(cpu: &mut Cpu, bus: &dyn Bus) -> Result<SbiCallResult, Trap> {
     let eid = cpu.read_reg(Register::X17); // a7 = extension ID
     let fid = cpu.read_reg(Register::X16); // a6 = function ID
 
@@ -176,26 +191,32 @@ pub fn handle_sbi_call(cpu: &mut Cpu, bus: &dyn Bus) -> bool {
         EID_IPI => ipi::handle(cpu, bus, fid),
 
         // RFENCE Extension
-        EID_RFENCE => rfence::handle(cpu, fid),
+        EID_RFENCE => rfence::handle(cpu, bus, fid),
 
         // HSM Extension
-        EID_HSM => hsm::handle(cpu, bus, fid),
+        EID_HSM => match hsm::handle(cpu, bus, fid) {
+            hsm::HsmOutcome::Ret(ret) => ret,
+            hsm::HsmOutcome::Restarted => return Ok(SbiCallResult::Restarted),
+        },
 
         // System Reset Extension
-        EID_SRST => srst::handle(cpu, fid),
+        EID_SRST => match srst::handle(cpu, bus, fid) {
+            Ok(ret) => ret,
+            Err(trap) => return Err(trap),
+        },
 
         // Debug Console Extension
         EID_DBCN => console::handle(cpu, bus, fid),
 
-        // Unknown extension
-        _ => SbiRet::not_supported(),
+        // Unknown extension: trap to M-mode. Do not write NOT_SUPPORTED.
+        _ => return Ok(SbiCallResult::Unhandled),
     };
 
     // Write results to a0 (error) and a1 (value)
     cpu.write_reg(Register::X10, result.error as u64);
     cpu.write_reg(Register::X11, result.value as u64);
 
-    true
+    Ok(SbiCallResult::Handled)
 }
 
 // ============================================================================
@@ -224,5 +245,34 @@ mod tests {
     fn test_sbi_ret_not_supported() {
         let ret = SbiRet::not_supported();
         assert_eq!(ret.error, SBI_ERR_NOT_SUPPORTED);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_unknown_eid_does_not_write_regs() {
+        let bus = crate::bus::SystemBus::new(crate::machine::virt::DRAM_BASE, 1024 * 1024);
+        let mut cpu = Cpu::new(0x8000_0000, 0);
+        cpu.write_reg(Register::X10, 0x1234);
+        cpu.write_reg(Register::X11, 0x5678);
+        cpu.write_reg(Register::X17, 0xDEAD_BEEF); // unknown EID
+        cpu.write_reg(Register::X16, 0);
+
+        let result = handle_sbi_call(&mut cpu, &bus);
+        assert_eq!(result, Ok(SbiCallResult::Unhandled));
+        assert_eq!(cpu.read_reg(Register::X10), 0x1234);
+        assert_eq!(cpu.read_reg(Register::X11), 0x5678);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_known_eid_unknown_fid_not_supported() {
+        let bus = crate::bus::SystemBus::new(crate::machine::virt::DRAM_BASE, 1024 * 1024);
+        let mut cpu = Cpu::new(0x8000_0000, 0);
+        cpu.write_reg(Register::X17, EID_BASE);
+        cpu.write_reg(Register::X16, 99); // unknown FID
+
+        let result = handle_sbi_call(&mut cpu, &bus);
+        assert_eq!(result, Ok(SbiCallResult::Handled));
+        assert_eq!(cpu.read_reg(Register::X10) as i64, SBI_ERR_NOT_SUPPORTED);
     }
 }

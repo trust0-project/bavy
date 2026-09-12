@@ -133,7 +133,8 @@ impl HartRegistry for NativeHartRegistry {
 
         let hcb = &self.hcbs[hart_id];
 
-        // Try to transition STARTED -> STOP_PENDING
+        // Try to transition STARTED -> STOP_PENDING, then STOPPED so
+        // `wait_for_start` / `start_hart` (which expect STOPPED) can proceed.
         if !hcb.transition(HartState::Started, HartState::StopPending) {
             let current = hcb.get_state();
             return match current {
@@ -141,6 +142,8 @@ impl HartRegistry for NativeHartRegistry {
                 _ => Err(HartError::InvalidState),
             };
         }
+
+        hcb.set_state(HartState::Stopped);
 
         // Wake the hart so it can see the stop request
         self.notify(hart_id);
@@ -315,6 +318,18 @@ mod tests {
         assert_eq!(opaque, 0xCAFE);
         assert!(preserve);
         assert_eq!(reg.get_state(1), HartState::Started);
+    }
+
+    #[test]
+    fn test_stop_hart_sets_stopped() {
+        let reg = NativeHartRegistry::new(2);
+        assert!(reg.start_hart(1, 0x8000_0000, 0, false).is_ok());
+        reg.acknowledge_start(1);
+        assert_eq!(reg.get_state(1), HartState::Started);
+
+        assert!(reg.stop_hart(1).is_ok());
+        assert_eq!(reg.get_state(1), HartState::Stopped);
+        assert_eq!(reg.get_state(1).sbi_status(), 1);
     }
 
     #[test]

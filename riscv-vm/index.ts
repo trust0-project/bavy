@@ -34,6 +34,24 @@ export interface VmOptions {
   harts?: number;
   /** Path to worker script (default: '/worker.js') */
   workerScript?: string;
+  /**
+   * Guest board identity. `virt` (default) is QEMU-virt at 10 MHz;
+   * `d1` is Allwinner D1 / Lichee RV at 24 MHz.
+   */
+  machine?: string;
+}
+
+function isVirtMachine(machine?: string): boolean {
+  if (!machine) return true;
+  switch (machine.trim().toLowerCase()) {
+    case 'virt':
+    case 'qemu':
+    case 'qemu-virt':
+    case 'riscv-virtio':
+      return true;
+    default:
+      return false;
+  }
 }
 
 /**
@@ -49,6 +67,7 @@ export interface VmOptions {
  * @param kernelData - ELF kernel binary
  * @param options - VM configuration options
  * @param options.harts - Number of harts: undefined/0 = auto-detect (cpu/2), >= 1 = explicit count
+ * @param options.machine - Guest board: `virt` (10 MHz) or `d1` (24 MHz). Default virt.
  * @returns WasmVm instance
  */
 export async function createVM(
@@ -61,12 +80,15 @@ export async function createVM(
   // - undefined or 0: auto-detect (cpu/2) via Rust default constructor
   // - >= 1: use the specified value via new_with_harts
   const harts = options.harts;
+  const machine = options.machine;
 
-  // Create VM with specified hart count
-  // new_with_harts(harts) for explicit count, default constructor for auto-detect
-  const vm = (harts !== undefined && harts >= 1)
-    ? module.WasmVm.new_with_harts(kernelData, harts)
-    : new module.WasmVm(kernelData);
+  // Create VM with specified hart count / board.
+  // Non-virt boards go through new_with_machine; virt keeps the existing constructors.
+  const vm = (!isVirtMachine(machine) && typeof module.WasmVm.new_with_machine === 'function')
+    ? module.WasmVm.new_with_machine(kernelData, (harts !== undefined && harts >= 1) ? harts : 0, machine as string)
+    : (harts !== undefined && harts >= 1)
+      ? module.WasmVm.new_with_harts(kernelData, harts)
+      : new module.WasmVm(kernelData);
 
   // Start workers if in SMP mode
   const workerScript = options.workerScript || "/worker.js";

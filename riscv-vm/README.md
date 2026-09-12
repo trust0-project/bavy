@@ -11,45 +11,45 @@ A complete RISC-V 64-bit (RV64GC) virtual machine implementation in Rust, capabl
   - **PLIC**: Platform-Level Interrupt Controller.
   - **CLINT**: Core Local Interruptor (Timer).
   - **VirtIO**: Block Device (Disk) and Network Device (Net).
-- **Networking**:
-  - Native TAP interface support (Linux).
-  - WebSocket backend for browser/cross-platform networking.
-  - WebTransport backend for P2P connectivity.
+- **Networking**: WebTransport relay via `--net-webtransport` (native and Node CLI). There is no `--net-ws` flag.
+- **Boards**: `--machine virt` (default, QEMU-virt, 10 MHz timebase) or `--machine d1` (Allwinner D1, 24 MHz). Same values in native `src/main.rs`, Node `cli.ts`, and JS `createVM({ machine })`.
 - **Platform**:
-  - **WASM**: Compiles to WebAssembly for browser execution.
-  - **Native**: Runs as a CLI application on Host OS.
+  - **WASM**: Compiles to WebAssembly for browser / Node execution.
+  - **Native**: Runs as a CLI application on the host OS.
+  - Without `SharedArrayBuffer` (no COOP/COEP), Wasm is always **1 hart**.
 
 ## Usage
 
 ### CLI (Native)
 
-Run the emulator from the command line:
+Boots an SD card image (MBR + FAT32 `KERNEL.BIN` + filesystem partition). There is no `--kernel` or `--disk` flag.
 
 ```bash
-# Run a kernel image
-cargo run --release -- --kernel path/to/kernel
+# Boot an SD card (machine defaults to virt, 10 MHz)
+cargo run --release -- --sdcard path/to/sdcard.img
 
-# Run with networking (WebSocket backend)
-cargo run --release -- --kernel path/to/kernel --net-ws ws://localhost:8765
+# Hart count (`0` = auto: virt uses host CPUs, d1 stays at 1)
+cargo run --release -- --sdcard path/to/sdcard.img --harts 2
 
-# Run with block device
-cargo run --release -- --kernel path/to/kernel --disk path/to/fs.img
+# Guest board: virt (QEMU-virt) or d1 (Allwinner, 24 MHz timebase)
+cargo run --release -- --sdcard path/to/sdcard.img --machine virt
+cargo run --release -- --sdcard path/to/sdcard.img --machine d1
+
+# Networking (WebTransport relay)
+cargo run --release -- --sdcard path/to/sdcard.img --net-webtransport https://127.0.0.1:4433
 ```
+
+The Node CLI (`npx virtual-machine`) takes the same `--sdcard`, `--harts`, `--machine`, and `--net-webtransport` options.
 
 ### WebAssembly
 
-The VM exposes a simple API for JavaScript integration:
+The VM exposes a simple API for JavaScript integration. Pass `machine: "virt" | "d1"` to match the guest kernel. Without `SharedArrayBuffer`, SMP is unavailable and the VM runs 1 hart.
 
 ```typescript
-import { WasmVm } from "virtual-machine";
+import { createVM } from "virtual-machine";
 
-// Initialize VM with kernel binary
-const vm = new WasmVm(kernelBytes);
+const vm = await createVM(kernelBytes, { harts: 2, machine: "virt" });
 
-// Connect networking
-vm.connect_network("ws://localhost:8765");
-
-// Step execution
 while (running) {
   vm.step();
 }

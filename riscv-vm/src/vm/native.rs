@@ -1,9 +1,12 @@
 use crate::Trap;
-use crate::bus::{DRAM_BASE, SystemBus};
+use crate::bus::{Bus, SystemBus};
 use crate::console::Console;
 use crate::cpu::Cpu;
 use crate::devices::clint::TICKS_PER_MS;
+use crate::engine::decoder::Register;
+use crate::hart_registry::{HartState, WakeReason};
 use crate::loader::load_elf_into_dram;
+use crate::machine::Machine;
 use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -104,19 +107,32 @@ pub struct NativeVm {
     pub shared: Arc<SharedState>,
     num_harts: usize,
     entry_pc: u64,
+    /// Guest board identity (virt vs d1).
+    machine: Machine,
     /// WebTransport network backend (if connected)
     wt_backend: Option<crate::net::webtransport::WebTransportBackend>,
 }
 
 impl NativeVm {
-    /// Create a new VM with the given kernel.
+    /// Create a new virt-machine VM with the given kernel.
     ///
     /// # Arguments
     /// * `kernel` - Kernel binary (ELF or raw)
     /// * `num_harts` - Number of harts (CPUs) to create
     pub fn new(kernel: &[u8], num_harts: usize) -> Result<Self, String> {
-        const DRAM_SIZE: usize = 512 * 1024 * 1024;
-        let bus = SystemBus::new(DRAM_BASE, DRAM_SIZE);
+        Self::with_machine(kernel, num_harts, Machine::Virt)
+    }
+
+    /// Create a VM for an explicit guest board (`virt` or `d1`).
+    pub fn with_machine(
+        kernel: &[u8],
+        num_harts: usize,
+        machine: Machine,
+    ) -> Result<Self, String> {
+        let map = machine.memory_map();
+        let registry = Arc::new(crate::hart_registry::native::NativeHartRegistry::new(num_harts));
+        let bus = SystemBus::with_registry(map.dram_base, map.dram_size, registry);
+        debug_assert_eq!(bus.machine, machine);
 
         bus.set_num_harts(num_harts);
 
@@ -126,32 +142,24 @@ impl NativeVm {
             bus.dram
                 .load(kernel, 0)
                 .map_err(|e| format!("Failed to load kernel: {:?}", e))?;
-            DRAM_BASE
+            map.dram_base
         };
 
-        // Generate and write DTB to DRAM for OpenSBI compliance
-        // D1 EMAC is always enabled for kernel probing
-        let d1_config = crate::dtb::D1DeviceConfig {
-            has_display: false, // Will be updated via enable_gpu()
-            has_mmc: false,     // Will be updated via load_disk()
-            has_emac: true,     // Always enabled for kernel probing
-            has_touch: true,    // Touch input always enabled
-            has_audio: false,   // Will be updated via enable_audio()
-        };
-        let dtb = crate::dtb::generate_dtb(num_harts, DRAM_SIZE as u64, &d1_config);
-        let dtb_address = crate::dtb::write_dtb_to_dram(&bus.dram, &dtb);
-        
-        println!(
-            "[VM] Generated DTB ({} bytes) at 0x{:x}",
-            dtb.len(), dtb_address
-        );
-
-        // Always initialize D1 EMAC so kernel can probe it (regardless of network connection)
+        // Transitional: attach D1 EMAC on both machines so the current kernel
+        // can probe MMIO. DTB only *advertises* D1 nodes on Machine::D1.
         {
             use crate::devices::d1_emac::D1EmacEmulated;
             let emac = D1EmacEmulated::new();
             *bus.d1_emac.write().unwrap() = Some(emac);
         }
+
+        let dtb_address = bus.refresh_dtb(num_harts);
+        println!(
+            "[VM] Generated DTB at 0x{:x} (machine {}, timebase {} Hz)",
+            dtb_address,
+            machine.as_str(),
+            machine.timebase_hz()
+        );
 
         let bus = Arc::new(bus);
         let shared = Arc::new(SharedState::new());
@@ -170,6 +178,7 @@ impl NativeVm {
             shared,
             num_harts,
             entry_pc,
+            machine,
             wt_backend: None,
         })
     }
@@ -191,7 +200,8 @@ impl NativeVm {
         if let Some(bus) = Arc::get_mut(&mut self.bus) {
             let mmc = D1MmcEmulated::new(disk);
             *bus.d1_mmc.write().unwrap() = Some(mmc);
-            println!("[VM] D1 MMC loaded with disk image");
+            let dtb = bus.refresh_dtb(self.num_harts);
+            println!("[VM] D1 MMC loaded with disk image (dtb=0x{:x})", dtb);
         } else {
             eprintln!("[VM] Cannot load disk: workers already running");
         }
@@ -243,9 +253,10 @@ impl NativeVm {
             
             *bus.d1_display.write().unwrap() = Some(display);
             *bus.d1_touch.write().unwrap() = Some(touch);
-            
+            let dtb = bus.refresh_dtb(self.num_harts);
+
             println!("[VM] D1 Display enabled (1024x768)");
-            println!("[VM] D1 Touch enabled");
+            println!("[VM] D1 Touch enabled (dtb=0x{:x})", dtb);
         } else {
             eprintln!("[VM] Cannot enable display: workers already running");
         }
@@ -260,7 +271,8 @@ impl NativeVm {
         if let Some(bus) = Arc::get_mut(&mut self.bus) {
             let vinput = VirtioInput::new();
             bus.virtio_devices.push(Box::new(vinput));
-            println!("[VM] VirtIO Input device enabled");
+            let dtb = bus.refresh_dtb(self.num_harts);
+            println!("[VM] VirtIO Input device enabled (dtb=0x{:x})", dtb);
         } else {
             eprintln!("[VM] Cannot enable input: workers already running");
         }
@@ -282,10 +294,28 @@ impl NativeVm {
             let tag = mount_tag.unwrap_or("hostfs");
             let p9dev = VirtioP9::new(host_path, tag);
             bus.virtio_devices.push(Box::new(p9dev));
-            println!("[VM] VirtIO 9P device enabled: {} -> {}", host_path, tag);
+            let dtb = bus.refresh_dtb(self.num_harts);
+            println!(
+                "[VM] VirtIO 9P device enabled: {} -> {} (dtb=0x{:x})",
+                host_path, tag, dtb
+            );
         } else {
             eprintln!("[VM] Cannot enable 9P: workers already running");
         }
+    }
+
+    /// Guest board selected at construction.
+    pub fn machine(&self) -> Machine {
+        self.machine
+    }
+
+    /// Framebuffer protocol addresses are virt DRAM-relative (`0x8100_0000`).
+    /// Do not subtract virt `DRAM_BASE` from a D1 physical address.
+    fn virt_fb_dram_offset(&self, phys: u64) -> Option<u64> {
+        if self.machine != Machine::Virt {
+            return None;
+        }
+        phys.checked_sub(self.bus.dram_base())
     }
 
 
@@ -363,7 +393,7 @@ impl NativeVm {
             return None;
         }
 
-        let dram_offset = (FRAMEBUFFER_PHYS_ADDR - crate::bus::DRAM_BASE) as usize;
+        let dram_offset = self.virt_fb_dram_offset(FRAMEBUFFER_PHYS_ADDR)? as usize;
         self.bus.dram.read_range(dram_offset, FB_SIZE_BYTES).ok()
     }
 
@@ -394,7 +424,10 @@ impl NativeVm {
     /// Can be used to skip unchanged frames.
     pub fn get_gpu_frame_version(&self) -> u32 {
         const FRAME_VERSION_PHYS_ADDR: u64 = 0x80FF_FFFC;
-        let dram_offset = FRAME_VERSION_PHYS_ADDR - crate::bus::DRAM_BASE;
+        let dram_offset = match self.virt_fb_dram_offset(FRAME_VERSION_PHYS_ADDR) {
+            Some(off) => off,
+            None => return 0,
+        };
         self.bus.dram.load_32(dram_offset).unwrap_or(0)
     }
 
@@ -424,7 +457,8 @@ impl NativeVm {
     }
 
     /// Start worker threads for secondary harts.
-    /// Workers will spin-wait until allow_workers_to_start() is called.
+    /// Each secondary blocks on HSM `wait_for_start` and does not execute guest
+    /// code until `sbi_hart_start`.
     pub fn start_workers(&mut self) {
         for hart_id in 1..self.num_harts {
             let bus = Arc::clone(&self.bus);
@@ -526,13 +560,6 @@ impl NativeVm {
             let (batch_steps, halt_reason) = self.execute_batch(&mut cpu, BATCH_SIZE);
             step_count += batch_steps;
 
-            // After initial boot steps, signal workers to start
-            // OpenSBI takes ~50k+ steps before jumping to kernel, so we wait 100k
-            // This gives hart 0 time to set up boot environment before secondary harts begin
-            if step_count >= 100_000 && !self.shared.can_workers_start() {
-                self.shared.allow_workers_to_start();
-            }
-
             if let Some(reason) = halt_reason {
                 match reason {
                     HaltReason::Shutdown(code) => {
@@ -611,20 +638,8 @@ impl NativeVm {
         let mut count = 0u64;
         let hart_id: usize = 0; // Hart 0 runs on main thread
 
-        // CRITICAL: Sync CLINT interrupt state to CPU's MIP at batch start.
-        // Access MIP directly (bypassing privilege check since this is hardware delivery).
-        const CSR_MIP: usize = 0x344;
-        let (msip, timer) = self.bus.clint.check_interrupts_for_hart(hart_id);
-        if msip || timer {
-            let mut mip = cpu.csrs[CSR_MIP];
-            if msip {
-                mip |= 1 << 1; // SSIP
-            }
-            if timer {
-                mip |= 1 << 5; // STIP
-            }
-            cpu.csrs[CSR_MIP] = mip;
-        }
+        // Sync hardware mip (MSIP=3, MTIP=7, SEIP=9, MEIP=11) — same mask as Cpu::step.
+        cpu.sync_hw_mip(&*self.bus);
 
         for _ in 0..max_steps {
             match cpu.step(&*self.bus) {
@@ -641,29 +656,13 @@ impl NativeVm {
                     // WFI: Advance PC past the instruction
                     cpu.pc = cpu.pc.wrapping_add(4);
 
-                    // Check if interrupts are already pending from CLINT
-                    let (msip, timer) = self.bus.clint.check_interrupts_for_hart(hart_id);
-                    if msip || timer {
-                        // Deliver CLINT interrupts directly to MIP CSR
-                        let mut mip = cpu.csrs[CSR_MIP];
-                        if msip {
-                            mip |= 1 << 1; // SSIP
-                        }
-                        if timer {
-                            mip |= 1 << 5; // STIP
-                        }
-                        cpu.csrs[CSR_MIP] = mip;
-                        
-                        // Check if the CPU can actually take this interrupt (not masked)
-                        if cpu.check_pending_interrupt().is_some() {
-                            // Interrupt is enabled - continue to take trap
-                            continue;
-                        }
-                        // Interrupt is pending but masked - fall through to sleep
-                        // This properly blocks the thread instead of busy-spinning
+                    cpu.sync_hw_mip(&*self.bus);
+                    cpu.force_irq_poll();
+                    if cpu.check_pending_interrupt().is_some() {
+                        continue;
                     }
 
-                    // No pending interrupts - must sleep to save CPU
+                    // No takeable interrupt — sleep until CLINT wakes us.
                     let now = self.bus.clint.mtime();
                     let trigger = self.bus.clint.get_mtimecmp(hart_id);
                     let timeout_ms = if trigger > now {
@@ -676,8 +675,9 @@ impl NativeVm {
                         1
                     };
 
-                    // Sleep until interrupt or timeout
                     self.bus.clint.wait_for_interrupt(hart_id, timeout_ms);
+                    cpu.sync_hw_mip(&*self.bus);
+                    cpu.force_irq_poll();
                 }
                 Err(_) => {
                     // Other architectural traps handled by CPU
@@ -726,6 +726,7 @@ impl NativeVm {
         println!("[VM] Shutting down...");
 
         self.shared.request_halt();
+        self.unblock_hsm_waiters();
 
         for handle in self.handles.drain(..) {
             if let Err(e) = handle.join() {
@@ -735,11 +736,21 @@ impl NativeVm {
 
         println!("[VM] All threads stopped");
     }
+
+    /// Wake harts parked in `wait_for_start` so `join` can complete on halt.
+    fn unblock_hsm_waiters(&self) {
+        let registry = self.bus.hart_registry();
+        for hart_id in 0..self.num_harts {
+            let _ = registry.start_hart(hart_id, 0, 0, true);
+            registry.wake_hart(hart_id, WakeReason::Start);
+        }
+    }
 }
 
 impl Drop for NativeVm {
     fn drop(&mut self) {
         self.shared.request_halt();
+        self.unblock_hsm_waiters();
         for handle in self.handles.drain(..) {
             handle.join().ok();
         }
@@ -747,17 +758,25 @@ impl Drop for NativeVm {
 }
 
 fn hart_thread(hart_id: usize, entry_pc: u64, bus: Arc<SystemBus>, shared: Arc<SharedState>) {
-    // Wait for hart 0 to signal that workers can start.
-    // This ensures hart 0 has executed initial boot code before secondary harts begin.
-    while !shared.can_workers_start() {
+    // Block until sbi_hart_start. Do not execute guest code before HSM start.
+    // Poll so VM halt can join without waiting forever.
+    loop {
         if shared.should_stop() {
             return;
         }
-        thread::sleep(Duration::from_micros(100));
+        match bus.hart_registry().get_state(hart_id) {
+            HartState::StartPending | HartState::Started => break,
+            _ => thread::sleep(Duration::from_millis(10)),
+        }
     }
 
+    let (addr, opaque, preserve_boot_pc) = bus.hart_registry().wait_for_start(hart_id);
+
     let mut cpu = Cpu::new(entry_pc, hart_id as u64);
-    cpu.setup_smode_boot(); // Enable S-mode operation
+    cpu.setup_smode_boot();
+    apply_hsm_start(&mut cpu, hart_id, addr, opaque, preserve_boot_pc);
+    bus.hart_registry().acknowledge_start(hart_id);
+
     let mut step_count: u64 = 0;
     let start_time = Instant::now();
 
@@ -772,6 +791,28 @@ fn hart_thread(hart_id: usize, entry_pc: u64, bus: Arc<SystemBus>, shared: Arc<S
             break;
         }
 
+        // If sbi_hart_stop parked via the SBI handler, we resume already STARTED.
+        // If stop is observed here, wait for the next sbi_hart_start.
+        match bus.hart_registry().get_state(hart_id) {
+            HartState::Stopped | HartState::StopPending => {
+                loop {
+                    if shared.should_stop() {
+                        return;
+                    }
+                    match bus.hart_registry().get_state(hart_id) {
+                        HartState::StartPending | HartState::Started => break,
+                        _ => thread::sleep(Duration::from_millis(10)),
+                    }
+                }
+                let (addr, opaque, preserve_boot_pc) =
+                    bus.hart_registry().wait_for_start(hart_id);
+                apply_hsm_start(&mut cpu, hart_id, addr, opaque, preserve_boot_pc);
+                bus.hart_registry().acknowledge_start(hart_id);
+                continue;
+            }
+            _ => {}
+        }
+
         let (batch_steps, halt_reason) = execute_batch_worker(&mut cpu, &bus, hart_id, BATCH_SIZE);
         step_count += batch_steps;
 
@@ -781,7 +822,7 @@ fn hart_thread(hart_id: usize, entry_pc: u64, bus: Arc<SystemBus>, shared: Arc<S
                     shared.signal_halted(code);
                     break;
                 }
-                HaltReason::Fatal(msg, pc) => {
+                HaltReason::Fatal(_msg, _pc) => {
                     shared.signal_halted(0xDEAD);
                     break;
                 }
@@ -796,7 +837,7 @@ fn hart_thread(hart_id: usize, entry_pc: u64, bus: Arc<SystemBus>, shared: Arc<S
                 if now.duration_since(last_report_time) >= report_interval {
                     let delta_steps = step_count - last_report_steps;
                     let delta_time = now.duration_since(last_report_time).as_secs_f64();
-                    let current_ips = if delta_time > 0.0 {
+                    let _current_ips = if delta_time > 0.0 {
                         delta_steps as f64 / delta_time
                     } else {
                         0.0
@@ -808,12 +849,23 @@ fn hart_thread(hart_id: usize, entry_pc: u64, bus: Arc<SystemBus>, shared: Arc<S
         }
     }
 
-    let elapsed = start_time.elapsed().as_secs_f64();
-    let ips = if elapsed > 0.0 {
-        step_count as f64 / elapsed
+    let _elapsed = start_time.elapsed().as_secs_f64();
+}
+
+fn apply_hsm_start(
+    cpu: &mut Cpu,
+    hart_id: usize,
+    addr: u64,
+    opaque: u64,
+    preserve_boot_pc: bool,
+) {
+    if preserve_boot_pc || addr == 0 {
+        cpu.pc = cpu.boot_pc;
     } else {
-        0.0
-    };
+        cpu.pc = addr;
+    }
+    cpu.write_reg(Register::X10, hart_id as u64);
+    cpu.write_reg(Register::X11, opaque);
 }
 
 fn execute_batch_worker(
@@ -824,20 +876,8 @@ fn execute_batch_worker(
 ) -> (u64, Option<HaltReason>) {
     let mut count = 0u64;
 
-    // CRITICAL: Sync CLINT interrupt state to CPU's MIP at batch start.
-    // Access MIP directly (bypassing privilege check since this is hardware delivery).
-    const CSR_MIP: usize = 0x344;
-    let (msip, timer) = bus.clint.check_interrupts_for_hart(hart_id);
-    if msip || timer {
-        let mut mip = cpu.csrs[CSR_MIP];
-        if msip {
-            mip |= 1 << 1; // SSIP
-        }
-        if timer {
-            mip |= 1 << 5; // STIP
-        }
-        cpu.csrs[CSR_MIP] = mip;
-    }
+    // Sync hardware mip (MSIP=3, MTIP=7, SEIP=9, MEIP=11) — same mask as Cpu::step.
+    cpu.sync_hw_mip(bus);
 
     for _ in 0..max_steps {
         match cpu.step(bus) {
@@ -851,46 +891,27 @@ fn execute_batch_worker(
                 return (count, Some(HaltReason::Fatal(msg, cpu.pc)));
             }
             Err(Trap::Wfi) => {
-                // WFI: Advance PC past the instruction
                 cpu.pc = cpu.pc.wrapping_add(4);
 
-                // Check if interrupts are already pending from CLINT
-                let (msip, timer) = bus.clint.check_interrupts_for_hart(hart_id);
-                if msip || timer {
-                    // Deliver CLINT interrupts directly to MIP CSR
-                    let mut mip = cpu.csrs[CSR_MIP];
-                    if msip {
-                        mip |= 1 << 1; // SSIP
-                    }
-                    if timer {
-                        mip |= 1 << 5; // STIP
-                    }
-                    cpu.csrs[CSR_MIP] = mip;
-                    
-                    // Check if the CPU can actually take this interrupt (not masked)
-                    if cpu.check_pending_interrupt().is_some() {
-                        // Interrupt is enabled - continue to take trap
-                        continue;
-                    }
-                    // Interrupt is pending but masked - fall through to sleep
-                    // This properly blocks the thread instead of busy-spinning
+                cpu.sync_hw_mip(bus);
+                cpu.force_irq_poll();
+                if cpu.check_pending_interrupt().is_some() {
+                    continue;
                 }
 
-                // No pending interrupts - must sleep to save CPU
                 let now = bus.clint.mtime();
                 let trigger = bus.clint.get_mtimecmp(hart_id);
                 let timeout_ms = if trigger > now {
                     let diff = trigger - now;
                     let ms = diff / TICKS_PER_MS;
-                    // Cap at 100ms, but ensure at least 1ms to prevent busy loop
                     ms.max(1).min(100)
                 } else {
-                    // Timer already passed - still sleep briefly to prevent spin
                     1
                 };
 
-                // Sleep until interrupt or timeout
                 bus.clint.wait_for_interrupt(hart_id, timeout_ms);
+                cpu.sync_hw_mip(bus);
+                cpu.force_irq_poll();
             }
             Err(_) => {
                 // Other architectural traps handled by CPU

@@ -161,6 +161,8 @@ pub struct Cpu {
     /// NaN-boxed into the upper bits per the RISC-V spec.
     pub fregs: [u64; 32],
     pub pc: u64,
+    /// ELF/boot entry. Used when HSM start has PRESERVE_BOOT_PC (`start_addr == 0`).
+    pub boot_pc: u64,
     /// Reservation set address for LR/SC (granule-aligned), or None if no reservation.
     pub(super) reservation: Option<u64>,
     /// Value observed by the most recent LR. SC is implemented as a host
@@ -187,6 +189,17 @@ pub struct Cpu {
     pub use_blocks: bool,
     /// Total retired guest instructions (backs minstret/instret CSRs and MIPS accounting).
     pub instret: u64,
+    /// Last `Bus::fence_seq` applied by this hart (TLB + block cache).
+    pub fence_seq: u32,
+    /// `instret` at last interrupt poll (retired-instruction IRQ budget).
+    pub last_irq_instret: u64,
+    /// Tier-2 promotion policy (consulted on every hot block touch).
+    pub hotness: crate::jit::HotnessPolicy,
+    /// Times `HotnessPolicy::should_jit` returned true (Tier-2 compile requests).
+    pub jit_promotions: u64,
+    /// Cranelift module that owns compiled `Block::jit_fn` pointers.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "jit"))]
+    pub jit: Option<Box<crate::jit::native::JitEngine>>,
 }
 
 impl Cpu {
@@ -210,6 +223,7 @@ impl Cpu {
             regs: [0; 32],
             fregs: [0; 32],
             pc,
+            boot_pc: pc,
             reservation: None,
             reservation_value: 0,
             csrs,
@@ -220,6 +234,12 @@ impl Cpu {
             block_cache: BlockCache::new(),
             use_blocks: true, // Disabled by default; enable for production workloads
             instret: 0,
+            fence_seq: 0,
+            last_irq_instret: 0,
+            hotness: crate::jit::HotnessPolicy::default(),
+            jit_promotions: 0,
+            #[cfg(all(not(target_arch = "wasm32"), feature = "jit"))]
+            jit: None,
         }
     }
 
@@ -243,8 +263,8 @@ impl Cpu {
     /// 8. Initializes HSM state tracking for primary hart
     pub fn setup_smode_boot_with_dtb(&mut self, dtb_address: u64) {
         use super::csr::{
-            CSR_MCOUNTEREN, CSR_MEDELEG, CSR_MHARTID, CSR_MIDELEG, CSR_MSTATUS,
-            CSR_PMPCFG0, CSR_PMPADDR0,
+            CSR_MCOUNTEREN, CSR_MEDELEG, CSR_MHARTID, CSR_MIDELEG, CSR_MSTATUS, CSR_PMPADDR0,
+            CSR_PMPCFG0,
         };
 
         // Delegate exceptions to S-mode:
@@ -274,15 +294,15 @@ impl Cpu {
         // - Supervisor external interrupt (9)
         let mideleg: u64 = (1 << 1)   // Supervisor software interrupt
                         | (1 << 5)   // Supervisor timer interrupt
-                        | (1 << 9);  // Supervisor external interrupt
+                        | (1 << 9); // Supervisor external interrupt
         self.csrs[CSR_MIDELEG as usize] = mideleg;
 
         // Set mstatus.MPP = 01 (Supervisor) so MRET enters S-mode
         // Also set MPIE = 1 so interrupts are enabled after MRET
         let mut mstatus = self.csrs[CSR_MSTATUS as usize];
         mstatus &= !(0b11 << 11); // Clear MPP
-        mstatus |= 0b01 << 11;    // MPP = Supervisor (01)
-        mstatus |= 1 << 7;        // MPIE = 1 (enable interrupts on MRET)
+        mstatus |= 0b01 << 11; // MPP = Supervisor (01)
+        mstatus |= 1 << 7; // MPIE = 1 (enable interrupts on MRET)
         self.csrs[CSR_MSTATUS as usize] = mstatus;
 
         // Enable S-mode access to time/cycle/instret CSRs
@@ -301,24 +321,19 @@ impl Cpu {
         // The kernel will use this instead of reading mhartid CSR
         let hart_id = self.csrs[CSR_MHARTID as usize];
         self.regs[10] = hart_id; // a0 = hart_id
-        
+
         // Set a1 (x11) to DTB address - SBI convention for S-mode kernel entry
         // This must be 8-byte aligned per OpenSBI protocol
         self.regs[11] = dtb_address; // a1 = dtb_address
 
-        // Initialize HSM state tracking - mark primary hart as STARTED
-        if hart_id == 0 {
-            crate::sbi::hsm::init_primary_hart();
-        } else {
-            // Secondary harts start in STOPPED state (default)
-            // They will transition to STARTED when hart_start is called
-        }
+        // HSM: hart 0 is already STARTED in NativeHartRegistry::new / Wasm init_hcbs.
+        // Secondary harts stay STOPPED until sbi_hart_start.
 
         // Set mode to Supervisor directly for emulator simplicity
         // (In real hardware, you'd execute MRET to enter S-mode)
         self.mode = Mode::Supervisor;
     }
-    
+
     /// Configure the CPU for S-mode kernel boot (legacy, no DTB).
     ///
     /// This is a convenience wrapper for backward compatibility.
@@ -326,7 +341,6 @@ impl Cpu {
     pub fn setup_smode_boot(&mut self) {
         self.setup_smode_boot_with_dtb(0);
     }
-
 
     /// Export the current CSR image into a compact map suitable for
     /// serialization in snapshots.
@@ -371,6 +385,17 @@ impl Cpu {
     pub fn invalidate_blocks(&mut self) {
         self.block_cache.flush();
         self.invalidate_decode_cache();
+    }
+
+    /// Apply a remote/local fence if `bus.fence_seq` moved (SBI RFENCE / SFENCE / FENCE.I).
+    #[inline]
+    pub fn sync_fence_seq(&mut self, bus: &dyn Bus) {
+        let seq = bus.fence_seq();
+        if seq != self.fence_seq {
+            self.tlb.flush();
+            self.invalidate_blocks();
+            self.fence_seq = seq;
+        }
     }
 
     pub fn read_reg(&self, reg: Register) -> u64 {
@@ -546,8 +571,12 @@ impl Cpu {
 
     /// Translate a virtual address to a physical address using the MMU.
     ///
+    /// M-mode and `satp.MODE == Bare` are an identity map (VA = PA): no TLB
+    /// and no walk. That is always true for today's guest.
+    ///
     /// On translation failure, this enters the trap handler and returns the
     /// trap via `Err`.
+    #[inline(always)]
     pub(super) fn translate_addr(
         &mut self,
         bus: &dyn Bus,
@@ -557,6 +586,9 @@ impl Cpu {
         insn_raw: Option<u32>,
     ) -> Result<u64, Trap> {
         let satp = self.csrs[CSR_SATP as usize];
+        if mmu::translation_disabled(self.mode, satp) {
+            return Ok(vaddr);
+        }
         let mstatus = self.csrs[CSR_MSTATUS as usize];
         match mmu::translate(bus, &mut self.tlb, self.mode, satp, mstatus, vaddr, access) {
             Ok(pa) => Ok(pa),
@@ -573,6 +605,23 @@ impl Cpu {
     /// Trap: Block ended with a trap
     /// Exit: Block needs to exit to interpreter
     pub(super) fn execute_block_inner(&mut self, block: &Block, bus: &dyn Bus) -> BlockExecResult {
+        if let Some(jit_fn) = block.jit_fn {
+            let ret = unsafe { jit_fn(self as *mut Cpu as *mut u8) };
+            if ret & crate::jit::JIT_SIDE_EXIT == 0 {
+                return BlockExecResult::Continue(ret);
+            }
+            // Side-exit: fall back to the MicroOp loop. Guest PCs are even, so
+            // an odd return cannot be a successful next-PC.
+            let demote_after = self.hotness.demote_after_side_exits;
+            let p = block as *const Block as *mut Block;
+            unsafe {
+                (*p).jit_side_exits = (*p).jit_side_exits.saturating_add(1);
+                if (*p).jit_side_exits > demote_after {
+                    (*p).jit_fn = None;
+                }
+            }
+        }
+
         let base_pc = block.start_pc;
         let len = block.len as usize;
         // ZERO-COPY: Reference the ops array directly instead of copying
@@ -1221,6 +1270,105 @@ impl Cpu {
                 }
 
                 // ═══════════════════════════════════════════════════════════
+                // F/D fast path (in-block; rare FP still InterpOp-exits)
+                // ═══════════════════════════════════════════════════════════
+                MicroOp::Flw {
+                    rd,
+                    rs1,
+                    imm,
+                    pc_offset,
+                } => {
+                    let pc = base_pc.wrapping_add(pc_offset as u64);
+                    if let Err(trap) = self.exec_load_fp(
+                        bus,
+                        Register::from_u32(rd as u32),
+                        Register::from_u32(rs1 as u32),
+                        imm,
+                        2,
+                        pc,
+                    ) {
+                        return self.block_trap(trap, pc);
+                    }
+                }
+
+                MicroOp::Fld {
+                    rd,
+                    rs1,
+                    imm,
+                    pc_offset,
+                } => {
+                    let pc = base_pc.wrapping_add(pc_offset as u64);
+                    if let Err(trap) = self.exec_load_fp(
+                        bus,
+                        Register::from_u32(rd as u32),
+                        Register::from_u32(rs1 as u32),
+                        imm,
+                        3,
+                        pc,
+                    ) {
+                        return self.block_trap(trap, pc);
+                    }
+                }
+
+                MicroOp::Fsw {
+                    rs1,
+                    rs2,
+                    imm,
+                    pc_offset,
+                } => {
+                    let pc = base_pc.wrapping_add(pc_offset as u64);
+                    if let Err(trap) = self.exec_store_fp(
+                        bus,
+                        Register::from_u32(rs1 as u32),
+                        Register::from_u32(rs2 as u32),
+                        imm,
+                        2,
+                        pc,
+                    ) {
+                        return self.block_trap(trap, pc);
+                    }
+                }
+
+                MicroOp::Fsd {
+                    rs1,
+                    rs2,
+                    imm,
+                    pc_offset,
+                } => {
+                    let pc = base_pc.wrapping_add(pc_offset as u64);
+                    if let Err(trap) = self.exec_store_fp(
+                        bus,
+                        Register::from_u32(rs1 as u32),
+                        Register::from_u32(rs2 as u32),
+                        imm,
+                        3,
+                        pc,
+                    ) {
+                        return self.block_trap(trap, pc);
+                    }
+                }
+
+                MicroOp::OpFp {
+                    rd,
+                    rs1,
+                    rs2,
+                    funct7,
+                    rm,
+                    pc_offset,
+                } => {
+                    let pc = base_pc.wrapping_add(pc_offset as u64);
+                    if let Err(trap) = self.exec_op_fp(
+                        Register::from_u32(rd as u32),
+                        Register::from_u32(rs1 as u32),
+                        Register::from_u32(rs2 as u32),
+                        funct7 as u32,
+                        rm as u32,
+                    ) {
+                        return self.block_trap(trap, pc);
+                    }
+                }
+
+                // ═══════════════════════════════════════════════════════════
                 // Control flow (block terminators)
                 // ═══════════════════════════════════════════════════════════
                 MicroOp::Jal {
@@ -1397,7 +1545,7 @@ impl Cpu {
                     let is_word = matches!(op, MicroOp::ScW { .. });
                     let addr = self.regs[rs1 as usize];
                     let pc = base_pc.wrapping_add(pc_offset as u64);
-                    let pa = match self.translate_addr_for_block(bus, addr, MmuAccessType::Load) {
+                    let pa = match self.translate_addr_for_block(bus, addr, MmuAccessType::Store) {
                         Ok(pa) => pa,
                         Err(trap) => return self.block_trap(trap, pc),
                     };
@@ -1437,22 +1585,74 @@ impl Cpu {
                 | MicroOp::AmoMinu { .. }
                 | MicroOp::AmoMaxu { .. } => {
                     let (rd, rs1, rs2, is_word, pc_offset) = match op {
-                        MicroOp::AmoSwap { rd, rs1, rs2, is_word, pc_offset }
-                        | MicroOp::AmoAdd { rd, rs1, rs2, is_word, pc_offset }
-                        | MicroOp::AmoXor { rd, rs1, rs2, is_word, pc_offset }
-                        | MicroOp::AmoAnd { rd, rs1, rs2, is_word, pc_offset }
-                        | MicroOp::AmoOr { rd, rs1, rs2, is_word, pc_offset }
-                        | MicroOp::AmoMin { rd, rs1, rs2, is_word, pc_offset }
-                        | MicroOp::AmoMax { rd, rs1, rs2, is_word, pc_offset }
-                        | MicroOp::AmoMinu { rd, rs1, rs2, is_word, pc_offset }
-                        | MicroOp::AmoMaxu { rd, rs1, rs2, is_word, pc_offset } => {
-                            (rd, rs1, rs2, is_word, pc_offset)
+                        MicroOp::AmoSwap {
+                            rd,
+                            rs1,
+                            rs2,
+                            is_word,
+                            pc_offset,
                         }
+                        | MicroOp::AmoAdd {
+                            rd,
+                            rs1,
+                            rs2,
+                            is_word,
+                            pc_offset,
+                        }
+                        | MicroOp::AmoXor {
+                            rd,
+                            rs1,
+                            rs2,
+                            is_word,
+                            pc_offset,
+                        }
+                        | MicroOp::AmoAnd {
+                            rd,
+                            rs1,
+                            rs2,
+                            is_word,
+                            pc_offset,
+                        }
+                        | MicroOp::AmoOr {
+                            rd,
+                            rs1,
+                            rs2,
+                            is_word,
+                            pc_offset,
+                        }
+                        | MicroOp::AmoMin {
+                            rd,
+                            rs1,
+                            rs2,
+                            is_word,
+                            pc_offset,
+                        }
+                        | MicroOp::AmoMax {
+                            rd,
+                            rs1,
+                            rs2,
+                            is_word,
+                            pc_offset,
+                        }
+                        | MicroOp::AmoMinu {
+                            rd,
+                            rs1,
+                            rs2,
+                            is_word,
+                            pc_offset,
+                        }
+                        | MicroOp::AmoMaxu {
+                            rd,
+                            rs1,
+                            rs2,
+                            is_word,
+                            pc_offset,
+                        } => (rd, rs1, rs2, is_word, pc_offset),
                         _ => unreachable!(),
                     };
                     let addr = self.regs[rs1 as usize];
                     let pc = base_pc.wrapping_add(pc_offset as u64);
-                    let pa = match self.translate_addr_for_block(bus, addr, MmuAccessType::Load) {
+                    let pa = match self.translate_addr_for_block(bus, addr, MmuAccessType::Store) {
                         Ok(pa) => pa,
                         Err(trap) => return self.block_trap(trap, pc),
                     };
@@ -1506,6 +1706,13 @@ impl Cpu {
                     return self.block_exit(pc);
                 }
 
+                MicroOp::FenceI { pc_offset } => {
+                    // FENCE.I: drop stale superblocks via the interpreter so we
+                    // do not invalidate the cache while `block` is still borrowed.
+                    let pc = base_pc.wrapping_add(pc_offset as u64);
+                    return self.block_exit(pc);
+                }
+
                 MicroOp::InterpOp { pc_offset } => {
                     // No micro-op encoding (FP instruction): hand to interpreter.
                     let pc = base_pc.wrapping_add(pc_offset as u64);
@@ -1529,10 +1736,7 @@ impl Cpu {
     #[inline(always)]
     fn block_trap(&mut self, trap: Trap, fault_pc: u64) -> BlockExecResult {
         self.instret = self.instret.wrapping_sub(1);
-        BlockExecResult::Trap {
-            trap,
-            fault_pc,
-        }
+        BlockExecResult::Trap { trap, fault_pc }
     }
 
     /// Build an Exit result from block execution, un-counting the exiting
@@ -1540,19 +1744,23 @@ impl Cpu {
     #[inline(always)]
     fn block_exit(&mut self, next_pc: u64) -> BlockExecResult {
         self.instret = self.instret.wrapping_sub(1);
-        BlockExecResult::Exit {
-            next_pc,
-        }
+        BlockExecResult::Exit { next_pc }
     }
 
-    /// Translate address without entering trap handler (for block execution)
-    fn translate_addr_for_block(
+    /// Translate address without entering trap handler (for block execution
+    /// and FP helpers that let the caller raise the trap).
+    /// Bare / M-mode skip the TLB and page-table walk (VA is PA).
+    #[inline(always)]
+    pub(super) fn translate_addr_for_block(
         &mut self,
         bus: &dyn Bus,
         vaddr: u64,
         access: MmuAccessType,
     ) -> Result<u64, Trap> {
         let satp = self.csrs[CSR_SATP as usize];
+        if mmu::translation_disabled(self.mode, satp) {
+            return Ok(vaddr);
+        }
         let mstatus = self.csrs[CSR_MSTATUS as usize];
         mmu::translate(bus, &mut self.tlb, self.mode, satp, mstatus, vaddr, access)
     }
@@ -2248,7 +2456,10 @@ mod tests {
         let res = cpu.step(&bus);
         match res {
             Err(Trap::LoadAddressMisaligned(a)) => assert_eq!(a, 0x0200_0001),
-            _ => panic!("Expected LoadAddressMisaligned trap for MMIO, got {:?}", res),
+            _ => panic!(
+                "Expected LoadAddressMisaligned trap for MMIO, got {:?}",
+                res
+            ),
         }
     }
 

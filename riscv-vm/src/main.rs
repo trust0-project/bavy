@@ -3,6 +3,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use riscv_vm::Machine;
 use riscv_vm::sdboot;
 use riscv_vm::vm::native::NativeVm;
 
@@ -35,6 +36,10 @@ struct Args {
     /// Number of harts (CPUs), 0 for auto-detect
     #[arg(short = 'n', long, default_value = "0")]
     harts: usize,
+
+    /// Guest board: virt (QEMU-virt, 10 MHz timebase) or d1 (Allwinner, 24 MHz)
+    #[arg(long, default_value = "virt")]
+    machine: String,
 
     /// WebTransport relay URL for networking (e.g., https://127.0.0.1:4433)
     #[arg(long)]
@@ -178,12 +183,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let boot_info = sdboot::parse_sdcard(&sdcard_data)
         .map_err(|e| format!("Failed to parse SD card: {}", e))?;
 
-    // Determine hart count
+    let machine = Machine::parse(&args.machine).ok_or_else(|| {
+        format!(
+            "unknown machine {:?}; expected virt or d1",
+            args.machine
+        )
+    })?;
+
+    // Determine hart count.
+    // `--harts 0` uses the machine default (virt: host CPUs, d1: 1).
+    // D1 stays at 1 unless the user explicitly passes `--harts`.
+    let host_cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
     let num_harts = if args.harts == 0 {
-        // Auto-detect: use all available CPUs since idle harts sleep via WFI
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
+        machine.default_harts_native(host_cpus)
     } else {
         args.harts
     }
@@ -216,6 +230,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ""
     );
     uart_println!("║  Harts:   {:52} ║", num_harts);
+    uart_println!(
+        "║  Machine: {:52} ║",
+        format!("{} (timebase {} Hz)", machine.as_str(), machine.timebase_hz())
+    );
     if let Some(relay) = &args.net_webtransport {
         uart_println!("║  Network: {:52} ║", relay);
     }
@@ -223,7 +241,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     uart_println!();
 
     // Create VM with kernel from SD card
-    let mut vm = NativeVm::new(&boot_info.kernel_data, num_harts)?;
+    let mut vm = NativeVm::with_machine(&boot_info.kernel_data, num_harts, machine)?;
 
     // Load entire SD card as block device (for filesystem partition)
     vm.load_disk(sdcard_data);
@@ -476,33 +494,37 @@ fn run_with_gui(mut vm: NativeVm, scale_factor: u8) -> Result<(), Box<dyn std::e
         }
         let _ = std::io::stdout().flush();
 
-        // Read frame version from guest memory
-        const FRAME_VERSION_PHYS_ADDR: u64 = 0x80FF_FFFC;
-        let dram_offset = FRAME_VERSION_PHYS_ADDR - riscv_vm::bus::DRAM_BASE;
-        let frame_version = bus.dram.load_32(dram_offset).unwrap_or(0);
+        // Read frame version from guest memory (virt DRAM-relative protocol)
+        if bus.machine == Machine::Virt {
+            const FRAME_VERSION_PHYS_ADDR: u64 = 0x80FF_FFFC;
+            let dram_offset = FRAME_VERSION_PHYS_ADDR - bus.dram_base();
+            let frame_version = bus.dram.load_32(dram_offset).unwrap_or(0);
 
-        // Update frame only if changed
-        if frame_version != last_frame_version {
-            last_frame_version = frame_version;
-            
-            // Read framebuffer from guest memory
-            const FRAMEBUFFER_PHYS_ADDR: u64 = 0x8100_0000;
-            const FB_SIZE_BYTES: usize = 1024 * 768 * 4;
-            let fb_offset = (FRAMEBUFFER_PHYS_ADDR - riscv_vm::bus::DRAM_BASE) as usize;
-            
-            if let Ok(bytes) = bus.dram.read_range(fb_offset, FB_SIZE_BYTES) {
-                // Convert RGBA u8 to ARGB u32 for minifb
-                let frame: Vec<u32> = bytes.chunks_exact(4).map(|c| {
-                    ((c[3] as u32) << 24) | ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | (c[2] as u32)
-                }).collect();
-                
-                if let Err(e) = window.update_with_buffer(&frame, width, height) {
-                    eprintln!("[GUI] Failed to update window: {}", e);
-                    break;
+            // Update frame only if changed
+            if frame_version != last_frame_version {
+                last_frame_version = frame_version;
+
+                // Read framebuffer from guest memory
+                const FRAMEBUFFER_PHYS_ADDR: u64 = 0x8100_0000;
+                const FB_SIZE_BYTES: usize = 1024 * 768 * 4;
+                let fb_offset = (FRAMEBUFFER_PHYS_ADDR - bus.dram_base()) as usize;
+
+                if let Ok(bytes) = bus.dram.read_range(fb_offset, FB_SIZE_BYTES) {
+                    // Convert RGBA u8 to ARGB u32 for minifb
+                    let frame: Vec<u32> = bytes.chunks_exact(4).map(|c| {
+                        ((c[3] as u32) << 24) | ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | (c[2] as u32)
+                    }).collect();
+
+                    if let Err(e) = window.update_with_buffer(&frame, width, height) {
+                        eprintln!("[GUI] Failed to update window: {}", e);
+                        break;
+                    }
                 }
+            } else {
+                // Still need to update window to process events
+                window.update();
             }
         } else {
-            // Still need to update window to process events
             window.update();
         }
     }

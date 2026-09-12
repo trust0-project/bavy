@@ -245,4 +245,49 @@ mod tests {
             a.raw(sraiw(10, 5, 2));
         });
     }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn diff_jit_addi_add_loop() {
+        // Loop body is integer-only (addi/add/bne) so it is eligible for JIT.
+        // Threshold 1 forces compile on the first hot touch; final regs/PC
+        // must still match the interpreter.
+        let bytes = {
+            let mut a = Asm::new();
+            a.raw(addi(5, 0, 0));
+            a.raw(addi(6, 0, 0));
+            a.raw(addi(7, 0, 250));
+            a.label("loop");
+            a.raw(addi(5, 5, 1));
+            a.raw(add(6, 6, 5));
+            a.branch(bcond::NE, 5, 7, "loop");
+            a.label("done");
+            a.jump(0, "done");
+            a.assemble()
+        };
+
+        let mut probe = Runner::new(&bytes, false);
+        let mut halt_pc = 0u64;
+        for _ in 0..200_000 {
+            let before = probe.cpu.pc;
+            let _ = probe.cpu.step(&probe.bus);
+            if probe.cpu.pc == before {
+                halt_pc = before;
+                break;
+            }
+        }
+        assert!(halt_pc != 0);
+
+        let mut tier0 = Runner::new(&bytes, false);
+        let mut tier1 = Runner::new(&bytes, true);
+        tier1.cpu.hotness.jit_threshold = 1;
+        tier0.run_to(halt_pc, 200_000);
+        tier1.run_to(halt_pc, 200_000);
+        ArchState::capture(&tier0.cpu)
+            .assert_eq(&ArchState::capture(&tier1.cpu), "interpreter-vs-jit");
+        assert!(
+            tier1.cpu.block_cache.jitted_count() > 0,
+            "JIT did not compile the addi/add loop"
+        );
+    }
 }

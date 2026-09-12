@@ -55,7 +55,7 @@ pub struct Dram {
     #[cfg(not(target_arch = "wasm32"))]
     size: usize, // Cached size (immutable after creation)
     #[cfg(not(target_arch = "wasm32"))]
-    data: UnsafeCell<Vec<u8>>, // Lock-free memory access
+    data: UnsafeCell<NativeDram>, // Lock-free memory access
 
     #[cfg(target_arch = "wasm32")]
     backing: WasmBacking,
@@ -115,6 +115,113 @@ const DATA_ORDER: Ordering = Ordering::SeqCst;
 #[cfg(all(not(target_arch = "wasm32"), not(feature = "strict-memory")))]
 const DATA_ORDER: Ordering = Ordering::Relaxed;
 
+/// Guest RAM backing. `Vec` is the portable fallback; `Map` is a 2 MiB-aligned
+/// `posix_memalign` buffer so the host can attach huge/super pages.
+#[cfg(not(target_arch = "wasm32"))]
+enum NativeDram {
+    Vec(Vec<u8>),
+    #[cfg(unix)]
+    Map { ptr: *mut u8, len: usize },
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl NativeDram {
+    fn len(&self) -> usize {
+        match self {
+            Self::Vec(v) => v.len(),
+            #[cfg(unix)]
+            Self::Map { len, .. } => *len,
+        }
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        match self {
+            Self::Vec(v) => v.as_ptr(),
+            #[cfg(unix)]
+            Self::Map { ptr, .. } => *ptr,
+        }
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        match self {
+            Self::Vec(v) => v.as_mut_ptr(),
+            #[cfg(unix)]
+            Self::Map { ptr, .. } => *ptr,
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.as_ptr(), self.len()) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.as_mut_ptr(), self.len()) }
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), unix))]
+impl Drop for NativeDram {
+    fn drop(&mut self) {
+        if let Self::Map { ptr, .. } = self {
+            unsafe {
+                libc::free(*ptr as *mut libc::c_void);
+            }
+        }
+    }
+}
+
+/// Minimum size at which huge/super pages are worth requesting (2 MiB).
+#[cfg(not(target_arch = "wasm32"))]
+const HUGEPAGE_MIN: usize = 2 * 1024 * 1024;
+
+/// Hint the kernel to back `ptr..ptr+len` with huge pages. Failures are ignored.
+#[cfg(not(target_arch = "wasm32"))]
+fn advise_hugepages(ptr: *mut u8, len: usize) {
+    if len < HUGEPAGE_MIN {
+        return;
+    }
+    #[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
+    unsafe {
+        let _ = libc::madvise(ptr as *mut libc::c_void, len, libc::MADV_HUGEPAGE);
+    }
+    #[cfg(all(unix, target_os = "macos"))]
+    {
+        // Darwin has no MADV_HUGEPAGE. Alignment is requested at mmap time.
+        let _ = ptr;
+        let _ = len;
+    }
+}
+
+/// Best-effort 2 MiB-aligned allocation. `None` on failure (caller uses Vec).
+#[cfg(all(not(target_arch = "wasm32"), unix))]
+fn try_aligned_alloc(size: usize) -> Option<NativeDram> {
+    if size < HUGEPAGE_MIN {
+        return None;
+    }
+    let mut ptr: *mut libc::c_void = std::ptr::null_mut();
+    let rc = unsafe { libc::posix_memalign(&mut ptr, HUGEPAGE_MIN, size) };
+    if rc != 0 || ptr.is_null() {
+        return None;
+    }
+    unsafe {
+        std::ptr::write_bytes(ptr as *mut u8, 0, size);
+        let ptr = ptr as *mut u8;
+        advise_hugepages(ptr, size);
+        Some(NativeDram::Map { ptr, len: size })
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn alloc_native_dram(size: usize) -> NativeDram {
+    #[cfg(unix)]
+    if let Some(mapped) = try_aligned_alloc(size) {
+        return mapped;
+    }
+    let mut data = vec![0; size];
+    advise_hugepages(data.as_mut_ptr(), size);
+    NativeDram::Vec(data)
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 impl Dram {
     /// Create a new DRAM image of `size` bytes, zero-initialised.
@@ -122,7 +229,7 @@ impl Dram {
         Self {
             base,
             size,
-            data: UnsafeCell::new(vec![0; size]),
+            data: UnsafeCell::new(alloc_native_dram(size)),
         }
     }
 
@@ -138,9 +245,8 @@ impl Dram {
     /// Caller must ensure proper synchronization for atomic operations.
     #[inline(always)]
     unsafe fn mem_ptr(&self) -> *mut u8 {
-        // SAFETY: UnsafeCell::get() returns a raw pointer which we dereference
-        // to get the Vec's data pointer. This is safe because the Vec lives
-        // for the lifetime of Dram.
+        // SAFETY: UnsafeCell::get() returns a raw pointer to NativeDram for
+        // the lifetime of Dram.
         unsafe { (*self.data.get()).as_mut_ptr() }
     }
 
@@ -325,15 +431,14 @@ impl Dram {
         }
         // SAFETY: Bounds checked
         unsafe {
-            let mem = &*self.data.get();
-            Ok(mem[offset..offset + len].to_vec())
+            Ok((*self.data.get()).as_slice()[offset..offset + len].to_vec())
         }
     }
 
     /// Get a clone of all DRAM contents (for snapshots).
     pub fn get_data(&self) -> Vec<u8> {
         // SAFETY: Clone is atomic enough for snapshots
-        unsafe { (*self.data.get()).clone() }
+        unsafe { (*self.data.get()).as_slice().to_vec() }
     }
 
     /// Replace all DRAM contents (for snapshot restore).
@@ -343,7 +448,7 @@ impl Dram {
         }
         // SAFETY: Size checked, restore should be done while VM is paused
         unsafe {
-            (*self.data.get()).clone_from_slice(data);
+            (*self.data.get()).as_mut_slice().copy_from_slice(data);
         }
         Ok(())
     }

@@ -17,45 +17,76 @@ use crate::Mode;
 use crate::Trap;
 use crate::bus::Bus;
 use crate::devices::clint::{CLINT_BASE, MTIME_OFFSET};
-use crate::engine::block::{Block, BlockCompiler, CompileResult, MAX_BLOCK_SIZE};
+use crate::engine::block::{Block, BlockCompiler, CompileResult};
 use crate::engine::decoder::{self, Op, Register};
-use crate::engine::microop::MicroOp;
 use crate::mmu::AccessType as MmuAccessType;
 
+/// Retired-instruction budget between hardware interrupt polls.
+/// One `step()` can retire a whole superblock chain, so wrapping `poll_counter`
+/// (once per step) is not a 256-insn bound.
+pub const IRQ_POLL_BUDGET: u64 = 4096;
+
+/// Hardware-driven mip bits from [`Bus::poll_interrupts_for_hart`].
+/// CLINT MSIP → bit 3, timer → bit 7; PLIC SEIP=9, MEIP=11.
+/// SSIP/STIP (1/5) are software/Sstc bits; `sip` aliases those from mip.
+pub const HW_MIP_MASK: u64 = (1 << 3) | (1 << 7) | (1 << 9) | (1 << 11);
+
 impl Cpu {
-    pub fn step(&mut self, bus: &dyn Bus) -> Result<(), Trap> {
-        // Batch interrupt polling: only check every 256 instructions for performance.
-        self.poll_counter = self.poll_counter.wrapping_add(1);
+    #[inline]
+    fn irq_budget_exceeded(&self) -> bool {
+        self.instret.wrapping_sub(self.last_irq_instret) >= IRQ_POLL_BUDGET
+    }
 
-        if self.poll_counter == 0 {
-            // Poll device-driven interrupts into MIP mask.
-            let hart_id = self.csrs[CSR_MHARTID as usize] as usize;
-            let mut hw_mip = bus.poll_interrupts_for_hart(hart_id);
+    #[inline]
+    fn irq_poll_due(&self) -> bool {
+        self.poll_counter == 0 || self.irq_budget_exceeded()
+    }
 
-            // Sstc support: raise STIP (bit 5) when time >= stimecmp and Sstc enabled.
-            let menvcfg = self.csrs[CSR_MENVCFG as usize];
-            let sstc_enabled = ((menvcfg >> 63) & 1) == 1;
-            let stimecmp = self.csrs[CSR_STIMECMP as usize];
-            if sstc_enabled && stimecmp != 0 {
-                if let Ok(now) = bus.read64(CLINT_BASE + MTIME_OFFSET) {
-                    if now >= stimecmp {
-                        hw_mip |= 1 << 5; // STIP
-                    }
+    /// Write CLINT/PLIC pending bits into mip (MSIP=3, MTIP=7, SEIP=9, MEIP=11).
+    ///
+    /// When Sstc is enabled, also drive STIP (bit 5) from `stimecmp`. Does **not**
+    /// inject SSIP/STIP from CLINT MSIP/MTIP — host WFI must use this same mask.
+    pub fn sync_hw_mip(&mut self, bus: &dyn Bus) {
+        let hart_id = self.csrs[CSR_MHARTID as usize] as usize;
+        let mut hw_mip = bus.poll_interrupts_for_hart(hart_id);
+
+        let menvcfg = self.csrs[CSR_MENVCFG as usize];
+        let sstc_enabled = ((menvcfg >> 63) & 1) == 1;
+        let stimecmp = self.csrs[CSR_STIMECMP as usize];
+        if sstc_enabled && stimecmp != 0 {
+            if let Ok(now) = bus.read64(CLINT_BASE + MTIME_OFFSET) {
+                if now >= stimecmp {
+                    hw_mip |= 1 << 5; // STIP (Sstc)
                 }
             }
+        }
 
-            // Update MIP
-            let hw_bits: u64 = (1 << 3) | (1 << 7) | (1 << 9) | (1 << 11);
-            let hw_bits_with_stip: u64 = hw_bits | (1 << 5);
-            let mask = if sstc_enabled {
-                hw_bits_with_stip
-            } else {
-                hw_bits
-            };
-            let old_mip = self.csrs[CSR_MIP as usize];
-            self.csrs[CSR_MIP as usize] = (old_mip & !mask) | (hw_mip & mask);
+        let mask = if sstc_enabled {
+            HW_MIP_MASK | (1 << 5)
+        } else {
+            HW_MIP_MASK
+        };
+        let old_mip = self.csrs[CSR_MIP as usize];
+        self.csrs[CSR_MIP as usize] = (old_mip & !mask) | (hw_mip & mask);
+    }
 
-            if let Some(trap) = self.check_pending_interrupt() {
+    fn poll_hw_interrupts(&mut self, bus: &dyn Bus) -> Option<Trap> {
+        self.sync_hw_mip(bus);
+        self.last_irq_instret = self.instret;
+        self.check_pending_interrupt()
+    }
+
+    /// Force the next `step()` to poll (WFI wakeup). `poll_counter` wraps on increment.
+    pub fn force_irq_poll(&mut self) {
+        self.poll_counter = 255;
+    }
+
+    pub fn step(&mut self, bus: &dyn Bus) -> Result<(), Trap> {
+        self.sync_fence_seq(bus);
+        self.poll_counter = self.poll_counter.wrapping_add(1);
+
+        if self.irq_poll_due() {
+            if let Some(trap) = self.poll_hw_interrupts(bus) {
                 return self.handle_trap(trap, self.pc, None);
             }
         }
@@ -71,18 +102,38 @@ impl Cpu {
         self.step_single_inner(bus)
     }
 
-    /// Try to execute a compiled block at current PC.
-    /// Returns Some(result) if block was executed, None if should fall back to interpreter.
-    /// 
-    /// Block Chaining: When a block ends with a known next_block_pc (JAL target or fallthrough),
-    /// we jump directly to the next cached block without returning to step(). This reduces
-    /// dispatch overhead for hot code paths.
-    fn try_execute_block(&mut self, bus: &dyn Bus) -> Option<Result<(), Trap>> {
-        let mut current_pc = self.pc;
-        // Chain limit bounds interrupt latency: chained blocks skip the
-        // dispatcher's interrupt poll. 64 blocks x <=64 ops sits well inside
-        // the 256-instruction poll budget used elsewhere.
+    /// Continue chaining only while depth and the retired-instruction IRQ budget
+    /// allow it. Polls and breaks the chain when the budget is exceeded so one
+    /// `step()` cannot run 64×64 ops without checking interrupts.
+    fn continue_superblock_chain(
+        &mut self,
+        bus: &dyn Bus,
+        chain_count: u32,
+        next_block_pc: Option<u64>,
+        next_pc: u64,
+    ) -> Result<bool, Trap> {
         const MAX_CHAIN_DEPTH: u32 = 64;
+        if chain_count >= MAX_CHAIN_DEPTH {
+            return Ok(false);
+        }
+        if next_block_pc != Some(next_pc) {
+            return Ok(false);
+        }
+        if self.irq_budget_exceeded() {
+            self.sync_fence_seq(bus);
+            if let Some(trap) = self.poll_hw_interrupts(bus) {
+                return Err(trap);
+            }
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// Try to execute a compiled block at current PC.
+    /// Returns Some(result) if a block was executed, None to fall back to the interpreter.
+    fn try_execute_block(&mut self, bus: &dyn Bus) -> Option<Result<(), Trap>> {
+        self.sync_fence_seq(bus);
+        let mut current_pc = self.pc;
         let mut chain_count = 0u32;
 
         loop {
@@ -97,35 +148,63 @@ impl Cpu {
                     None
                 }
             }; // Borrow of block_cache ends here
-            
+
             if let Some((block_ptr, next_block_pc)) = block_ptr_and_meta {
                 // SAFETY: The raw pointer is valid because:
                 // 1. It was just obtained from block_cache.get_and_touch()
                 // 2. block_cache is not modified during execute_block_inner
                 // 3. We hold &mut self, so no other code can access block_cache
+                let exec_count = unsafe { (*block_ptr).exec_count };
+                if self.hotness.should_jit(exec_count) {
+                    self.jit_promotions = self.jit_promotions.saturating_add(1);
+                    #[cfg(all(not(target_arch = "wasm32"), feature = "jit"))]
+                    {
+                        // Copy MicroOps first so we never hold `&Block` from the
+                        // cache together with `&mut Cpu` (Cpu owns the cache).
+                        if unsafe { (*block_ptr).jit_fn.is_none() } {
+                            use crate::engine::block::MAX_BLOCK_SIZE;
+                            use crate::engine::microop::MicroOp;
+                            let start_pc = unsafe { (*block_ptr).start_pc };
+                            let byte_len = unsafe { (*block_ptr).byte_len };
+                            let n = unsafe { (*block_ptr).len as usize };
+                            let mut ops = [MicroOp::Fence; MAX_BLOCK_SIZE];
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(
+                                    core::ptr::addr_of!((*block_ptr).ops).cast::<MicroOp>(),
+                                    ops.as_mut_ptr(),
+                                    n,
+                                );
+                            }
+                            crate::jit::native::ensure_compiled(
+                                self,
+                                start_pc,
+                                &ops[..n],
+                                byte_len,
+                            );
+                        }
+                    }
+                }
                 let block = unsafe { &*block_ptr };
                 let result = self.execute_block_inner(block, bus);
-                
+
                 // Handle block result
                 match result {
                     crate::cpu::core::BlockExecResult::Continue(next_pc) => {
                         self.pc = next_pc;
-                        
-                        // Block Chaining: if we have a known next block and haven't chained too many,
-                        // try to jump directly to it
                         chain_count += 1;
-                        if chain_count < MAX_CHAIN_DEPTH {
-                            if let Some(chain_pc) = next_block_pc {
-                                if chain_pc == next_pc {
-                                    // Target matches - try to chain
-                                    current_pc = next_pc;
-                                    continue;
-                                }
+                        match self.continue_superblock_chain(
+                            bus,
+                            chain_count,
+                            next_block_pc,
+                            next_pc,
+                        ) {
+                            Ok(true) => {
+                                current_pc = next_pc;
+                                continue;
                             }
+                            Ok(false) => return Some(Ok(())),
+                            Err(trap) => return Some(self.handle_trap(trap, self.pc, None)),
                         }
-                        
-                        // No chaining - return to main loop
-                        return Some(Ok(()));
                     }
                     crate::cpu::core::BlockExecResult::Trap { trap, fault_pc } => {
                         return Some(self.handle_trap(trap, fault_pc, None));
@@ -169,6 +248,8 @@ impl Cpu {
                         exec_count: 0,
                         generation: block.generation,
                         next_block_pc: block.next_block_pc,
+                        jit_fn: None,
+                        jit_side_exits: 0,
                     };
                     let next_block_pc = block.next_block_pc;
 
@@ -178,19 +259,20 @@ impl Cpu {
                     match result {
                         crate::cpu::core::BlockExecResult::Continue(next_pc) => {
                             self.pc = next_pc;
-                            
-                            // Try chaining for newly compiled block too
                             chain_count += 1;
-                            if chain_count < MAX_CHAIN_DEPTH {
-                                if let Some(chain_pc) = next_block_pc {
-                                    if chain_pc == next_pc {
-                                        current_pc = next_pc;
-                                        continue;
-                                    }
+                            match self.continue_superblock_chain(
+                                bus,
+                                chain_count,
+                                next_block_pc,
+                                next_pc,
+                            ) {
+                                Ok(true) => {
+                                    current_pc = next_pc;
+                                    continue;
                                 }
+                                Ok(false) => return Some(Ok(())),
+                                Err(trap) => return Some(self.handle_trap(trap, self.pc, None)),
                             }
-                            
-                            return Some(Ok(()));
                         }
                         crate::cpu::core::BlockExecResult::Trap { trap, fault_pc } => {
                             return Some(self.handle_trap(trap, fault_pc, None));
@@ -210,34 +292,10 @@ impl Cpu {
     /// Execute a single instruction (interpreter mode).
     /// This is the original step() implementation without the interrupt check.
     pub(super) fn step_single(&mut self, bus: &dyn Bus) -> Result<(), Trap> {
-        // Check interrupts (needed when called from block exit)
+        self.sync_fence_seq(bus);
         self.poll_counter = self.poll_counter.wrapping_add(1);
-        if self.poll_counter == 0 {
-            let hart_id = self.csrs[CSR_MHARTID as usize] as usize;
-            let mut hw_mip = bus.poll_interrupts_for_hart(hart_id);
-
-            let menvcfg = self.csrs[CSR_MENVCFG as usize];
-            let sstc_enabled = ((menvcfg >> 63) & 1) == 1;
-            let stimecmp = self.csrs[CSR_STIMECMP as usize];
-            if sstc_enabled && stimecmp != 0 {
-                if let Ok(now) = bus.read64(CLINT_BASE + MTIME_OFFSET) {
-                    if now >= stimecmp {
-                        hw_mip |= 1 << 5;
-                    }
-                }
-            }
-
-            let hw_bits: u64 = (1 << 3) | (1 << 7) | (1 << 9) | (1 << 11);
-            let hw_bits_with_stip: u64 = hw_bits | (1 << 5);
-            let mask = if sstc_enabled {
-                hw_bits_with_stip
-            } else {
-                hw_bits
-            };
-            let old_mip = self.csrs[CSR_MIP as usize];
-            self.csrs[CSR_MIP as usize] = (old_mip & !mask) | (hw_mip & mask);
-
-            if let Some(trap) = self.check_pending_interrupt() {
+        if self.irq_poll_due() {
+            if let Some(trap) = self.poll_hw_interrupts(bus) {
                 return self.handle_trap(trap, self.pc, None);
             }
         }
@@ -741,8 +799,15 @@ impl Cpu {
             } => {
                 let addr = self.read_reg(rs1);
 
-                // Translate once per AMO/LD/ST sequence.
-                let pa = self.translate_addr(bus, addr, MmuAccessType::Load, pc, Some(insn_raw))?;
+                // LR is a load. SC and AMO are RMW: they need store (R+W)
+                // permission, otherwise a write to a read-only page would
+                // raise a load-page-fault.
+                let access = if funct5 == 0b00010 {
+                    MmuAccessType::Load
+                } else {
+                    MmuAccessType::Store
+                };
+                let pa = self.translate_addr(bus, addr, access, pc, Some(insn_raw))?;
 
                 // Only word (funct3=2) and doubleword (funct3=3) widths are valid.
                 let is_word = match funct3 {
@@ -923,10 +988,12 @@ impl Cpu {
                                     Some(insn_raw),
                                 );
                             }
-                            // Simplest implementation: flush entire TLB.
+                            // SFENCE.VMA: drop TLB + superblocks locally and bump
+                            // fence_seq so remote harts drop theirs in sync_fence_seq.
                             self.tlb.flush();
-                            // Also invalidate decode cache (PC->PA mappings may have changed)
-                            self.invalidate_decode_cache();
+                            self.invalidate_blocks();
+                            bus.bump_fence_seq();
+                            self.fence_seq = bus.fence_seq();
                         } else {
                             match insn_raw {
                                 0x0010_0073 => {
@@ -942,12 +1009,20 @@ impl Cpu {
                                     // ECALL - route based on current privilege mode
                                     // For S-mode, try SBI call first before trapping
                                     if self.mode == Mode::Supervisor {
-                                        if crate::sbi::handle_sbi_call(self, bus) {
-                                            // SBI handled the call, advance PC and continue
-                                            next_pc = pc.wrapping_add(insn_len as u64);
-                                            self.pc = next_pc;
-                                            self.instret = self.instret.wrapping_add(1);
-                                            return Ok(());
+                                        match crate::sbi::handle_sbi_call(self, bus) {
+                                            Ok(crate::sbi::SbiCallResult::Handled) => {
+                                                next_pc = pc.wrapping_add(insn_len as u64);
+                                                self.pc = next_pc;
+                                                self.instret = self.instret.wrapping_add(1);
+                                                return Ok(());
+                                            }
+                                            Ok(crate::sbi::SbiCallResult::Restarted) => {
+                                                // HSM stop/start already set PC and a0/a1.
+                                                self.instret = self.instret.wrapping_add(1);
+                                                return Ok(());
+                                            }
+                                            Ok(crate::sbi::SbiCallResult::Unhandled) => {}
+                                            Err(trap) => return Err(trap),
                                         }
                                     }
                                     let trap = match self.mode {
@@ -1097,10 +1172,10 @@ impl Cpu {
                             if let Err(e) = self.write_csr(csr_addr, new_val) {
                                 return self.handle_trap(e, pc, Some(insn_raw));
                             }
-                            // Invalidate decode cache if SATP changed (address space switch)
+                            // Address-space switch: drop TLB and superblocks (not remote).
                             if csr_addr == CSR_SATP {
                                 self.tlb.flush();
-                                self.invalidate_decode_cache();
+                                self.invalidate_blocks();
                             }
                         }
 
@@ -1123,6 +1198,18 @@ impl Cpu {
                 // Rust code compiled for RISC-V emits `fence` instructions
                 // for Acquire/Release atomics on plain loads/stores.
                 core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+                // Fallback if FENCE.I was decoded as Fence (opcode 0x0F, funct3=1).
+                if (insn_raw >> 12) & 7 == 1 {
+                    self.invalidate_blocks();
+                    bus.bump_fence_seq();
+                    self.fence_seq = bus.fence_seq();
+                }
+            }
+            Op::FenceI => {
+                // Zifencei: subsequent instruction fetches must see prior stores.
+                self.invalidate_blocks();
+                bus.bump_fence_seq();
+                self.fence_seq = bus.fence_seq();
             }
 
             // ── F/D extensions ──

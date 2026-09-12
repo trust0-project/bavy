@@ -35,6 +35,11 @@ pub struct Block {
     /// Next block PC for direct chaining (set when block ends with JAL or fallthrough).
     /// If Some(pc), executor can jump directly to cached block at pc without lookup.
     pub next_block_pc: Option<u64>,
+    /// Native JIT entry (`extern "C" fn(*mut Cpu) -> u64`) when this block
+    /// was compiled. Even returns are the next PC; odd returns are a side-exit.
+    pub jit_fn: Option<unsafe extern "C" fn(*mut u8) -> u64>,
+    /// Consecutive JIT side-exits; demote when this exceeds the hotness policy.
+    pub jit_side_exits: u32,
 }
 
 impl Block {
@@ -49,6 +54,8 @@ impl Block {
             exec_count: 0,
             generation,
             next_block_pc: None,
+            jit_fn: None,
+            jit_side_exits: 0,
         }
     }
 
@@ -152,8 +159,16 @@ impl<'a> BlockCompiler<'a> {
                 _ => None,
             };
 
-            // Convert to MicroOp
-            let micro_op = self.transcode(op, pc_offset, insn_len);
+            // Convert to MicroOp. Unknown encodings must not become Fence NOPs.
+            let micro_op = match self.transcode(op, pc_offset, insn_len) {
+                Some(m) => m,
+                None => {
+                    if block.len > 0 {
+                        return CompileResult::Ok(block);
+                    }
+                    return CompileResult::Unsuitable;
+                }
+            };
             let is_term = micro_op.is_terminator();
 
             // Add to block
@@ -248,8 +263,11 @@ impl<'a> BlockCompiler<'a> {
     }
 
     /// Transcode a decoded Op into a MicroOp.
-    fn transcode(&self, op: Op, pc_offset: u16, insn_len: u8) -> MicroOp {
-        match op {
+    ///
+    /// Returns `None` for encodings the engine cannot execute (unknown funct,
+    /// reserved SYSTEM, unknown AMO). The caller must not map those to `Fence`.
+    fn transcode(&self, op: Op, pc_offset: u16, insn_len: u8) -> Option<MicroOp> {
+        Some(match op {
             Op::Lui { rd, imm } => MicroOp::Lui {
                 rd: rd.to_usize() as u8,
                 imm,
@@ -327,7 +345,7 @@ impl<'a> BlockCompiler<'a> {
                         pc_offset,
                         insn_len,
                     },
-                    _ => MicroOp::Fence, // Should not happen
+                    _ => return None,
                 }
             }
 
@@ -382,7 +400,7 @@ impl<'a> BlockCompiler<'a> {
                         imm,
                         pc_offset,
                     },
-                    _ => MicroOp::Fence,
+                    _ => return None,
                 }
             }
 
@@ -419,7 +437,7 @@ impl<'a> BlockCompiler<'a> {
                         imm,
                         pc_offset,
                     },
-                    _ => MicroOp::Fence,
+                    _ => return None,
                 }
             }
 
@@ -452,7 +470,7 @@ impl<'a> BlockCompiler<'a> {
                             MicroOp::Srli { rd, rs1, shamt }
                         }
                     }
-                    _ => MicroOp::Fence,
+                    _ => return None,
                 }
             }
 
@@ -485,7 +503,7 @@ impl<'a> BlockCompiler<'a> {
                     (6, 0x01) => MicroOp::Rem { rd, rs1, rs2 },
                     (7, 0x00) => MicroOp::And { rd, rs1, rs2 },
                     (7, 0x01) => MicroOp::Remu { rd, rs1, rs2 },
-                    _ => MicroOp::Fence,
+                    _ => return None,
                 }
             }
 
@@ -517,7 +535,7 @@ impl<'a> BlockCompiler<'a> {
                             MicroOp::Srliw { rd, rs1, shamt }
                         }
                     }
-                    _ => MicroOp::Fence,
+                    _ => return None,
                 }
             }
 
@@ -542,7 +560,7 @@ impl<'a> BlockCompiler<'a> {
                     (5, 0x01) => MicroOp::Divuw { rd, rs1, rs2 },
                     (6, 0x01) => MicroOp::Remw { rd, rs1, rs2 },
                     (7, 0x01) => MicroOp::Remuw { rd, rs1, rs2 },
-                    _ => MicroOp::Fence,
+                    _ => return None,
                 }
             }
 
@@ -570,7 +588,7 @@ impl<'a> BlockCompiler<'a> {
                                 if funct7 == 0x09 {
                                     MicroOp::SfenceVma { pc_offset }
                                 } else {
-                                    MicroOp::Fence // Unknown, treat as fence
+                                    return None;
                                 }
                             }
                         }
@@ -611,7 +629,7 @@ impl<'a> BlockCompiler<'a> {
                         csr: (imm & 0xFFF) as u16,
                         pc_offset,
                     },
-                    _ => MicroOp::Fence,
+                    _ => return None,
                 }
             }
 
@@ -718,18 +736,87 @@ impl<'a> BlockCompiler<'a> {
                         is_word,
                         pc_offset,
                     },
-                    _ => MicroOp::Fence,
+                    _ => return None,
                 }
             }
 
             Op::Fence => MicroOp::Fence,
+            Op::FenceI => MicroOp::FenceI { pc_offset },
 
-            // Floating point has no micro-op encoding; hand the instruction
-            // to the interpreter (block terminates here).
-            Op::LoadFp { .. } | Op::StoreFp { .. } | Op::OpFp { .. } | Op::FmaFp { .. } => {
-                MicroOp::InterpOp { pc_offset }
+            Op::LoadFp {
+                rd,
+                rs1,
+                imm,
+                funct3,
+            } => {
+                let rd = rd.to_usize() as u8;
+                let rs1 = rs1.to_usize() as u8;
+                match funct3 {
+                    2 => MicroOp::Flw {
+                        rd,
+                        rs1,
+                        imm,
+                        pc_offset,
+                    },
+                    3 => MicroOp::Fld {
+                        rd,
+                        rs1,
+                        imm,
+                        pc_offset,
+                    },
+                    _ => return None,
+                }
             }
-        }
+
+            Op::StoreFp {
+                rs1,
+                rs2,
+                imm,
+                funct3,
+            } => {
+                let rs1 = rs1.to_usize() as u8;
+                let rs2 = rs2.to_usize() as u8;
+                match funct3 {
+                    2 => MicroOp::Fsw {
+                        rs1,
+                        rs2,
+                        imm,
+                        pc_offset,
+                    },
+                    3 => MicroOp::Fsd {
+                        rs1,
+                        rs2,
+                        imm,
+                        pc_offset,
+                    },
+                    _ => return None,
+                }
+            }
+
+            // Fast-path OP-FP stays in the superblock. FDIV/FSQRT/FCVT/FMIN/
+            // compares and FMA still exit via InterpOp.
+            Op::OpFp {
+                rd,
+                rs1,
+                rs2,
+                funct7,
+                rm,
+            } => match funct7 {
+                0x00 | 0x01 | 0x04 | 0x05 | 0x08 | 0x09 | 0x70 | 0x71 | 0x78 | 0x79 => {
+                    MicroOp::OpFp {
+                        rd: rd.to_usize() as u8,
+                        rs1: rs1.to_usize() as u8,
+                        rs2: rs2.to_usize() as u8,
+                        funct7: funct7 as u8,
+                        rm: rm as u8,
+                        pc_offset,
+                    }
+                }
+                _ => MicroOp::InterpOp { pc_offset },
+            },
+
+            Op::FmaFp { .. } => MicroOp::InterpOp { pc_offset },
+        })
     }
 }
 
@@ -788,5 +875,186 @@ mod tests {
             },
             4
         ));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn compile_insns(insns: &[u32]) -> CompileResult {
+        use crate::bus::{Bus, DRAM_BASE, SystemBus};
+        let bus = SystemBus::new(DRAM_BASE, 64 * 1024);
+        for (i, insn) in insns.iter().enumerate() {
+            bus.write32(DRAM_BASE + (i as u64) * 4, *insn)
+                .expect("write test insn");
+        }
+        let mut tlb = Tlb::new();
+        let mut compiler = BlockCompiler {
+            bus: &bus,
+            satp: 0,
+            mstatus: 0,
+            mode: Mode::Machine,
+            tlb: &mut tlb,
+        };
+        compiler.compile(DRAM_BASE, 0)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn unknown_opcode_is_unsuitable_or_trap_not_fence() {
+        // Opcode 0 is not a valid RV64GC encoding. Must not become a Fence NOP.
+        match compile_insns(&[0x0000_0000]) {
+            CompileResult::Unsuitable => {}
+            CompileResult::Trap(Trap::IllegalInstruction(_)) => {}
+            CompileResult::Trap(other) => panic!("unexpected trap: {other:?}"),
+            CompileResult::Ok(block) => {
+                let only_fence = block.ops().iter().all(|op| matches!(op, MicroOp::Fence));
+                panic!(
+                    "unknown opcode compiled to a block (len={}, fence_only={only_fence})",
+                    block.len
+                );
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn unknown_funct_is_unsuitable_not_fence() {
+        // R-type opcode 0x33 with funct7=0x7F is not a valid ALU encoding.
+        let unknown_r = (0x7Fu32 << 25) | 0x33;
+        match compile_insns(&[unknown_r]) {
+            CompileResult::Unsuitable => {}
+            CompileResult::Trap(Trap::IllegalInstruction(_)) => {}
+            CompileResult::Trap(other) => panic!("unexpected trap: {other:?}"),
+            CompileResult::Ok(block) => {
+                panic!(
+                    "unknown funct compiled to a block (len={}, first={:?})",
+                    block.len,
+                    block.ops().first()
+                );
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn wfi_is_last_op_in_block() {
+        // addi x1, x0, 1; wfi; addi x2, x0, 2 — WFI must terminate packing.
+        let addi1 = 0x0010_0093;
+        let wfi = 0x1050_0073;
+        let addi2 = 0x0020_0113;
+        match compile_insns(&[addi1, wfi, addi2]) {
+            CompileResult::Ok(block) => {
+                assert_eq!(block.len, 2, "ops after WFI must not be packed");
+                assert!(
+                    matches!(block.ops()[block.len as usize - 1], MicroOp::Wfi { .. }),
+                    "last op must be WFI, got {:?}",
+                    block.ops()[block.len as usize - 1]
+                );
+            }
+            _ => panic!("expected compiled block containing WFI"),
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn fence_i_is_distinct_from_fence() {
+        let fence = 0x0000_000F;
+        let fence_i = 0x0000_100F;
+        let addi = 0x0010_0093;
+
+        match compile_insns(&[fence, addi]) {
+            CompileResult::Ok(block) => {
+                assert!(
+                    matches!(block.ops()[0], MicroOp::Fence),
+                    "FENCE must transcode to MicroOp::Fence, got {:?}",
+                    block.ops()[0]
+                );
+                assert!(
+                    !matches!(block.ops()[0], MicroOp::FenceI { .. }),
+                    "FENCE must not be FenceI"
+                );
+                assert!(
+                    block.len >= 2,
+                    "FENCE is not a terminator; following ADDI should be packed"
+                );
+            }
+            _ => panic!("expected FENCE block"),
+        }
+
+        match compile_insns(&[fence_i, addi]) {
+            CompileResult::Ok(block) => {
+                assert_eq!(block.len, 1, "FENCE.I must terminate the block");
+                assert!(
+                    matches!(block.ops()[0], MicroOp::FenceI { .. }),
+                    "FENCE.I must transcode to MicroOp::FenceI, got {:?}",
+                    block.ops()[0]
+                );
+            }
+            _ => panic!("expected FENCE.I block"),
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn fp_load_store_and_fadd_pack_in_block() {
+        // FLW/FLD/FSW/FSD and FADD.D are in-block MicroOps (not InterpOp).
+        fn i_type(opcode: u32, rd: u32, funct3: u32, rs1: u32, imm: i32) -> u32 {
+            ((imm as u32 & 0xFFF) << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode
+        }
+        fn s_type(opcode: u32, funct3: u32, rs1: u32, rs2: u32, imm: i32) -> u32 {
+            let imm = imm as u32;
+            ((imm >> 5 & 0x7F) << 25)
+                | (rs2 << 20)
+                | (rs1 << 15)
+                | (funct3 << 12)
+                | ((imm & 0x1F) << 7)
+                | opcode
+        }
+        fn op_fp(funct7: u32, rs2: u32, rs1: u32, rm: u32, rd: u32) -> u32 {
+            (funct7 << 25) | (rs2 << 20) | (rs1 << 15) | (rm << 12) | (rd << 7) | 0x53
+        }
+        let flw = i_type(0x07, 1, 2, 5, 0);
+        let fld = i_type(0x07, 2, 3, 5, 8);
+        let fadd_d = op_fp(0x01, 2, 1, 7, 3);
+        let fsw = s_type(0x27, 2, 5, 3, 16);
+        let fsd = s_type(0x27, 3, 5, 3, 24);
+        let addi = 0x0010_0093;
+        match compile_insns(&[flw, fld, fadd_d, fsw, fsd, addi]) {
+            CompileResult::Ok(block) => {
+                assert_eq!(block.len, 6, "FP fast path must pack with following ADDI");
+                assert!(matches!(block.ops()[0], MicroOp::Flw { .. }));
+                assert!(matches!(block.ops()[1], MicroOp::Fld { .. }));
+                assert!(matches!(block.ops()[2], MicroOp::OpFp { funct7: 0x01, .. }));
+                assert!(matches!(block.ops()[3], MicroOp::Fsw { .. }));
+                assert!(matches!(block.ops()[4], MicroOp::Fsd { .. }));
+                assert!(
+                    !block
+                        .ops()
+                        .iter()
+                        .any(|op| matches!(op, MicroOp::InterpOp { .. })),
+                    "fast-path FP must not InterpOp-exit"
+                );
+            }
+            _ => panic!("expected packed FP block"),
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn fsqrt_still_interp_exits() {
+        fn op_fp(funct7: u32, rs2: u32, rs1: u32, rm: u32, rd: u32) -> u32 {
+            (funct7 << 25) | (rs2 << 20) | (rs1 << 15) | (rm << 12) | (rd << 7) | 0x53
+        }
+        let fsqrt_d = op_fp(0x2D, 0, 1, 7, 2);
+        let addi = 0x0010_0093;
+        match compile_insns(&[fsqrt_d, addi]) {
+            CompileResult::Ok(block) => {
+                assert_eq!(block.len, 1, "FSQRT must terminate via InterpOp");
+                assert!(
+                    matches!(block.ops()[0], MicroOp::InterpOp { .. }),
+                    "FSQRT should remain InterpOp, got {:?}",
+                    block.ops()[0]
+                );
+            }
+            _ => panic!("expected InterpOp block for FSQRT"),
+        }
     }
 }

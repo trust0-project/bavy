@@ -263,6 +263,15 @@ impl Tlb {
     }
 }
 
+/// Identity map: M-mode always uses Bare, and `satp.MODE == 0` is Bare.
+///
+/// Today's guest never writes `satp`, so this is the hot path. Keep it
+/// branch-cheap and inlinable; the Sv39 walker below is unchanged for MODE != 0.
+#[inline(always)]
+pub fn translation_disabled(mode: Mode, satp: u64) -> bool {
+    mode == Mode::Machine || (satp >> 60) == 0
+}
+
 /// Sv39/Sv48 translation + A/D bit updates.
 ///
 /// `addr` is a virtual address. Returns the translated physical address or a
@@ -276,8 +285,7 @@ pub fn translate(
     addr: u64,
     access_type: AccessType,
 ) -> Result<u64, Trap> {
-    // No translation in Machine mode (always Bare).
-    if mode == Mode::Machine {
+    if translation_disabled(mode, satp) {
         return Ok(addr);
     }
 
@@ -285,10 +293,6 @@ pub fn translate(
     let current_asid = (satp >> 44) & 0xFFFF;
 
     let (levels, va_bits, vpn_full_mask): (usize, u64, u64) = match satp_mode {
-        0 => {
-            // Bare: no translation.
-            return Ok(addr);
-        }
         8 => {
             // Sv39
             let levels = 3;

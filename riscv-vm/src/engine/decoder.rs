@@ -130,7 +130,8 @@ pub enum Op {
         aq: bool,
         rl: bool,
     }, // RV64A atomics (LR/SC/AMO*)
-    Fence, // FENCE / FENCE.I
+    Fence,  // FENCE (opcode 0x0F, funct3=0)
+    FenceI, // FENCE.I (opcode 0x0F, funct3=1) — Zifencei I-cache barrier
     LoadFp {
         rd: Register, // FP destination register
         rs1: Register,
@@ -277,7 +278,11 @@ pub fn decode(insn: u32) -> Result<Op, Trap> {
                 imm: i_imm,
             })
         }
-        0x0F => Ok(Op::Fence),
+        0x0F => match funct3 {
+            0 => Ok(Op::Fence),
+            1 => Ok(Op::FenceI),
+            _ => Err(Trap::IllegalInstruction(insn as u64)),
+        },
 
         // F/D extensions
         0x07 => {
@@ -796,6 +801,19 @@ mod tests {
         match res {
             Err(Trap::IllegalInstruction(bits)) => assert_eq!(bits, bad as u64),
             _ => panic!("Expected IllegalInstruction trap"),
+        }
+    }
+
+    #[test]
+    fn decode_fence_vs_fence_i() {
+        // FENCE: opcode 0x0F, funct3=0
+        assert_eq!(decode(0x0000_000F), Ok(Op::Fence));
+        // FENCE.I: opcode 0x0F, funct3=1
+        assert_eq!(decode(0x0000_100F), Ok(Op::FenceI));
+        // Unknown funct3 on misc-mem is illegal, not FENCE.
+        match decode(0x0000_200F) {
+            Err(Trap::IllegalInstruction(bits)) => assert_eq!(bits, 0x0000_200F),
+            other => panic!("expected IllegalInstruction, got {other:?}"),
         }
     }
 

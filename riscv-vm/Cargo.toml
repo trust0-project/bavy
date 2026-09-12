@@ -15,6 +15,15 @@ gui = ["minifb"]
 # Restore SeqCst ordering on plain guest data accesses (debug escape hatch;
 # see dram::DATA_ORDER). Slower, but rules out memory-ordering bugs.
 strict-memory = []
+# Native Cranelift JIT (not wasm32). Not in default; merge only when
+# `cargo test --lib --features jit` matches the interpreter.
+jit = [
+    "dep:cranelift-jit",
+    "dep:cranelift-codegen",
+    "dep:cranelift-module",
+    "dep:cranelift-native",
+    "dep:cranelift-frontend",
+]
 
 [dependencies]
 log = "0.4"
@@ -43,6 +52,12 @@ napi-rs = { package = "napi", version = "2", features = ["async", "tokio_rt"], o
 napi-derive = { version = "2", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Cranelift JIT (native-only; enabled by the `jit` feature).
+cranelift-jit = { version = "0.122", optional = true }
+cranelift-codegen = { version = "0.122", optional = true }
+cranelift-module = { version = "0.122", optional = true }
+cranelift-native = { version = "0.122", optional = true }
+cranelift-frontend = { version = "0.122", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 # Simple synchronous HTTP client for SD card URL downloads
 ureq = { version = "2", features = ["tls"] }

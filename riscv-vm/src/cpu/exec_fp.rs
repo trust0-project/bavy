@@ -18,10 +18,10 @@ impl Cpu {
         (self.csrs[CSR_MSTATUS as usize] >> 13) & 0x3 != 0
     }
 
-    /// Mark the FP state dirty (mstatus.FS = 11) after any FP register write.
+    /// Mark the FP state dirty (mstatus.FS = Dirty, SD = 1) after any FP write.
     #[inline(always)]
     fn set_fs_dirty(&mut self) {
-        self.csrs[CSR_MSTATUS as usize] |= 3 << 13;
+        self.csrs.mark_fs_dirty();
     }
 
     #[inline(always)]
@@ -30,11 +30,12 @@ impl Cpu {
         self.set_fs_dirty();
     }
 
-    /// Accumulate exception flags into fcsr.fflags.
+    /// Accumulate exception flags into fcsr.fflags (dirties FS when flags change).
     #[inline(always)]
     fn accrue_fflags(&mut self, flags: u32) {
         if flags != 0 {
             self.csrs[CSR_FCSR as usize] |= (flags & 0x1F) as u64;
+            self.set_fs_dirty();
         }
     }
 
@@ -56,13 +57,13 @@ impl Cpu {
         rs1: Register,
         imm: i64,
         funct3: u32,
-        pc: u64,
+        _pc: u64,
     ) -> Result<(), Trap> {
         if !self.fpu_enabled() {
             return Err(Trap::IllegalInstruction(0));
         }
         let addr = self.read_reg(rs1).wrapping_add(imm as u64);
-        let pa = self.translate_addr(bus, addr, MmuAccessType::Load, pc, None)?;
+        let pa = self.translate_addr_for_block(bus, addr, MmuAccessType::Load)?;
         match funct3 {
             2 => {
                 let v = bus.read32(pa)?;
@@ -85,13 +86,13 @@ impl Cpu {
         rs2: Register,
         imm: i64,
         funct3: u32,
-        pc: u64,
+        _pc: u64,
     ) -> Result<(), Trap> {
         if !self.fpu_enabled() {
             return Err(Trap::IllegalInstruction(0));
         }
         let addr = self.read_reg(rs1).wrapping_add(imm as u64);
-        let pa = self.translate_addr(bus, addr, MmuAccessType::Store, pc, None)?;
+        let pa = self.translate_addr_for_block(bus, addr, MmuAccessType::Store)?;
         self.clear_reservation_if_conflict(addr);
         let bits = self.fregs[rs2.to_usize()];
         match funct3 {
@@ -533,8 +534,8 @@ mod tests {
 
     #[test]
     fn test_fp_in_block_engine() {
-        // FP instructions inside a block exit to the interpreter (InterpOp)
-        // and execution resumes correctly afterwards.
+        // FLD/FADD.D/FSD run in-block (MicroOps), so the sequence does not
+        // exit to the interpreter between integer ops.
         let (mut cpu, bus) = make_env();
         assert!(cpu.use_blocks);
         let data = BASE + 0x1000;
@@ -551,7 +552,6 @@ mod tests {
         for (i, insn) in program.iter().enumerate() {
             bus.write32(BASE + (i as u64) * 4, *insn).unwrap();
         }
-        // Step enough times: block exits force re-entry, so allow extra steps.
         for _ in 0..16 {
             let _ = cpu.step(&bus);
             if cpu.pc >= BASE + (program.len() as u64) * 4 {
@@ -561,6 +561,53 @@ mod tests {
         assert_eq!(f64::from_bits(bus.read64(data + 8).unwrap()), 10.0);
         assert_eq!(cpu.read_reg(Register::X6), 42);
         assert_eq!(cpu.read_reg(Register::X7), 43);
+        let sstatus = cpu.read_csr(crate::cpu::csr::CSR_SSTATUS).unwrap();
+        assert_eq!((sstatus >> 13) & 3, 3, "FS must be Dirty after FADD");
+        assert_ne!(sstatus & (1u64 << 63), 0, "SD must be set");
+        assert_eq!((sstatus >> 32) & 3, 2, "UXL must be 2");
+    }
+
+    #[test]
+    fn test_fs_dirty_and_sstatus_sd_uxl() {
+        let (mut cpu, bus) = make_env();
+        cpu.use_blocks = false;
+        let s0 = cpu.read_csr(crate::cpu::csr::CSR_SSTATUS).unwrap();
+        assert_eq!((s0 >> 32) & 3, 2, "UXL=2 before any FP");
+        assert_eq!(s0 & (1u64 << 63), 0, "SD clear at reset (FS=Initial)");
+        assert_eq!((s0 >> 13) & 3, 1);
+
+        cpu.fregs[1] = 1.0f64.to_bits();
+        run_program(&mut cpu, &bus, &[op_fp(0x01, 1, 1, 7, 2)]); // fadd.d f2, f1, f1
+        let s1 = cpu.read_csr(crate::cpu::csr::CSR_SSTATUS).unwrap();
+        assert_eq!((s1 >> 13) & 3, 3);
+        assert_ne!(s1 & (1u64 << 63), 0);
+        assert_eq!((s1 >> 32) & 3, 2);
+        let mstatus = cpu.read_csr(crate::cpu::csr::CSR_MSTATUS).unwrap();
+        assert_ne!(mstatus & (1u64 << 63), 0);
+    }
+
+    #[test]
+    fn test_ro_csr_write_is_illegal_instruction() {
+        let (mut cpu, bus) = make_env();
+        cpu.use_blocks = false;
+        // csrrw x0, cycle, x1  — write to URO CSR
+        let csrrw_cycle = (0xC00u32 << 20) | (1 << 15) | (1 << 12) | 0x73;
+        bus.write32(BASE, csrrw_cycle).unwrap();
+        let _ = cpu.step(&bus);
+        assert_eq!(cpu.csrs[crate::cpu::csr::CSR_MCAUSE as usize], 2);
+    }
+
+    #[test]
+    fn test_ro_csr_csrrs_x0_is_read_not_write() {
+        let (mut cpu, bus) = make_env();
+        cpu.use_blocks = false;
+        cpu.instret = 7;
+        // csrrs x1, cycle, x0 — rs1=x0 means no write, must not trap
+        let csrrs_cycle = (0xC00u32 << 20) | (0 << 15) | (2 << 12) | (1 << 7) | 0x73;
+        bus.write32(BASE, csrrs_cycle).unwrap();
+        cpu.step(&bus).unwrap();
+        assert_eq!(cpu.read_reg(Register::X1), 7);
+        assert_eq!(cpu.csrs[crate::cpu::csr::CSR_MCAUSE as usize], 0);
     }
 
     #[test]

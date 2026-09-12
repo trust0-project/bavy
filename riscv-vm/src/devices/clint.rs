@@ -807,7 +807,7 @@ mod tests {
         clint2.set_mtimecmp_array(&mtimecmp_array);
 
         // Verify state matches
-        assert_eq!(clint2.mtime(), 12345);
+        assert_eq!(clint2.mtime(), mtime);
         assert_eq!(clint2.get_msip(0), 1);
         assert_eq!(clint2.get_msip(1), 0);
         assert_eq!(clint2.get_msip(2), 1);
