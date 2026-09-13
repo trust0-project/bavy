@@ -5,7 +5,7 @@ use super::types::Trap;
 
 pub use super::types::Mode;
 
-/// sstatus writable subset of mstatus: SIE, SPIE, SPP, FS, SUM, MXR.
+/// The sstatus writable subset of mstatus: SIE, SPIE, SPP, FS, SUM, MXR.
 /// SD (63) and UXL (33:32) are not software-writable here (hardwired / read-only).
 const SSTATUS_WMASK: u64 =
     (1 << 1) | (1 << 5) | (1 << 8) | (3 << 13) | (1 << 18) | (1 << 19);
