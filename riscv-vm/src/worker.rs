@@ -181,6 +181,14 @@ impl WorkerState {
         //
         // Once started, we cache the flag to skip registry checks.
         if !self.started {
+            // Host-side construction is a separate gate from guest HSM start.
+            // Do not let an early HSM request race workers that have not all
+            // loaded their module and attached to shared memory yet.
+            if !self.control.can_workers_start() {
+                self.control.wait_brief(100.0);
+                return WorkerStepResult::Continue;
+            }
+
             let state = self.registry.get_state(self.hart_id);
             match state {
                 HartState::StartPending => {
@@ -212,13 +220,15 @@ impl WorkerState {
                     self.started = true;
                 }
                 HartState::Stopped => {
-                    // Not started yet - sleep briefly and retry
-                    self.control.wait_brief(10.0);
+                    // Wait on this hart's HCB state so `sbi_hart_start`
+                    // wakes the exact worker without polling a global flag.
+                    self.registry
+                        .wait_state_brief(self.hart_id, HartState::Stopped, 100.0);
                     return WorkerStepResult::Continue;
                 }
                 _ => {
                     // Other states (StopPending, Suspended, etc.) - wait
-                    self.control.wait_brief(10.0);
+                    self.registry.wait_state_brief(self.hart_id, state, 100.0);
                     return WorkerStepResult::Continue;
                 }
             }

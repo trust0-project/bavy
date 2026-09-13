@@ -79,6 +79,16 @@ pub fn generate_for(
         "stdout-path",
         &format!("/soc/serial@{:x}", map.uart.base),
     );
+    // Optional `/chosen` fallback the kernel also parses. Primary advertisement
+    // is the reserved-memory node below; omit both when HDL is disabled.
+    if advertise_hdl(machine, attached) {
+        builder.add_prop_reg64_named(
+            "havy,hdl-mailbox",
+            crate::hdl::HDL_ADDR_VIRT,
+            crate::hdl::HDL_REGION_SIZE as u64,
+        );
+        builder.add_prop_u32("havy,hdl-abi-major", crate::hdl::HDL_ABI_MAJOR as u32);
+    }
     builder.end_node();
 
     builder.begin_node("cpus");
@@ -109,6 +119,36 @@ pub fn generate_for(
     builder.begin_node(&format!("memory@{:x}", map.dram_base));
     builder.add_prop_string("device_type", "memory");
     builder.add_prop_reg64(map.dram_base, memory_size);
+    builder.end_node();
+
+    builder.begin_node("reserved-memory");
+    builder.add_prop_u32("#address-cells", 2);
+    builder.add_prop_u32("#size-cells", 2);
+    builder.add_prop_empty("ranges");
+    let fb_meta = map.dram_base + 0x00FF_F000;
+    builder.begin_node(&format!("fb-doorbell@{:x}", fb_meta));
+    builder.add_prop_string("compatible", "havy,fb-doorbell");
+    builder.add_prop_reg64(fb_meta, 0x1000);
+    builder.end_node();
+    let fb_base = map.dram_base + 0x0100_0000;
+    let fb_bytes: u64 = match machine {
+        Machine::Virt => 4096 * 768,
+        Machine::D1 => 2048 * 480,
+    };
+    builder.begin_node(&format!("framebuffer@{:x}", fb_base));
+    builder.add_prop_string("compatible", "simple-framebuffer");
+    builder.add_prop_reg64(fb_base, fb_bytes);
+    builder.end_node();
+    if advertise_hdl(machine, attached) {
+        let hdl_base = crate::hdl::HDL_ADDR_VIRT;
+        builder.begin_node(&format!("hdl-mailbox@{:x}", hdl_base));
+        builder.add_prop_string("compatible", "havy,hdl-mailbox");
+        builder.add_prop_reg64(hdl_base, crate::hdl::HDL_REGION_SIZE as u64);
+        builder.add_prop_u32("havy,abi-major", crate::hdl::HDL_ABI_MAJOR as u32);
+        builder.add_prop_u32("havy,abi-minor", crate::hdl::HDL_ABI_MINOR as u32);
+        builder.add_prop_empty("no-map");
+        builder.end_node();
+    }
     builder.end_node();
 
     builder.begin_node("soc");
@@ -143,13 +183,10 @@ pub fn generate_for(
     builder.add_prop_reg64(map.plic.base, plic_dtb_size);
     builder.add_prop_u32("riscv,ndev", map.plic.ndev);
     builder.add_prop_u32("phandle", 100);
-    let mut plic_ints = Vec::new();
-    for hart in 0..num_harts {
-        plic_ints.push((hart + 1) as u32);
-        plic_ints.push(9);
-        plic_ints.push((hart + 1) as u32);
-        plic_ints.push(11);
-    }
+    // The VM's emulated devices and PLIC are owned by hart 0. Secondary
+    // harts use guest IPIs and the kernel I/O router, so advertise only the
+    // BSP's supervisor/machine external-interrupt contexts.
+    let plic_ints = vec![1, 9, 1, 11];
     builder.add_prop_u32_array("interrupts-extended", &plic_ints);
     builder.end_node();
 
@@ -252,6 +289,12 @@ pub fn generate_for(
     builder.finish()
 }
 
+/// Virt DTB advertises the mailbox only when the host kill-switch is on.
+/// D1 never publishes this node (silicon has no host GPU mailbox).
+fn advertise_hdl(machine: Machine, attached: &AttachedDevices) -> bool {
+    machine == Machine::Virt && attached.hdl_mailbox
+}
+
 /// Write the DTB at this machine's DTB physical address (`dram.base + dtb_offset`).
 pub fn write_dtb_to_dram(dram: &Dram, dtb: &[u8]) -> u64 {
     write_dtb_to_dram_at(dram, dtb, dtb_addr_for_dram(dram))
@@ -269,9 +312,11 @@ pub fn dtb_addr_for_dram(dram: &Dram) -> u64 {
 pub fn write_dtb_to_dram_at(dram: &Dram, dtb: &[u8], dtb_addr: u64) -> u64 {
     assert!(dtb.len() <= DTB_MAX_SIZE, "DTB exceeds {} bytes", DTB_MAX_SIZE);
     let offset = dtb_addr.checked_sub(dram.base).expect("DTB address below DRAM");
-    for (i, byte) in dtb.iter().enumerate() {
-        let _ = dram.store_8(offset + i as u64, *byte as u64);
-    }
+    dram.load(dtb, offset).expect("DTB write outside guest DRAM");
+    let magic = dram
+        .read_range(offset as usize, FDT_MAGIC.to_be_bytes().len())
+        .expect("DTB readback outside guest DRAM");
+    assert_eq!(magic.as_slice(), FDT_MAGIC.to_be_bytes());
     dtb_addr
 }
 
@@ -348,8 +393,12 @@ impl DtbBuilder {
     }
     
     fn add_prop_reg64(&mut self, address: u64, size: u64) {
-        let string_offset = self.get_string_offset("reg");
-        
+        self.add_prop_reg64_named("reg", address, size);
+    }
+
+    fn add_prop_reg64_named(&mut self, name: &str, address: u64, size: u64) {
+        let string_offset = self.get_string_offset(name);
+
         self.write_u32(FDT_PROP);
         self.write_u32(16); // 2 cells address + 2 cells size
         self.write_u32(string_offset);
@@ -449,6 +498,7 @@ mod tests {
             has_touch: true,
             has_audio: true,
             virtio_count: 2,
+            hdl_mailbox: true,
         };
         let dtb = generate_for(Machine::Virt, 2, 512 * 1024 * 1024, &config);
         assert_eq!(dtb[0..4], FDT_MAGIC.to_be_bytes());
@@ -458,6 +508,33 @@ mod tests {
         assert!(text.contains("riscv-virtio,qemu"));
         assert!(!text.contains("allwinner,sun20i-d1"));
         assert!(text.contains(ISA_STRING));
+        assert!(dtb.windows(6).any(|w| w == b"cpu@0\0"));
+        assert!(dtb.windows(6).any(|w| w == b"cpu@1\0"));
+        assert!(!dtb.windows(6).any(|w| w == b"cpu@2\0"));
+    }
+
+    #[test]
+    fn virt_dtb_contains_every_requested_hart() {
+        for num_harts in [1usize, 2, 4, 8] {
+            let dtb = generate_for(
+                Machine::Virt,
+                num_harts,
+                512 * 1024 * 1024,
+                &AttachedDevices::default(),
+            );
+            for hart in 0..num_harts {
+                let node = format!("cpu@{}\0", hart);
+                assert!(
+                    dtb.windows(node.len()).any(|window| window == node.as_bytes()),
+                    "missing {node:?} from {num_harts}-hart DTB",
+                );
+            }
+            let extra = format!("cpu@{}\0", num_harts);
+            assert!(
+                !dtb.windows(extra.len()).any(|window| window == extra.as_bytes()),
+                "unexpected {extra:?} in {num_harts}-hart DTB",
+            );
+        }
     }
 
     #[test]
@@ -478,6 +555,74 @@ mod tests {
         assert!(text.contains("serial@2500000"));
         assert!(!text.contains("virtio,mmio"));
         assert!(!text.contains("riscv,clint0"));
+        assert!(!text.contains("havy,hdl-mailbox"));
+        assert!(!text.contains("hdl-mailbox@81400000"));
+    }
+
+    #[test]
+    fn virt_dtb_advertises_hdl_mailbox_when_enabled() {
+        let dtb = generate_for(
+            Machine::Virt,
+            1,
+            512 * 1024 * 1024,
+            &AttachedDevices {
+                hdl_mailbox: true,
+                ..Default::default()
+            },
+        );
+        let text = String::from_utf8_lossy(&dtb);
+        assert!(text.contains("hdl-mailbox@81400000"));
+        assert!(text.contains("havy,hdl-mailbox"));
+        assert!(text.contains("havy,abi-major"));
+        assert!(text.contains("havy,abi-minor"));
+        assert!(text.contains("no-map"));
+        assert!(text.contains("havy,hdl-abi-major"));
+        // reg = <0x0 0x81400000 0x0 0x21000> as four big-endian cells.
+        let reg = [
+            0u32.to_be_bytes(),
+            0x8140_0000u32.to_be_bytes(),
+            0u32.to_be_bytes(),
+            0x0002_1000u32.to_be_bytes(),
+        ]
+        .concat();
+        assert!(
+            dtb.windows(reg.len()).any(|w| w == reg.as_slice()),
+            "missing HDL mailbox reg cells"
+        );
+    }
+
+    #[test]
+    fn virt_dtb_omits_hdl_mailbox_when_disabled() {
+        let dtb = generate_for(
+            Machine::Virt,
+            1,
+            512 * 1024 * 1024,
+            &AttachedDevices {
+                hdl_mailbox: false,
+                ..Default::default()
+            },
+        );
+        let text = String::from_utf8_lossy(&dtb);
+        assert!(!text.contains("hdl-mailbox@"));
+        assert!(!text.contains("havy,hdl-mailbox"));
+        assert!(!text.contains("havy,hdl-abi-major"));
+        assert!(!text.contains("havy,abi-major"));
+    }
+
+    #[test]
+    fn d1_dtb_never_advertises_hdl_even_if_flag_set() {
+        let dtb = generate_for(
+            Machine::D1,
+            1,
+            512 * 1024 * 1024,
+            &AttachedDevices {
+                hdl_mailbox: true,
+                ..Default::default()
+            },
+        );
+        let text = String::from_utf8_lossy(&dtb);
+        assert!(!text.contains("havy,hdl-mailbox"));
+        assert!(!text.contains("hdl-mailbox@"));
     }
     
     #[test]

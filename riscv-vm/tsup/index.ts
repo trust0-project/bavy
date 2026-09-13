@@ -63,13 +63,15 @@ export default function createConfig({
   entry,
   banner,
   platform,
-  external
+  external,
+  splitting,
 }: {
   format: Format | Format[] | undefined;
   entry: string[] | undefined;
   banner?: { js: string };
   platform?: "neutral" | "node" | "browser";
   external?: string[] | undefined;
+  splitting?: boolean;
 }) {
   return defineConfig(({ watch: _watch }) => ({
     entry,
@@ -79,6 +81,7 @@ export default function createConfig({
     minify: false,
     platform: platform || "neutral",
     clean: false,
+    splitting: splitting ?? false,
     esbuildPlugins: [wasmPlugin, ...plugins],
     banner,
     esbuildOptions: (options, _context) => {

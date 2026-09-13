@@ -109,6 +109,12 @@ impl WakeReason {
 /// This is used when the kernel wants secondary harts to execute boot
 /// assembly for proper stack initialization.
 pub const HCB_FLAG_PRESERVE_BOOT_PC: u32 = 1 << 0;
+/// Start address, opaque value, and flags have been fully published.
+///
+/// `START_PENDING` reserves the HCB for one caller.  A worker must not consume
+/// the parameters until this flag is visible; otherwise it can race the caller
+/// between the state CAS and the following parameter stores.
+pub const HCB_FLAG_START_PARAMS_READY: u32 = 1 << 1;
 
 // ============================================================================
 // HartControlBlock
@@ -208,6 +214,12 @@ impl HartControlBlock {
     #[inline]
     pub fn preserve_boot_pc(&self) -> bool {
         (self.get_flags() & HCB_FLAG_PRESERVE_BOOT_PC) != 0
+    }
+
+    /// Check whether an HSM start request has published all parameters.
+    #[inline]
+    pub fn start_params_ready(&self) -> bool {
+        (self.get_flags() & HCB_FLAG_START_PARAMS_READY) != 0
     }
 
     /// Get start address (64-bit).

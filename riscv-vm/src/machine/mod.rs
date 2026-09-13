@@ -98,15 +98,15 @@ impl Machine {
             return 1;
         }
         match self {
-            Self::Virt => n,
-            Self::D1 => n.min(1).max(1),
+            Self::Virt => n.min(8),
+            Self::D1 => 1,
         }
     }
 
     /// Native CLI default when `--harts 0`.
     pub fn default_harts_native(self, host_cpus: usize) -> usize {
         match self {
-            Self::Virt => host_cpus.max(1),
+            Self::Virt => host_cpus.max(1).min(8),
             Self::D1 => 1,
         }
     }
@@ -206,6 +206,9 @@ pub struct AttachedDevices {
     pub has_audio: bool,
     /// Instantiated virtio-mmio slots (Virt only). Never advertise empty slots.
     pub virtio_count: usize,
+    /// Advertise `/reserved-memory/hdl-mailbox@81400000` (virt only).
+    /// Kill-switch: `false` omits the node (`--hdl=0` / `HAVY_HDL=0` / `?hdl=0`).
+    pub hdl_mailbox: bool,
 }
 
 #[cfg(test)]
@@ -230,6 +233,7 @@ mod tests {
     fn wasm_without_sab_is_uniprocessor() {
         assert_eq!(Machine::Virt.clamp_harts(8, false), 1);
         assert_eq!(Machine::Virt.clamp_harts(4, true), 4);
+        assert_eq!(Machine::Virt.clamp_harts(64, true), 8);
         assert_eq!(Machine::D1.clamp_harts(8, true), 1);
     }
 

@@ -326,6 +326,23 @@ impl Dram {
         }
     }
 
+    /// 32-bit load with Acquire. Used for the HDL mailbox `seq` doorbell.
+    #[inline(always)]
+    pub fn load_32_acquire(&self, offset: u64) -> Result<u32, MemoryError> {
+        let off = offset as usize;
+        if off + 4 > self.size {
+            return Err(MemoryError::OutOfBounds(offset));
+        }
+        unsafe {
+            if offset & 3 == 0 {
+                let ptr = self.mem_ptr().add(off) as *const AtomicU32;
+                Ok((*ptr).load(Ordering::Acquire).to_le())
+            } else {
+                Ok((self.mem_ptr().add(off) as *const u32).read_unaligned().to_le())
+            }
+        }
+    }
+
     #[inline(always)]
     pub fn load_64(&self, offset: u64) -> Result<u64, MemoryError> {
         let off = offset as usize;
@@ -1121,6 +1138,13 @@ impl Dram {
         let parts = self.shared();
         let idx = Self::atomic_index_of(parts, off);
         Ok(Atomics::load(&parts.atomic_view, idx).unwrap_or(0) as u32)
+    }
+
+    /// Acquire 32-bit load. Linear Wasm is single-hart (plain load); SAB uses
+    /// `Atomics.load` (sequentially consistent, which is a valid acquire).
+    #[inline(always)]
+    pub fn load_32_acquire(&self, offset: u64) -> Result<u32, MemoryError> {
+        self.load_32(offset)
     }
 
     #[inline(always)]

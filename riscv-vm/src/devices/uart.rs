@@ -128,6 +128,11 @@ impl Uart {
         self.regs.lock().unwrap().interrupting
     }
 
+    /// Whether the guest enabled the received-data-available interrupt.
+    pub fn rx_interrupt_enabled(&self) -> bool {
+        (self.regs.lock().unwrap().ier & 0x01) != 0
+    }
+
     // Snapshot support methods
 
     /// Get input FIFO contents for snapshot

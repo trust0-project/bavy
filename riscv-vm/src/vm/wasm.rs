@@ -4,8 +4,16 @@ use crate::cpu;
 use crate::loader::load_elf_wasm;
 use crate::machine::Machine;
 use crate::shared_mem;
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::Arc;
 use wasm_bindgen::prelude::*;
+
+const FB_META_OFF: u64 = 0x00FF_F000;
+const FB_SCANOUT_OFF: usize = 0x0100_0000;
+const FB_DIRTY_RECT_OFF: u64 = FB_META_OFF + 0xFE0;
+const FB_FRAME_VERSION_OFF: u64 = FB_META_OFF + 0xFFC;
+const FB_MAGIC: u32 = 0x4856_4642;
 
 /// Network connection status for the WASM VM.
 #[cfg(target_arch = "wasm32")]
@@ -38,32 +46,26 @@ fn detect_hart_count() -> usize {
 /// Check if SharedArrayBuffer is available for multi-threaded execution.
 #[cfg(target_arch = "wasm32")]
 fn check_shared_array_buffer_available() -> bool {
-    // SharedArrayBuffer requires cross-origin isolation (COOP/COEP headers)
-
-    // Check if we're in a browser context
-    if let Some(window) = web_sys::window() {
-        // Check crossOriginIsolated property
-        let isolated: bool =
-            js_sys::Reflect::get(&window, &JsValue::from_str("crossOriginIsolated"))
-                .ok()
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-
-        if !isolated {
-            web_sys::console::warn_1(&JsValue::from_str(
-                "[VM] Not cross-origin isolated. Add COOP/COEP headers for SMP support.",
-            ));
-            return false;
-        }
-
-        web_sys::console::log_1(&JsValue::from_str(
-            "[VM] Cross-origin isolated - SharedArrayBuffer should be available",
-        ));
+    let global = js_sys::global();
+    let has_sab = js_sys::Reflect::get(&global, &JsValue::from_str("SharedArrayBuffer"))
+        .map(|value| !value.is_undefined() && !value.is_null())
+        .unwrap_or(false);
+    if !has_sab {
+        return false;
     }
 
-    // If cross-origin isolated, SharedArrayBuffer should work
-    // Note: catch_unwind doesn't work in WASM, so we trust the isolation check
-    true
+    // Window and DedicatedWorkerGlobalScope both expose crossOriginIsolated.
+    // Node has SharedArrayBuffer without that browser-only requirement.
+    let isolated = js_sys::Reflect::get(&global, &JsValue::from_str("crossOriginIsolated"))
+        .ok()
+        .and_then(|value| value.as_bool())
+        .unwrap_or_else(|| web_sys::window().is_none());
+    if !isolated {
+        web_sys::console::warn_1(&JsValue::from_str(
+            "[VM] SharedArrayBuffer blocked: enable COOP/COEP cross-origin isolation",
+        ));
+    }
+    isolated
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -137,8 +139,8 @@ pub struct WasmVm {
     shared_uart_input: Option<shared_mem::wasm::SharedUartInput>,
     /// Worker handles
     workers: Vec<web_sys::Worker>,
-    /// Worker ready flags
-    workers_ready: Vec<bool>,
+    /// Number of secondary workers that loaded WASM and attached to the SAB.
+    worker_ready_count: Rc<Cell<usize>>,
     /// Whether workers have been started
     workers_started: bool,
     /// Entry PC for workers
@@ -159,12 +161,23 @@ pub struct WasmVm {
 
 #[cfg(target_arch = "wasm32")]
 impl WasmVm {
-    /// Framebuffer protocol addresses are virt DRAM-relative (`0x8100_0000`).
-    fn virt_fb_dram_offset(&self, phys: u64) -> Option<u64> {
-        if self.machine != Machine::Virt {
-            return None;
+    /// Framebuffer protocol is DRAM-relative (doorbell + scanout at +16 MiB).
+    /// Valid on both Virt and D1; D1's buffer lives in D1 DRAM.
+    fn fb_dram_offset(&self, dram_rel: u64) -> u64 {
+        dram_rel
+    }
+
+    fn fb_layout(&self) -> (usize, u32, u32, usize) {
+        let magic = self.bus.dram.load_32(FB_META_OFF).unwrap_or(0);
+        if magic == FB_MAGIC {
+            let width = self.bus.dram.load_32(FB_META_OFF + 0x10).unwrap_or(1024).max(1);
+            let height = self.bus.dram.load_32(FB_META_OFF + 0x14).unwrap_or(768).max(1);
+            let stride = self.bus.dram.load_32(FB_META_OFF + 0x18).unwrap_or(width * 4) as usize;
+            let stride = stride.max(width as usize * 4);
+            (FB_SCANOUT_OFF, width, height, stride)
+        } else {
+            (FB_SCANOUT_OFF, 1024, 768, 4096)
         }
-        phys.checked_sub(self.bus.dram_base())
     }
 }
 
@@ -180,7 +193,7 @@ impl WasmVm {
     /// Use `new_with_harts()` to specify a custom hart count.
     #[wasm_bindgen(constructor)]
     pub fn new(kernel: &[u8]) -> Result<WasmVm, JsValue> {
-        Self::create_vm_internal(kernel, None, Machine::Virt)
+        Self::create_vm_internal(kernel, None, Machine::Virt, true)
     }
 
     /// Create a new VM instance with a specified number of harts.
@@ -194,7 +207,7 @@ impl WasmVm {
         } else {
             Some(num_harts)
         };
-        Self::create_vm_internal(kernel, harts, Machine::Virt)
+        Self::create_vm_internal(kernel, harts, Machine::Virt, true)
     }
 
     /// Create a VM for an explicit guest board (`virt` = 10 MHz, `d1` = 24 MHz).
@@ -219,7 +232,31 @@ impl WasmVm {
         } else {
             Some(num_harts)
         };
-        Self::create_vm_internal(kernel, harts, machine)
+        Self::create_vm_internal(kernel, harts, machine, machine == Machine::Virt)
+    }
+
+    /// Create a VM with an explicit HDL mailbox kill-switch.
+    ///
+    /// `hdl = false` omits `/reserved-memory/hdl-mailbox@81400000` (maps to
+    /// `?hdl=0` / `HAVY_HDL=0`). D1 never advertises the node.
+    pub fn new_with_machine_hdl(
+        kernel: &[u8],
+        num_harts: usize,
+        machine: &str,
+        hdl: bool,
+    ) -> Result<WasmVm, JsValue> {
+        let machine = Machine::parse(machine).ok_or_else(|| {
+            JsValue::from_str(&format!(
+                "unknown machine {:?}; expected virt or d1",
+                machine
+            ))
+        })?;
+        let harts = if num_harts == 0 {
+            None
+        } else {
+            Some(num_harts)
+        };
+        Self::create_vm_internal(kernel, harts, machine, hdl)
     }
 
     /// Internal constructor with optional hart count and board identity.
@@ -227,6 +264,7 @@ impl WasmVm {
         kernel: &[u8],
         num_harts: Option<usize>,
         machine: Machine,
+        hdl: bool,
     ) -> Result<WasmVm, JsValue> {
         // Set up panic hook for better error messages in the browser console
         console_error_panic_hook::set_once();
@@ -360,11 +398,13 @@ impl WasmVm {
             *bus.d1_emac.write().unwrap() = Some(emac);
         }
 
+        bus.set_hdl_mailbox(hdl);
         let dtb_address = bus.refresh_dtb(num_harts);
 
         web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
-            "[VM] Generated DTB at 0x{:x}",
-            dtb_address
+            "[VM] Generated DTB at 0x{:x} (hdl={})",
+            dtb_address,
+            bus.hdl_mailbox_enabled()
         )));
 
         // Create primary CPU (hart 0)
@@ -395,7 +435,7 @@ impl WasmVm {
             shared_uart_output,
             shared_uart_input,
             workers: Vec::new(),
-            workers_ready: Vec::new(),
+            worker_ready_count: Rc::new(Cell::new(0)),
             workers_started: false,
             entry_pc,
             boot_steps: 0,
@@ -407,21 +447,37 @@ impl WasmVm {
         })
     }
 
-    /// Load a disk image and attach it as a D1 MMC device.
-    /// This should be called before starting execution if the kernel needs a filesystem.
+    /// Load a disk image. Virt: virtio-blk with the Linux partition as sector 0.
+    /// D1: D1 MMC (MBR parsed in the guest).
     pub fn load_disk(&mut self, disk_image: &[u8]) {
         use crate::devices::d1_mmc::D1MmcEmulated;
-        
+        use crate::devices::virtio::VirtioBlock;
+        use crate::machine::Machine;
+        use crate::sdboot::linux_partition_image;
+
+        if self.machine == Machine::Virt {
+            let fs = linux_partition_image(disk_image);
+            let n = fs.len();
+            self.bus
+                .virtio_devices
+                .push(Box::new(VirtioBlock::new(fs)));
+            let dtb = self.bus.refresh_dtb(self.num_harts);
+            web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+                "[VM] virtio-blk loaded ({} bytes, dtb=0x{:x})",
+                n, dtb
+            )));
+            return;
+        }
+
         let mmc = D1MmcEmulated::new(disk_image.to_vec());
         *self.bus.d1_mmc.write().unwrap() = Some(mmc);
         let dtb = self.bus.refresh_dtb(self.num_harts);
-
-        // Verify the device is attached
         let attached = self.bus.d1_mmc.read().unwrap().is_some();
-
         web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
             "[VM] D1 MMC loaded with {} byte disk image, attached={}, dtb=0x{:x}",
-            disk_image.len(), attached, dtb
+            disk_image.len(),
+            attached,
+            dtb
         )));
     }
 
@@ -669,11 +725,16 @@ impl WasmVm {
     ///
     /// Returns true if the event was sent successfully.
     pub fn send_touch_event(&self, x: u32, y: u32, pressed: bool) -> bool {
+        if let Some(ref input) = self.input_device {
+            input.push_mouse_move(x as u16, y as u16);
+            self.bus
+                .raise_device_activity(crate::bus::DEVICE_ACTIVITY_VIRTIO);
+            return true;
+        }
         if let Ok(mut touch) = self.bus.d1_touch.write() {
             if let Some(ref mut dev) = *touch {
                 dev.push_touch(x as u16, y as u16, pressed);
-                // Inject interrupt so kernel wakes up to process input
-                drop(touch); // Release lock before calling inject
+                drop(touch);
                 self.bus.inject_input_interrupt();
                 return true;
             }
@@ -699,6 +760,13 @@ impl WasmVm {
             Some(code) => code,
             None => return false, // Unknown key - don't send
         };
+
+        if let Some(ref input) = self.input_device {
+            input.push_key_event(linux_code, pressed);
+            self.bus
+                .raise_device_activity(crate::bus::DEVICE_ACTIVITY_VIRTIO);
+            return true;
+        }
         
         if let Ok(mut touch) = self.bus.d1_touch.write() {
             if let Some(ref mut dev) = *touch {
@@ -708,6 +776,20 @@ impl WasmVm {
                 self.bus.inject_input_interrupt();
                 return true;
             }
+        }
+        false
+    }
+
+    /// Send a typed ASCII character through virtio-input.
+    pub fn send_char_event(&self, char_code: u32) -> bool {
+        if char_code > 127 {
+            return false;
+        }
+        if let Some(ref input) = self.input_device {
+            input.push_char_event(char_code as u8);
+            self.bus
+                .raise_device_activity(crate::bus::DEVICE_ACTIVITY_VIRTIO);
+            return true;
         }
         false
     }
@@ -728,6 +810,10 @@ impl WasmVm {
     pub fn send_d1_char(&self, char_code: u32) -> bool {
         if char_code > 127 {
             return false; // Only ASCII for now
+        }
+
+        if self.send_char_event(char_code) {
+            return true;
         }
         
         if let Ok(mut touch) = self.bus.d1_touch.write() {
@@ -783,9 +869,13 @@ impl WasmVm {
 
     /// Check if there's a GPU frame ready for rendering.
     ///
-    /// With direct memory framebuffer, this always returns true when GPU is enabled.
-    /// The framebuffer at FRAMEBUFFER_ADDR always contains the current frame.
+    /// True once the guest published the HVFB doorbell, or when the host
+    /// attached a display device (enable_gpu). Present scrapes reserved DRAM,
+    /// not the D1 DE shadow buffer.
     pub fn has_gpu_frame(&self) -> bool {
+        if self.bus.dram.load_32(FB_META_OFF).unwrap_or(0) == FB_MAGIC {
+            return true;
+        }
         if let Ok(display) = self.bus.d1_display.read() {
             display.is_some()
         } else {
@@ -797,115 +887,105 @@ impl WasmVm {
     /// Returns a u32 that increments each time the kernel flushes dirty pixels.
     /// Browser can compare this to skip fetching unchanged frames.
     pub fn get_gpu_frame_version(&self) -> u32 {
-        // Frame version is stored at 0x80FF_FFFC by the kernel (virt DRAM-relative)
-        const FRAME_VERSION_PHYS_ADDR: u64 = 0x80FF_FFFC;
-
-        let dram_offset = match self.virt_fb_dram_offset(FRAME_VERSION_PHYS_ADDR) {
-            Some(off) => off,
-            None => return 0,
-        };
-
-        match self.bus.dram.load_32(dram_offset) {
-            Ok(version) => version,
-            Err(_) => 0,
-        }
+        self.bus
+            .dram
+            .load_32(self.fb_dram_offset(FB_FRAME_VERSION_OFF))
+            .unwrap_or(0)
     }
 
-    /// Get GPU frame data as RGBA pixels.
-    /// Returns a Uint8Array of pixel data, or null if no frame is available.
-    ///
-    /// The frame data is in RGBA format with 4 bytes per pixel (1024×768 = 3,145,728 bytes).
-    /// 
-    /// This reads from a fixed framebuffer address in guest memory (0x8100_0000).
-    /// The kernel GPU driver writes pixels there, and we read them here.
+    /// Get GPU frame data as RGBA pixels (stride-padded).
     pub fn get_gpu_frame(&self) -> Option<js_sys::Uint8Array> {
-        // Fixed framebuffer address in guest memory (after heap at 0x8080_0000)
-        // This must match the address used by the kernel's GPU driver
-        const FRAMEBUFFER_PHYS_ADDR: u64 = 0x8100_0000;
-        const FB_WIDTH: u32 = 1024;
-        const FB_HEIGHT: u32 = 768;
-        const FB_SIZE: usize = (FB_WIDTH * FB_HEIGHT * 4) as usize; // RGBA = 4 bytes/pixel
-
-        let dram_offset = match self.virt_fb_dram_offset(FRAMEBUFFER_PHYS_ADDR) {
-            Some(off) => off as usize,
-            None => return None,
-        };
-        
-        // Debug: Check first few pixels to see if there's any data
-        match self.bus.dram.read_range(dram_offset, FB_SIZE) {
+        let (off, _w, height, stride) = self.fb_layout();
+        let fb_size = stride * height as usize;
+        match self.bus.dram.read_range(off, fb_size) {
             Ok(pixels) => {
-                let arr = js_sys::Uint8Array::new_with_length(FB_SIZE as u32);
+                let arr = js_sys::Uint8Array::new_with_length(fb_size as u32);
                 arr.copy_from(&pixels);
                 Some(arr)
             }
-            Err(e) => {
-                web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(
-                    &format!("[GPU] Failed to read framebuffer at offset {:#x}: {:?}", dram_offset, e)
-                ));
-                None
-            }
+            Err(_) => None,
         }
     }
 
     /// Get GPU display dimensions.
     /// Returns [width, height] or null if GPU is not enabled.
     pub fn get_gpu_size(&self) -> Option<js_sys::Uint32Array> {
-        if let Ok(display) = self.bus.d1_display.read() {
-            if let Some(ref d) = *display {
-                let arr = js_sys::Uint32Array::new_with_length(2);
-                arr.set_index(0, d.width());
-                arr.set_index(1, d.height());
-                return Some(arr);
-            }
-        }
-        None
+        let (_off, width, height, _stride) = self.fb_layout();
+        let arr = js_sys::Uint32Array::new_with_length(3);
+        arr.set_index(0, width);
+        arr.set_index(1, height);
+        arr.set_index(2, _stride as u32);
+        Some(arr)
     }
 
     /// Get a direct zero-copy view into the framebuffer in SharedArrayBuffer.
-    /// 
-    /// This eliminates all memory copies by creating a Uint8Array view directly
-    /// into guest memory at the framebuffer offset. The browser can pass this
-    /// directly to WebGPU's writeTexture for zero-copy rendering.
     ///
-    /// Works in both memory modes:
-    /// - SMP (SharedArrayBuffer): stable view into the SAB.
-    /// - Single-hart (linear memory): view into WASM linear memory. This view
-    ///   is invalidated whenever WASM memory grows, so consume it immediately
-    ///   and call this again each frame (do not cache it JS-side).
+    /// Do not cache this view across Wasm memory growth.
     pub fn get_framebuffer_view(&self) -> Option<js_sys::Uint8Array> {
-        // Framebuffer is at physical 0x8100_0000 on virt (DRAM + 16 MiB).
-        // Do not scrape a D1 physical address with the virt constant.
-        if self.machine != Machine::Virt {
-            return None;
-        }
-        const FRAMEBUFFER_DRAM_OFFSET: usize = 0x0100_0000;
-        const FB_SIZE: usize = 1024 * 768 * 4; // 3,145,728 bytes
+        let (off, _w, height, stride) = self.fb_layout();
+        let fb_size = stride * height as usize;
+        self.bus.dram.js_view(off, fb_size)
+    }
 
-        self.bus.dram.js_view(FRAMEBUFFER_DRAM_OFFSET, FB_SIZE)
+    /// Existing framebuffer scrape. Re-fetch every frame (`memory.grow` detaches).
+    pub fn fallback_fb_view(&self) -> Option<js_sys::Uint8Array> {
+        self.get_framebuffer_view()
+    }
+
+    /// HDL mailbox publication sequence. `0` = unpublished / not advertised.
+    /// Re-fetch every frame; do not cache across `memory.grow`.
+    pub fn hdl_seq(&self) -> u32 {
+        crate::hdl::seq(&self.bus.dram)
+    }
+
+    /// Copy of the published HDL slot, `≤ nbytes` and at most 64 KiB.
+    /// Torn seq returns `null`. Does not parse opcodes.
+    pub fn hdl_take_frame(&self) -> Option<js_sys::Uint8Array> {
+        let bytes = crate::hdl::take_frame(&self.bus.dram)?;
+        let arr = js_sys::Uint8Array::new_with_length(bytes.len() as u32);
+        arr.copy_from(&bytes);
+        Some(arr)
+    }
+
+    /// Omit (`false`) or restore the virt HDL mailbox DTB node, then rewrite DTB.
+    /// Call before the guest parses the DTB. D1 stays omitted.
+    pub fn set_hdl_mailbox(&mut self, enabled: bool) {
+        self.bus.set_hdl_mailbox(enabled);
+        let dtb = self.bus.refresh_dtb(self.num_harts);
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+            "[VM] HDL mailbox DTB {} (dtb=0x{:x})",
+            if self.bus.hdl_mailbox_enabled() {
+                "advertised"
+            } else {
+                "omitted"
+            },
+            dtb
+        )));
+    }
+
+    /// Whether the live DTB will include `havy,hdl-mailbox`.
+    pub fn hdl_mailbox_enabled(&self) -> bool {
+        self.bus.hdl_mailbox_enabled()
+    }
+
+    /// Write mailbox `flags` bit1 `HOST_ACCEPTED`. No-op if unpublished.
+    /// DRAM store into `.hdl`, not MMIO. Returns false if the mailbox is absent.
+    pub fn hdl_set_host_accepted(&self, accepted: bool) -> bool {
+        crate::hdl::set_host_accepted(&self.bus.dram, accepted)
     }
 
     /// Get the dirty rectangle from the last frame flush.
-    /// 
+    ///
     /// Returns [min_x, min_y, max_x, max_y] or None if no dirty region.
-    /// The kernel writes this to 0x80FF_FFE0 each time it flushes the framebuffer.
-    /// This allows the browser to do partial texture uploads for better performance.
     pub fn get_gpu_dirty_rect(&self) -> Option<js_sys::Uint32Array> {
-        // Dirty rect is stored at 0x80FF_FFE0 by the kernel (4 x u32)
-        const DIRTY_RECT_PHYS_ADDR: u64 = 0x80FF_FFE0;
-
-        let dram_offset = self.virt_fb_dram_offset(DIRTY_RECT_PHYS_ADDR)?;
-        
-        // Read 4 u32 values: min_x, min_y, max_x, max_y
+        let dram_offset = self.fb_dram_offset(FB_DIRTY_RECT_OFF);
         let min_x = self.bus.dram.load_32(dram_offset).ok()?;
         let min_y = self.bus.dram.load_32(dram_offset + 4).ok()?;
         let max_x = self.bus.dram.load_32(dram_offset + 8).ok()?;
         let max_y = self.bus.dram.load_32(dram_offset + 12).ok()?;
-        
-        // Return None if dirty rect is invalid (max <= min means nothing dirty)
         if max_x <= min_x || max_y <= min_y {
             return None;
         }
-        
         let arr = js_sys::Uint32Array::new_with_length(4);
         arr.set_index(0, min_x);
         arr.set_index(1, min_y);
@@ -1168,6 +1248,7 @@ impl WasmVm {
 
         if activity & DEVICE_ACTIVITY_VIRTIO != 0 {
             self.bus.poll_virtio();
+            self.cpu.force_irq_poll();
         }
 
         // Bridge host-side network ingress. The receive-queue checks are
@@ -1368,36 +1449,10 @@ impl WasmVm {
                 return false;
             }
             Err(Trap::Wfi) => {
-                // WFI: Advance PC and sleep if no takeable interrupt.
+                // Hart 0 must not Atomics.wait here. The JS driver (run_batch /
+                // step_n) has to return to drain UART/HID rings; blocking the
+                // present worker until the next timer made the shell look frozen.
                 self.cpu.pc = self.cpu.pc.wrapping_add(4);
-                self.cpu.sync_hw_mip(&self.bus);
-                self.cpu.force_irq_poll();
-                if self.cpu.check_pending_interrupt().is_some() {
-                    return true;
-                }
-
-                if let Some(ref clint) = self.shared_clint {
-                    let (msip, timer) = clint.check_interrupts(0);
-                    if msip || timer {
-                        // Pending in CLINT but masked — yield so we don't busy-spin.
-                        let view = &clint.view;
-                        let index = clint.msip_index(0);
-                        let _ = js_sys::Atomics::wait_with_timeout(view, index, 0, 1.0);
-                    } else {
-                        let now = clint.mtime();
-                        let trigger = clint.get_mtimecmp(0);
-                        let timeout_ms = if trigger > now {
-                            let diff = trigger - now;
-                            let ms = diff / 10_000; // 10MHz CLINT
-                            if ms > 100 { 100 } else { ms.max(1) as i32 }
-                        } else {
-                            1
-                        };
-                        let view = &clint.view;
-                        let index = clint.msip_index(0);
-                        let _ = js_sys::Atomics::wait_with_timeout(view, index, 0, timeout_ms.into());
-                    }
-                }
                 self.cpu.sync_hw_mip(&self.bus);
                 self.cpu.force_irq_poll();
             }
@@ -1436,6 +1491,7 @@ impl WasmVm {
             self.num_harts - 1,
             worker_url
         )));
+        self.worker_ready_count.set(0);
 
         for hart_id in 1..self.num_harts {
             // Create worker with ESM module type
@@ -1447,6 +1503,8 @@ impl WasmVm {
 
             // Set up message handler for this worker
             let hart_id_copy = hart_id;
+            let ready_count = Rc::clone(&self.worker_ready_count);
+            let mut ready_seen = false;
             let onmessage = wasm_bindgen::closure::Closure::wrap(Box::new(
                 move |event: web_sys::MessageEvent| {
                     let data = event.data();
@@ -1456,6 +1514,10 @@ impl WasmVm {
                     {
                         match type_str.as_str() {
                             "ready" => {
+                                if !ready_seen {
+                                    ready_seen = true;
+                                    ready_count.set(ready_count.get() + 1);
+                                }
                                 web_sys::console::log_1(&JsValue::from_str(&format!(
                                     "[VM] Worker {} ready",
                                     hart_id_copy
@@ -1509,7 +1571,6 @@ impl WasmVm {
                 .map_err(|e| JsValue::from_str(&format!("Failed to send init message: {:?}", e)))?;
 
             self.workers.push(worker);
-            self.workers_ready.push(false);
         }
 
         self.workers_started = true;
@@ -1543,10 +1604,27 @@ impl WasmVm {
         self.entry_pc
     }
 
+    /// Number of secondary workers ready to execute.
+    pub fn workers_ready_count(&self) -> usize {
+        self.worker_ready_count.get()
+    }
+
+    /// True once every configured secondary worker has attached to the SAB.
+    pub fn all_workers_ready(&self) -> bool {
+        self.num_harts <= 1
+            || (self.workers_started
+                && self.worker_ready_count.get() >= self.num_harts.saturating_sub(1))
+    }
+
     /// Signal that workers can start executing.
-    /// Called by the main thread after hart 0 has finished initializing
-    /// kernel data structures.
+    /// Ignored until every worker has reported ready.
     pub fn allow_workers_to_start(&mut self) {
+        if !self.all_workers_ready() {
+            web_sys::console::warn_1(&JsValue::from_str(
+                "[VM] Refusing to start secondary harts before all workers are ready",
+            ));
+            return;
+        }
         if let Some(ref control) = self.shared_control {
             control.allow_workers_to_start();
             self.workers_signaled = true;
@@ -1565,7 +1643,7 @@ impl WasmVm {
             worker.terminate();
         }
         self.workers.clear();
-        self.workers_ready.clear();
+        self.worker_ready_count.set(0);
         self.workers_started = false;
 
         web_sys::console::log_1(&JsValue::from_str("[VM] All workers terminated"));
@@ -1647,12 +1725,18 @@ impl WasmVm {
                         return executed;
                     }
                     Err(Trap::Wfi) => {
-                        // Guest is idle: advance PC, sync interrupts, and end
-                        // the batch so the JS caller can pace (rAF/setTimeout)
-                        // instead of burning the remaining budget.
+                        // Guest is idle. If HID/timer/IPI is already pending, WFI
+                        // is a no-op and the next step must take the interrupt —
+                        // otherwise clicks sit in the virtqueue until the 4096-insn
+                        // poll budget, and gpuid never sees them.
+                        self.cpu.force_irq_poll();
+                        self.sync_clint_to_mip();
+                        if self.cpu.check_pending_interrupt().is_some() {
+                            executed += 1;
+                            continue;
+                        }
                         self.cpu.pc = self.cpu.pc.wrapping_add(4);
                         executed += 1;
-                        self.sync_clint_to_mip();
                         return executed;
                     }
                     Err(_) => {
@@ -1803,10 +1887,11 @@ impl WasmVm {
         self.bus.dram_size() as u64
     }
 
-    /// Get heap memory usage from the guest kernel.
+    /// Get heap memory usage from the guest kernel doorbell (not SysInfo MMIO).
     /// Returns (used_bytes, total_bytes).
     pub fn get_heap_usage(&self) -> js_sys::Array {
-        let (used, total) = self.bus.sysinfo.heap_usage();
+        let used = self.bus.dram.load_64(FB_META_OFF + 0x20).unwrap_or(0);
+        let total = self.bus.dram.load_64(FB_META_OFF + 0x28).unwrap_or(0);
         let arr = js_sys::Array::new();
         arr.push(&JsValue::from(used as f64));
         arr.push(&JsValue::from(total as f64));

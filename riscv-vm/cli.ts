@@ -63,6 +63,20 @@ function timebaseHz(machine?: string): number {
   return isD1Machine(machine) ? 24_000_000 : 10_000_000;
 }
 
+function parseHdlFlag(value: unknown): boolean {
+  if (value === false) return false;
+  if (value === true || value === null || value === undefined) return true;
+  switch (String(value).trim().toLowerCase()) {
+    case '0':
+    case 'false':
+    case 'no':
+    case 'off':
+      return false;
+    default:
+      return true;
+  }
+}
+
 /**
  * Auto-detect the number of harts based on CPU cores.
  * Uses all available cores since idle harts sleep via WFI (no CPU waste).
@@ -359,6 +373,8 @@ async function createVm(
     mountPath?: string;
     /** Guest board: virt (10 MHz) or d1 (24 MHz). */
     machine?: string;
+    /** Advertise HDL mailbox in the virt DTB. Default true; false omits the node. */
+    hdl?: boolean;
   },
 ) {
   let sdcardBytes: Uint8Array;
@@ -412,11 +428,18 @@ async function createVm(
   const requestedHarts = options?.harts;
   const machine = options?.machine;
   const virt = isVirtMachine(machine);
-  const vm = (!virt && typeof (VmCtor as any).new_with_machine === 'function')
+  const hdl = parseHdlFlag(options?.hdl) && virt;
+  const vm = (typeof (VmCtor as any).new_with_machine_hdl === 'function')
+    ? (VmCtor as any).new_with_machine_hdl(kernelBytes, requestedHarts ?? 0, machine ?? 'virt', hdl)
+    : (!virt && typeof (VmCtor as any).new_with_machine === 'function')
     ? (VmCtor as any).new_with_machine(kernelBytes, requestedHarts ?? 0, machine)
     : (requestedHarts !== undefined && requestedHarts >= 1 && VmCtor.new_with_harts)
       ? VmCtor.new_with_harts(kernelBytes, requestedHarts)
       : new VmCtor(kernelBytes);
+
+  if (hdl === false && typeof vm.set_hdl_mailbox === 'function') {
+    vm.set_hdl_mailbox(false);
+  }
 
   // Load entire SD card as block device (for filesystem partition access)
   if (typeof vm.load_disk === 'function') {
@@ -925,6 +948,7 @@ async function runVmWithGui(vm: any, nativeNetClient: any | null, workers: Worke
 
   const INSTRUCTIONS_PER_TICK = 100_000;
   let lastFrameVersion = 0;
+  let lastHdlSeq = 0;
   let networkConnected = false;
 
   const drainOutput = () => {
@@ -1016,6 +1040,22 @@ async function runVmWithGui(vm: any, nativeNetClient: any | null, workers: Worke
     }
   };
 
+  const pollHdlMailbox = () => {
+    if (typeof vm.hdl_seq !== 'function' || typeof vm.hdl_take_frame !== 'function') {
+      return;
+    }
+    const s1 = vm.hdl_seq() >>> 0;
+    if (s1 === 0 || s1 === lastHdlSeq) {
+      return;
+    }
+    const frame = vm.hdl_take_frame();
+    if (!frame) {
+      return;
+    }
+    lastHdlSeq = s1;
+    void frame;
+  };
+
   const loop = () => {
     if (!running) {
       // Window was closed or halt requested
@@ -1034,6 +1074,7 @@ async function runVmWithGui(vm: any, nativeNetClient: any | null, workers: Worke
 
       drainOutput();
       bridgeNetwork();
+      pollHdlMailbox();
       updateDisplay();
 
       if (typeof vm.is_halted === 'function' && vm.is_halted()) {
@@ -1063,9 +1104,13 @@ function printBanner(
   netWebtransport?: string,
   enableGpu = false,
   machine?: string,
+  hdl = true,
 ) {
   const sdcardName = path.basename(sdcardPath);
   const machineLabel = `${machine ?? 'virt'} (${timebaseHz(machine)} Hz)`;
+  const hdlLabel = hdl && isVirtMachine(machine)
+    ? 'advertised (DTB havy,hdl-mailbox)'
+    : 'omitted (kill-switch or d1)';
 
   console.log();
   console.log('╔══════════════════════════════════════════════════════════════╗');
@@ -1078,6 +1123,7 @@ function printBanner(
   console.log(`║  SD Card: ${sdcardName.padEnd(50)} ║`);
   console.log(`║  Harts:   ${String(numHarts).padEnd(50)} ║`);
   console.log(`║  Machine: ${machineLabel.padEnd(50)} ║`);
+  console.log(`║  HDL:     ${hdlLabel.padEnd(50)} ║`);
   if (netWebtransport) {
     console.log(`║  Network: ${netWebtransport.padEnd(50)} ║`);
   }
@@ -1125,6 +1171,11 @@ const argv = (yargs(hideBin(process.argv)) as any)
     describe: 'Enable GPU display (opens a window)',
     default: false,
   })
+  .option('hdl', {
+    type: 'string',
+    describe: 'Advertise HDL mailbox in virt DTB (0/false omits the node)',
+    default: process.env.HAVY_HDL ?? '1',
+  })
   .help()
   .version()
   .parseSync();
@@ -1138,6 +1189,7 @@ const argv = (yargs(hideBin(process.argv)) as any)
   const mountPath = argv.mount as string | undefined;
   const debug = argv.debug as boolean;
   const enableGpu = argv['enable-gpu'] as boolean;
+  const hdlArg = parseHdlFlag(argv.hdl) && isVirtMachine(machineArg);
 
   if (!isVirtMachine(machineArg) && !isD1Machine(machineArg)) {
     console.error(`[CLI] unknown machine ${JSON.stringify(machineArg)}; expected virt or d1`);
@@ -1164,7 +1216,7 @@ const argv = (yargs(hideBin(process.argv)) as any)
   }
 
   // Print banner
-  printBanner(sdcardPath, numHarts, netWebtransport, enableGpu, machineArg);
+  printBanner(sdcardPath, numHarts, netWebtransport, enableGpu, machineArg, hdlArg);
 
   try {
     const { vm, nativeNetClient, workers } = await createVm(sdcardPath, {
@@ -1175,6 +1227,7 @@ const argv = (yargs(hideBin(process.argv)) as any)
       enableGpu,
       mountPath,
       machine: machineArg,
+      hdl: hdlArg,
     });
 
 

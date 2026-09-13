@@ -7,12 +7,15 @@ use riscv_vm::Machine;
 use riscv_vm::sdboot;
 use riscv_vm::vm::native::NativeVm;
 
-#[cfg(feature = "gui")]
-use std::sync::Arc;
-#[cfg(feature = "gui")]
-use std::thread;
-#[cfg(feature = "gui")]
-use minifb::{Key, MouseButton, MouseMode, Window, WindowOptions, Scale};
+fn parse_hdl_flag(s: &str) -> Result<bool, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => Err(format!(
+            "invalid --hdl / HAVY_HDL value {other:?}; expected 0 or 1"
+        )),
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "riscv-vm")]
@@ -40,6 +43,19 @@ struct Args {
     /// Guest board: virt (QEMU-virt, 10 MHz timebase) or d1 (Allwinner, 24 MHz)
     #[arg(long, default_value = "virt")]
     machine: String,
+
+    /// Advertise the HDL mailbox in the virt DTB (`1`/`true`, default).
+    /// `--hdl=0` / `HAVY_HDL=0` omits the node (guest never reads env vars).
+    #[arg(
+        long,
+        env = "HAVY_HDL",
+        value_name = "0|1",
+        default_value = "1",
+        num_args = 0..=1,
+        default_missing_value = "1",
+        value_parser = parse_hdl_flag
+    )]
+    hdl: bool,
 
     /// WebTransport relay URL for networking (e.g., https://127.0.0.1:4433)
     #[arg(long)]
@@ -234,6 +250,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "║  Machine: {:52} ║",
         format!("{} (timebase {} Hz)", machine.as_str(), machine.timebase_hz())
     );
+    uart_println!(
+        "║  HDL:     {:52} ║",
+        if args.hdl && machine == Machine::Virt {
+            "advertised (DTB havy,hdl-mailbox)"
+        } else {
+            "omitted (kill-switch or d1)"
+        }
+    );
     if let Some(relay) = &args.net_webtransport {
         uart_println!("║  Network: {:52} ║", relay);
     }
@@ -241,7 +265,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     uart_println!();
 
     // Create VM with kernel from SD card
-    let mut vm = NativeVm::with_machine(&boot_info.kernel_data, num_harts, machine)?;
+    let hdl = args.hdl && machine == Machine::Virt;
+    let mut vm = NativeVm::with_machine_hdl(&boot_info.kernel_data, num_harts, machine, hdl)?;
 
     // Load entire SD card as block device (for filesystem partition)
     vm.load_disk(sdcard_data);
@@ -266,7 +291,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Run VM - with or without GUI
     #[cfg(feature = "gui")]
     if args.enable_gpu {
-        run_with_gui(vm, args.scale)?;
+        riscv_vm::hdl_gui::run(vm, args.scale)?;
     } else {
         run_headless(vm);
     }
@@ -324,230 +349,3 @@ fn run_headless(mut vm: NativeVm) {
         uart_println!("[VM] Shutdown with code: {:#x}", halt_code);
     }
 }
-
-/// Run VM with GUI window
-#[cfg(feature = "gui")]
-fn run_with_gui(mut vm: NativeVm, scale_factor: u8) -> Result<(), Box<dyn std::error::Error>> {
-    let (width, height) = (1024, 768);
-    let scale = match scale_factor {
-        2 => Scale::X2,
-        4 => Scale::X4,
-        _ => Scale::X1,
-    };
-    
-    let mut window = Window::new(
-        "RISC-V VM",
-        width,
-        height,
-        WindowOptions {
-            scale,
-            ..WindowOptions::default()
-        },
-    )?;
-
-    // Limit to ~60 FPS
-    window.set_target_fps(60);
-
-    uart_println!("[GUI] Window opened ({}x{}, scale {})", width, height, scale_factor);
-
-    // Get shared state and bus for GUI thread
-    let shared = Arc::clone(&vm.shared);
-    let bus = Arc::clone(vm.bus());
-
-    // Run the VM in a separate thread
-    let vm_thread = thread::spawn(move || {
-        vm.run();
-    });
-
-    // Main GUI loop - polls framebuffer and updates window
-    let mut last_frame_version: u32 = 0;
-    let mut last_mouse_pressed = false;
-
-    while window.is_open() && !window.is_key_down(Key::Escape) {
-        // Check for VM halt
-        if shared.is_halted() {
-            break;
-        }
-
-        // Track whether any input was queued this frame so we can raise the
-        // PLIC input line once (the kernel's input path is interrupt-gated)
-        let mut input_queued = false;
-
-        // Handle mouse/touch input
-        let mouse_pressed = window.get_mouse_down(MouseButton::Left);
-        if let Some((mx, my)) = window.get_mouse_pos(MouseMode::Clamp) {
-            let x = mx as u32;
-            let y = my as u32;
-            
-            // Send touch events to the D1 touch controller
-            if mouse_pressed && !last_mouse_pressed {
-                // Mouse down
-                if let Ok(mut touch) = bus.d1_touch.write() {
-                    if let Some(ref mut dev) = *touch {
-                        dev.push_touch(x as u16, y as u16, true);
-                        input_queued = true;
-                    }
-                }
-            } else if !mouse_pressed && last_mouse_pressed {
-                // Mouse up
-                if let Ok(mut touch) = bus.d1_touch.write() {
-                    if let Some(ref mut dev) = *touch {
-                        dev.push_touch(x as u16, y as u16, false);
-                        input_queued = true;
-                    }
-                }
-            }
-        }
-        last_mouse_pressed = mouse_pressed;
-
-        // Handle keyboard input
-        let keys = window.get_keys_pressed(minifb::KeyRepeat::Yes);
-        for key in keys {
-                if let Ok(mut touch) = bus.d1_touch.write() {
-                    if let Some(ref mut dev) = *touch {
-                        input_queued = true;
-                        // Map minifb Key to character or special key event
-                        match key {
-                            // Special keys - send as key events
-                            Key::Enter => dev.push_key(28, true),      // KEY_ENTER
-                            Key::Backspace => dev.push_key(14, true),  // KEY_BACKSPACE
-                            Key::Tab => dev.push_key(15, true),        // KEY_TAB
-                            Key::Up => dev.push_key(103, true),        // KEY_UP
-                            Key::Down => dev.push_key(108, true),      // KEY_DOWN
-                            Key::Left => dev.push_key(105, true),      // KEY_LEFT
-                            Key::Right => dev.push_key(106, true),     // KEY_RIGHT
-                            Key::Home => dev.push_key(102, true),      // KEY_HOME
-                            Key::End => dev.push_key(107, true),       // KEY_END
-                            Key::PageUp => dev.push_key(104, true),    // KEY_PAGEUP
-                            Key::PageDown => dev.push_key(109, true),  // KEY_PAGEDOWN
-                            Key::Delete => dev.push_key(111, true),    // KEY_DELETE
-                            Key::Insert => dev.push_key(110, true),    // KEY_INSERT
-                            
-                            // Printable characters - send as char events
-                            Key::Space => dev.push_char(b' '),
-                            Key::Key0 => dev.push_char(b'0'),
-                            Key::Key1 => dev.push_char(b'1'),
-                            Key::Key2 => dev.push_char(b'2'),
-                            Key::Key3 => dev.push_char(b'3'),
-                            Key::Key4 => dev.push_char(b'4'),
-                            Key::Key5 => dev.push_char(b'5'),
-                            Key::Key6 => dev.push_char(b'6'),
-                            Key::Key7 => dev.push_char(b'7'),
-                            Key::Key8 => dev.push_char(b'8'),
-                            Key::Key9 => dev.push_char(b'9'),
-                            Key::A => dev.push_char(b'a'),
-                            Key::B => dev.push_char(b'b'),
-                            Key::C => dev.push_char(b'c'),
-                            Key::D => dev.push_char(b'd'),
-                            Key::E => dev.push_char(b'e'),
-                            Key::F => dev.push_char(b'f'),
-                            Key::G => dev.push_char(b'g'),
-                            Key::H => dev.push_char(b'h'),
-                            Key::I => dev.push_char(b'i'),
-                            Key::J => dev.push_char(b'j'),
-                            Key::K => dev.push_char(b'k'),
-                            Key::L => dev.push_char(b'l'),
-                            Key::M => dev.push_char(b'm'),
-                            Key::N => dev.push_char(b'n'),
-                            Key::O => dev.push_char(b'o'),
-                            Key::P => dev.push_char(b'p'),
-                            Key::Q => dev.push_char(b'q'),
-                            Key::R => dev.push_char(b'r'),
-                            Key::S => dev.push_char(b's'),
-                            Key::T => dev.push_char(b't'),
-                            Key::U => dev.push_char(b'u'),
-                            Key::V => dev.push_char(b'v'),
-                            Key::W => dev.push_char(b'w'),
-                            Key::X => dev.push_char(b'x'),
-                            Key::Y => dev.push_char(b'y'),
-                            Key::Z => dev.push_char(b'z'),
-                            Key::Minus => dev.push_char(b'-'),
-                            Key::Equal => dev.push_char(b'='),
-                            Key::LeftBracket => dev.push_char(b'['),
-                            Key::RightBracket => dev.push_char(b']'),
-                            Key::Backslash => dev.push_char(b'\\'),
-                            Key::Semicolon => dev.push_char(b';'),
-                            Key::Apostrophe => dev.push_char(b'\''),
-                            Key::Comma => dev.push_char(b','),
-                            Key::Period => dev.push_char(b'.'),
-                            Key::Slash => dev.push_char(b'/'),
-                            Key::Backquote => dev.push_char(b'`'),
-                            _ => {} // Ignore other keys
-                        }
-                    }
-                }
-            }
-
-        // Raise the PLIC input line so the kernel's interrupt-gated input
-        // path (gpuid) wakes up and drains the queues
-        if input_queued {
-            bus.inject_input_interrupt();
-        }
-
-        // Drain UART output to console
-        for byte in bus.uart.drain_output() {
-            if byte == b'\n' {
-                print!("\r\n");
-            } else {
-                print!("{}", byte as char);
-            }
-        }
-        let _ = std::io::stdout().flush();
-
-        // Read frame version from guest memory (virt DRAM-relative protocol)
-        if bus.machine == Machine::Virt {
-            const FRAME_VERSION_PHYS_ADDR: u64 = 0x80FF_FFFC;
-            let dram_offset = FRAME_VERSION_PHYS_ADDR - bus.dram_base();
-            let frame_version = bus.dram.load_32(dram_offset).unwrap_or(0);
-
-            // Update frame only if changed
-            if frame_version != last_frame_version {
-                last_frame_version = frame_version;
-
-                // Read framebuffer from guest memory
-                const FRAMEBUFFER_PHYS_ADDR: u64 = 0x8100_0000;
-                const FB_SIZE_BYTES: usize = 1024 * 768 * 4;
-                let fb_offset = (FRAMEBUFFER_PHYS_ADDR - bus.dram_base()) as usize;
-
-                if let Ok(bytes) = bus.dram.read_range(fb_offset, FB_SIZE_BYTES) {
-                    // Convert RGBA u8 to ARGB u32 for minifb
-                    let frame: Vec<u32> = bytes.chunks_exact(4).map(|c| {
-                        ((c[3] as u32) << 24) | ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | (c[2] as u32)
-                    }).collect();
-
-                    if let Err(e) = window.update_with_buffer(&frame, width, height) {
-                        eprintln!("[GUI] Failed to update window: {}", e);
-                        break;
-                    }
-                }
-            } else {
-                // Still need to update window to process events
-                window.update();
-            }
-        } else {
-            window.update();
-        }
-    }
-
-    // Signal VM to stop
-    shared.request_halt();
-
-    // Wait for VM thread to finish
-    uart_println!();
-    uart_println!("[GUI] Window closed, waiting for VM to stop...");
-    
-    if let Err(e) = vm_thread.join() {
-        eprintln!("[GUI] VM thread panicked: {:?}", e);
-    }
-
-    let halt_code = shared.halt_code();
-    if halt_code == 0x5555 {
-        uart_println!("[VM] Clean shutdown (PASS)");
-    } else if halt_code != 0 {
-        uart_println!("[VM] Shutdown with code: {:#x}", halt_code);
-    }
-
-    Ok(())
-}
-
-

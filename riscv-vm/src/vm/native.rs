@@ -129,6 +129,18 @@ impl NativeVm {
         num_harts: usize,
         machine: Machine,
     ) -> Result<Self, String> {
+        Self::with_machine_hdl(kernel, num_harts, machine, machine == Machine::Virt)
+    }
+
+    /// Create a VM with an explicit HDL mailbox kill-switch.
+    ///
+    /// `hdl = false` omits the virt DTB node. D1 never advertises it.
+    pub fn with_machine_hdl(
+        kernel: &[u8],
+        num_harts: usize,
+        machine: Machine,
+        hdl: bool,
+    ) -> Result<Self, String> {
         let map = machine.memory_map();
         let registry = Arc::new(crate::hart_registry::native::NativeHartRegistry::new(num_harts));
         let bus = SystemBus::with_registry(map.dram_base, map.dram_size, registry);
@@ -153,12 +165,14 @@ impl NativeVm {
             *bus.d1_emac.write().unwrap() = Some(emac);
         }
 
+        bus.set_hdl_mailbox(hdl);
         let dtb_address = bus.refresh_dtb(num_harts);
         println!(
-            "[VM] Generated DTB at 0x{:x} (machine {}, timebase {} Hz)",
+            "[VM] Generated DTB at 0x{:x} (machine {}, timebase {} Hz, hdl={})",
             dtb_address,
             machine.as_str(),
-            machine.timebase_hz()
+            machine.timebase_hz(),
+            bus.hdl_mailbox_enabled()
         );
 
         let bus = Arc::new(bus);
@@ -193,11 +207,22 @@ impl NativeVm {
         Self::new(kernel, num_harts)
     }
 
-    /// Load a disk image and attach as D1 MMC device.
+    /// Load a disk image. Virt: virtio-blk (Linux partition). D1: MMC.
     pub fn load_disk(&mut self, disk: Vec<u8>) {
         use crate::devices::d1_mmc::D1MmcEmulated;
+        use crate::devices::virtio::VirtioBlock;
+        use crate::machine::Machine;
+        use crate::sdboot::linux_partition_image;
 
         if let Some(bus) = Arc::get_mut(&mut self.bus) {
+            if self.machine == Machine::Virt {
+                let fs = linux_partition_image(&disk);
+                let n = fs.len();
+                bus.virtio_devices.push(Box::new(VirtioBlock::new(fs)));
+                let dtb = bus.refresh_dtb(self.num_harts);
+                println!("[VM] virtio-blk loaded ({} bytes, dtb=0x{:x})", n, dtb);
+                return;
+            }
             let mmc = D1MmcEmulated::new(disk);
             *bus.d1_mmc.write().unwrap() = Some(mmc);
             let dtb = bus.refresh_dtb(self.num_harts);
@@ -309,13 +334,9 @@ impl NativeVm {
         self.machine
     }
 
-    /// Framebuffer protocol addresses are virt DRAM-relative (`0x8100_0000`).
-    /// Do not subtract virt `DRAM_BASE` from a D1 physical address.
-    fn virt_fb_dram_offset(&self, phys: u64) -> Option<u64> {
-        if self.machine != Machine::Virt {
-            return None;
-        }
-        phys.checked_sub(self.bus.dram_base())
+    /// Framebuffer protocol is DRAM-relative (doorbell + scanout at +16 MiB).
+    fn fb_dram_offset(&self, dram_rel: u64) -> u64 {
+        dram_rel
     }
 
 
@@ -337,7 +358,10 @@ impl NativeVm {
     /// Get heap memory usage from the guest kernel.
     /// Returns (used_bytes, total_bytes).
     pub fn get_heap_usage(&self) -> (u64, u64) {
-        self.bus.sysinfo.heap_usage()
+        const META: u64 = 0x00FF_F000;
+        let used = self.bus.dram.load_64(META + 0x20).unwrap_or(0);
+        let total = self.bus.dram.load_64(META + 0x28).unwrap_or(0);
+        (used, total)
     }
 
     /// Get disk usage from the guest kernel.
@@ -383,18 +407,19 @@ impl NativeVm {
     /// Returns the framebuffer contents as a Vec<u8> with 4 bytes per pixel (RGBA).
     /// Returns None if GPU is not enabled.
     pub fn get_gpu_frame(&self) -> Option<Vec<u8>> {
-        const FRAMEBUFFER_PHYS_ADDR: u64 = 0x8100_0000;
-        const FB_WIDTH: usize = 1024;
-        const FB_HEIGHT: usize = 768;
-        const FB_SIZE_BYTES: usize = FB_WIDTH * FB_HEIGHT * 4;
-
-        // Check if display is enabled
-        if self.bus.d1_display.read().ok()?.is_none() {
-            return None;
-        }
-
-        let dram_offset = self.virt_fb_dram_offset(FRAMEBUFFER_PHYS_ADDR)? as usize;
-        self.bus.dram.read_range(dram_offset, FB_SIZE_BYTES).ok()
+        const FB_OFF: usize = 0x0100_0000;
+        const META: u64 = 0x00FF_F000;
+        const MAGIC: u32 = 0x4856_4642;
+        let (width, height, stride) = if self.bus.dram.load_32(META).unwrap_or(0) == MAGIC {
+            let w = self.bus.dram.load_32(META + 0x10).unwrap_or(1024).max(1);
+            let h = self.bus.dram.load_32(META + 0x14).unwrap_or(768).max(1);
+            let s = self.bus.dram.load_32(META + 0x18).unwrap_or(w * 4) as usize;
+            (w, h, s.max(w as usize * 4))
+        } else {
+            (1024, 768, 4096)
+        };
+        let fb_size = stride * height as usize;
+        self.bus.dram.read_range(FB_OFF, fb_size).ok()
     }
 
     /// Get GPU frame data as ARGB u32 values (for minifb compatibility).
@@ -414,6 +439,15 @@ impl NativeVm {
     /// Get GPU display dimensions.
     /// Returns (width, height) or None if GPU is not enabled.
     pub fn get_gpu_size(&self) -> Option<(u32, u32)> {
+        const META: u64 = 0x00FF_F000;
+        const MAGIC: u32 = 0x4856_4642;
+        if self.bus.dram.load_32(META).unwrap_or(0) == MAGIC {
+            let w = self.bus.dram.load_32(META + 0x10).unwrap_or(0);
+            let h = self.bus.dram.load_32(META + 0x14).unwrap_or(0);
+            if w > 0 && h > 0 {
+                return Some((w, h));
+            }
+        }
         let display = self.bus.d1_display.read().ok()?;
         let d = display.as_ref()?;
         Some((d.width(), d.height()))
@@ -423,12 +457,47 @@ impl NativeVm {
     /// Returns a u32 that increments each time the kernel flushes dirty pixels.
     /// Can be used to skip unchanged frames.
     pub fn get_gpu_frame_version(&self) -> u32 {
-        const FRAME_VERSION_PHYS_ADDR: u64 = 0x80FF_FFFC;
-        let dram_offset = match self.virt_fb_dram_offset(FRAME_VERSION_PHYS_ADDR) {
-            Some(off) => off,
-            None => return 0,
-        };
-        self.bus.dram.load_32(dram_offset).unwrap_or(0)
+        const FRAME_VERSION_OFF: u64 = 0x00FF_FFFC;
+        self.bus.dram.load_32(self.fb_dram_offset(FRAME_VERSION_OFF)).unwrap_or(0)
+    }
+
+    /// HDL mailbox publication sequence. `0` = unpublished / not advertised.
+    pub fn hdl_seq(&self) -> u32 {
+        crate::hdl::seq(&self.bus.dram)
+    }
+
+    /// Copy of the published HDL slot (`≤ nbytes`, max 64 KiB). Torn seq is `None`.
+    pub fn hdl_take_frame(&self) -> Option<Vec<u8>> {
+        crate::hdl::take_frame(&self.bus.dram)
+    }
+
+    /// Copy a new published slot, skipping `last_accepted`. Does not parse opcodes.
+    pub fn hdl_take_frame_if_new(&self, last_accepted: &mut u32) -> Option<Vec<u8>> {
+        crate::hdl::take_frame_if_new(&self.bus.dram, last_accepted)
+    }
+
+    /// Omit or restore the virt HDL mailbox DTB node and rewrite the blob.
+    pub fn set_hdl_mailbox(&self, enabled: bool) {
+        self.bus.set_hdl_mailbox(enabled);
+        let dtb = self.bus.refresh_dtb(self.num_harts);
+        println!(
+            "[VM] HDL mailbox DTB {} (dtb=0x{:x})",
+            if self.bus.hdl_mailbox_enabled() {
+                "advertised"
+            } else {
+                "omitted"
+            },
+            dtb
+        );
+    }
+
+    pub fn hdl_mailbox_enabled(&self) -> bool {
+        self.bus.hdl_mailbox_enabled()
+    }
+
+    /// Write mailbox `flags` bit1 `HOST_ACCEPTED`. No-op if unpublished.
+    pub fn hdl_set_host_accepted(&self, accepted: bool) -> bool {
+        crate::hdl::set_host_accepted(&self.bus.dram, accepted)
     }
 
     // ========================================================================

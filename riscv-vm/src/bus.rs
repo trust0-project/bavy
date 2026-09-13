@@ -519,6 +519,10 @@ pub struct SystemBus {
 
     /// Bumped on SFENCE.VMA / FENCE.I / SBI RFENCE so every hart drops caches.
     fence_seq: std::sync::atomic::AtomicU32,
+
+    /// Advertise the virt HDL mailbox in the DTB. Default on for Virt.
+    /// Kill-switch (`--hdl=0` / `HAVY_HDL=0` / `?hdl=0`) stores false.
+    hdl_mailbox: std::sync::atomic::AtomicBool,
 }
 
 /// Device activity bit: guest wrote a VirtIO MMIO register.
@@ -543,6 +547,8 @@ impl SystemBus {
         dram_size: usize,
         registry: Arc<dyn HartRegistry>,
     ) -> Self {
+        let machine = crate::machine::Machine::from_dram_base(dram_base)
+            .unwrap_or(crate::machine::Machine::Virt);
         Self {
             dram: Dram::new(dram_base, dram_size),
             clint: Clint::new(),
@@ -565,9 +571,9 @@ impl SystemBus {
             shared_control: None,
             rtc_timestamp: std::sync::atomic::AtomicU64::new(0),
             device_activity: std::sync::atomic::AtomicU32::new(DEVICE_ACTIVITY_VIRTIO | DEVICE_ACTIVITY_EMAC),
-            machine: crate::machine::Machine::from_dram_base(dram_base)
-                .unwrap_or(crate::machine::Machine::Virt),
+            machine,
             fence_seq: std::sync::atomic::AtomicU32::new(0),
+            hdl_mailbox: std::sync::atomic::AtomicBool::new(machine == crate::machine::Machine::Virt),
             registry,
         }
     }
@@ -632,6 +638,7 @@ impl SystemBus {
             device_activity: std::sync::atomic::AtomicU32::new(DEVICE_ACTIVITY_VIRTIO | DEVICE_ACTIVITY_EMAC),
             machine: crate::machine::Machine::Virt,
             fence_seq: std::sync::atomic::AtomicU32::new(0),
+            hdl_mailbox: std::sync::atomic::AtomicBool::new(true),
             registry,
         }
     }
@@ -708,7 +715,21 @@ impl SystemBus {
             has_touch: self.d1_touch.read().map(|g| g.is_some()).unwrap_or(false),
             has_audio: self.d1_audio.read().map(|g| g.is_some()).unwrap_or(false),
             virtio_count: self.virtio_devices.len(),
+            hdl_mailbox: self.hdl_mailbox_enabled(),
         }
+    }
+
+    /// Enable or omit the virt HDL mailbox DTB node. D1 is always omitted.
+    pub fn set_hdl_mailbox(&self, enabled: bool) {
+        let on = enabled && self.machine == crate::machine::Machine::Virt;
+        self.hdl_mailbox
+            .store(on, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether the next DTB refresh will include `havy,hdl-mailbox`.
+    pub fn hdl_mailbox_enabled(&self) -> bool {
+        self.machine == crate::machine::Machine::Virt
+            && self.hdl_mailbox.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Rewrite the guest DTB from live attachments. Returns the DTB physical address.
@@ -870,8 +891,15 @@ impl SystemBus {
             // Note: Shared CLINT timer is ticked separately in WasmVm::step()
             self.clint.tick();
 
-            // Update PLIC with UART interrupt status
-            let uart_irq = self.uart.is_interrupting();
+            // In SMP, host input lives in the shared UART ring rather than the
+            // local NS16550 FIFO. Drive RX IRQ from that ring while respecting
+            // the guest's IER setting.
+            let shared_rx_irq = self
+                .shared_uart_input
+                .as_ref()
+                .is_some_and(|input| input.has_data())
+                && self.uart.rx_interrupt_enabled();
+            let uart_irq = self.uart.is_interrupting() || shared_rx_irq;
             self.plic.set_source_level(UART_IRQ, uart_irq);
 
             // Update PLIC with VirtIO interrupts
@@ -886,20 +914,23 @@ impl SystemBus {
             self.refresh_touch_irq_level();
         }
 
-        // SEIP (Supervisor External Interrupt) - Bit 9
-        if self
-            .plic
-            .is_interrupt_pending_for_fast(Plic::s_context(hart_id))
-        {
-            mip |= 1 << 9;
-        }
+        // Device emulation is owned by hart 0. Secondary workers have no
+        // device objects, so external interrupts are deliberately targeted
+        // only at the BSP; secondaries use the guest io_router + IPIs.
+        if hart_id == 0 {
+            if self
+                .plic
+                .is_interrupt_pending_for_fast(Plic::s_context(0))
+            {
+                mip |= 1 << 9;
+            }
 
-        // MEIP (Machine External Interrupt) - Bit 11
-        if self
-            .plic
-            .is_interrupt_pending_for_fast(Plic::m_context(hart_id))
-        {
-            mip |= 1 << 11;
+            if self
+                .plic
+                .is_interrupt_pending_for_fast(Plic::m_context(0))
+            {
+                mip |= 1 << 11;
+            }
         }
 
         mip

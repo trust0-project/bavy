@@ -26,6 +26,7 @@ pub const EV_SYN: u16 = 0x00;
 pub const EV_KEY: u16 = 0x01;
 pub const EV_REL: u16 = 0x02;
 pub const EV_ABS: u16 = 0x03;
+pub const EV_CHAR: u16 = 0x10;
 
 // Absolute position codes (for mouse/tablet)
 pub const ABS_X: u16 = 0x00;
@@ -222,6 +223,22 @@ impl VirtioInput {
         if state.debug {
             log::debug!("[VirtIO Input] Key event: code={} pressed={}", code, pressed);
         }
+    }
+
+    /// Typed character (browser layout). Delivered as EV_CHAR so the guest
+    /// does not need the D1 I2C2+0x100 char MMIO.
+    pub fn push_char_event(&self, char_code: u8) {
+        let mut state = self.state.lock().unwrap();
+        state.event_queue.push_back(InputEvent {
+            event_type: EV_CHAR,
+            code: char_code as u16,
+            value: 1,
+        });
+        state.event_queue.push_back(InputEvent {
+            event_type: EV_SYN,
+            code: 0,
+            value: 0,
+        });
     }
 
     /// Push a mouse movement event (absolute position)

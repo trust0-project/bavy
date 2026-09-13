@@ -39,6 +39,27 @@ export interface VmOptions {
    * `d1` is Allwinner D1 / Lichee RV at 24 MHz.
    */
   machine?: string;
+  /**
+   * Advertise the HDL mailbox in the virt DTB (default true on virt).
+   * Pass `false` for the kill-switch (`?hdl=0` / `HAVY_HDL=0`).
+   * D1 never advertises the node. Guest does not read env vars.
+   */
+  hdl?: boolean;
+}
+
+/** Map `?hdl=0` / `HAVY_HDL=0` / `"false"` to a constructor boolean. */
+export function parseHdlFlag(value: string | boolean | null | undefined): boolean {
+  if (value === false) return false;
+  if (value === true || value === null || value === undefined) return true;
+  switch (String(value).trim().toLowerCase()) {
+    case '0':
+    case 'false':
+    case 'no':
+    case 'off':
+      return false;
+    default:
+      return true;
+  }
 }
 
 function isVirtMachine(machine?: string): boolean {
@@ -68,6 +89,7 @@ function isVirtMachine(machine?: string): boolean {
  * @param options - VM configuration options
  * @param options.harts - Number of harts: undefined/0 = auto-detect (cpu/2), >= 1 = explicit count
  * @param options.machine - Guest board: `virt` (10 MHz) or `d1` (24 MHz). Default virt.
+ * @param options.hdl - Advertise HDL mailbox in the virt DTB. Default true; `false` omits the node.
  * @returns WasmVm instance
  */
 export async function createVM(
@@ -81,11 +103,23 @@ export async function createVM(
   // - >= 1: use the specified value via new_with_harts
   const harts = options.harts;
   const machine = options.machine;
+  const hartsArg = (harts !== undefined && harts >= 1) ? harts : 0;
+  const machineStr = machine || 'virt';
+  const hdl = parseHdlFlag(options.hdl) && isVirtMachine(machineStr);
 
-  // Create VM with specified hart count / board.
-  // Non-virt boards go through new_with_machine; virt keeps the existing constructors.
-  const vm = (!isVirtMachine(machine) && typeof module.WasmVm.new_with_machine === 'function')
-    ? module.WasmVm.new_with_machine(kernelData, (harts !== undefined && harts >= 1) ? harts : 0, machine as string)
+  // Prefer the HDL-aware constructor so the first DTB already matches the kill-switch.
+  const WasmVm = module.WasmVm as typeof module.WasmVm & {
+    new_with_machine_hdl?: (
+      kernel: Uint8Array,
+      num_harts: number,
+      machine: string,
+      hdl: boolean,
+    ) => import("./pkg/riscv_vm").WasmVm;
+  };
+  const vm = (typeof WasmVm.new_with_machine_hdl === 'function')
+    ? WasmVm.new_with_machine_hdl(kernelData, hartsArg, machineStr, hdl)
+    : (!isVirtMachine(machine) && typeof module.WasmVm.new_with_machine === 'function')
+    ? module.WasmVm.new_with_machine(kernelData, hartsArg, machine as string)
     : (harts !== undefined && harts >= 1)
       ? module.WasmVm.new_with_harts(kernelData, harts)
       : new module.WasmVm(kernelData);

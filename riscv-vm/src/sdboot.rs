@@ -40,6 +40,25 @@ pub fn parse_mbr(sector0: &[u8]) -> Result<[PartitionEntry; 4], &'static str> {
     Ok(partitions)
 }
 
+/// Slice the Linux (0x83) partition out of an SD card image.
+/// VirtIO-blk presents this as sector 0 (SFS). Whole image if no MBR.
+pub fn linux_partition_image(disk: &[u8]) -> Vec<u8> {
+    let Ok(parts) = parse_mbr(disk) else {
+        return disk.to_vec();
+    };
+    for part in &parts {
+        if part.partition_type == 0x83 && part.sector_count > 0 {
+            let start = (part.start_lba as usize).saturating_mul(512);
+            let len = (part.sector_count as usize).saturating_mul(512);
+            if start < disk.len() {
+                let end = (start + len).min(disk.len());
+                return disk[start..end].to_vec();
+            }
+        }
+    }
+    disk.to_vec()
+}
+
 /// Find boot partition (FAT32 or FAT16)
 pub fn find_boot_partition(partitions: &[PartitionEntry; 4]) -> Option<&PartitionEntry> {
     for part in partitions {

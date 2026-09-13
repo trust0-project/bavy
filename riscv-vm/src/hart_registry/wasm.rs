@@ -8,7 +8,7 @@ use wasm_bindgen::JsValue;
 
 use super::{
     HartControlBlock, HartError, HartRegistry, HartState, WakeReason,
-    HCB_FLAG_PRESERVE_BOOT_PC, MAX_HARTS, HCB_SIZE,
+    HCB_FLAG_PRESERVE_BOOT_PC, HCB_FLAG_START_PARAMS_READY, MAX_HARTS, HCB_SIZE,
 };
 
 /// Offset of HCB region within the control region of SharedArrayBuffer.
@@ -213,6 +213,22 @@ impl WasmHartRegistry {
         let _ = js_sys::Atomics::notify(&self.view, idx);
     }
 
+    /// Park a worker briefly while its HCB remains in `state`.
+    ///
+    /// Waiting on the HCB state (rather than the unrelated global worker
+    /// gate) lets `sbi_hart_start` wake the exact target immediately.
+    pub fn wait_state_brief(&self, hart_id: usize, state: HartState, timeout_ms: f64) {
+        if hart_id >= self.num_harts {
+            return;
+        }
+        let _ = js_sys::Atomics::wait_with_timeout(
+            &self.view,
+            self.state_index(hart_id),
+            state as i32,
+            timeout_ms,
+        );
+    }
+
     /// Load a 64-bit value from two consecutive i32 fields.
     #[inline]
     fn load_u64(&self, hart_id: usize, lo_offset: usize) -> u64 {
@@ -298,10 +314,12 @@ impl HartRegistry for WasmHartRegistry {
         self.store_u64(hart_id, 2, addr); // start_addr at offset 2-3
         self.store_u64(hart_id, 4, opaque); // opaque at offset 4-5
         
-        let flags = if preserve_boot_pc { HCB_FLAG_PRESERVE_BOOT_PC } else { 0 };
-        self.store_flags(hart_id, flags);
-        
         self.store_wake_reason(hart_id, WakeReason::Start);
+        let flags = HCB_FLAG_START_PARAMS_READY
+            | if preserve_boot_pc { HCB_FLAG_PRESERVE_BOOT_PC } else { 0 };
+        // Publish READY last. Atomics.store is sequentially consistent, so a
+        // worker that observes this flag also observes both 64-bit parameters.
+        self.store_flags(hart_id, flags);
 
         // Wake the hart using Atomics.notify
         self.notify(hart_id);
@@ -329,6 +347,8 @@ impl HartRegistry for WasmHartRegistry {
             };
         }
 
+        // Clear the previous request before making the HCB reservable again.
+        self.store_flags(hart_id, 0);
         self.store_state(hart_id, HartState::Stopped);
         self.notify(hart_id);
         Ok(())
@@ -343,7 +363,9 @@ impl HartRegistry for WasmHartRegistry {
 
         loop {
             let state = self.load_state(hart_id);
-            if state == HartState::StartPending || state == HartState::Started {
+            if (state == HartState::StartPending || state == HartState::Started)
+                && (self.load_flags(hart_id) & HCB_FLAG_START_PARAMS_READY) != 0
+            {
                 break;
             }
 

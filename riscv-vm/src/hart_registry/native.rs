@@ -7,7 +7,7 @@ use std::sync::{Condvar, Mutex};
 
 use super::{
     HartControlBlock, HartError, HartRegistry, HartState, WakeReason,
-    HCB_FLAG_PRESERVE_BOOT_PC, MAX_HARTS,
+    HCB_FLAG_PRESERVE_BOOT_PC, HCB_FLAG_START_PARAMS_READY, MAX_HARTS,
 };
 
 /// Per-hart synchronization primitives.
@@ -110,10 +110,12 @@ impl HartRegistry for NativeHartRegistry {
         hcb.set_start_addr(addr);
         hcb.set_opaque(opaque);
         
-        let flags = if preserve_boot_pc { HCB_FLAG_PRESERVE_BOOT_PC } else { 0 };
-        hcb.set_flags(flags);
-        
         hcb.set_wake_reason(WakeReason::Start);
+        let flags = HCB_FLAG_START_PARAMS_READY
+            | if preserve_boot_pc { HCB_FLAG_PRESERVE_BOOT_PC } else { 0 };
+        // Publish READY last. Readers acquire this flag before consuming the
+        // two 64-bit start parameters.
+        hcb.set_flags(flags);
 
         // Wake the hart
         self.notify(hart_id);
@@ -143,6 +145,8 @@ impl HartRegistry for NativeHartRegistry {
             };
         }
 
+        // Clear the previous request before making the HCB reservable again.
+        hcb.set_flags(0);
         hcb.set_state(HartState::Stopped);
 
         // Wake the hart so it can see the stop request
@@ -161,7 +165,9 @@ impl HartRegistry for NativeHartRegistry {
 
         loop {
             let state = hcb.get_state();
-            if state == HartState::StartPending || state == HartState::Started {
+            if (state == HartState::StartPending || state == HartState::Started)
+                && hcb.start_params_ready()
+            {
                 // Start has been requested or we're already started
                 break;
             }
@@ -170,7 +176,10 @@ impl HartRegistry for NativeHartRegistry {
             let guard = sync.lock.lock().unwrap();
             
             // Re-check after acquiring lock to avoid race
-            if hcb.get_state() == HartState::StartPending || hcb.get_state() == HartState::Started {
+            let state = hcb.get_state();
+            if (state == HartState::StartPending || state == HartState::Started)
+                && hcb.start_params_ready()
+            {
                 break;
             }
 

@@ -7,6 +7,15 @@ pub mod jit;
 pub mod dram;
 pub mod dtb;
 pub mod engine;
+pub mod hdl;
+pub mod hdl_frame;
+pub mod hdl_pack;
+pub mod hdl_raster;
+pub mod hdl_soft;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod hdl_wgpu;
+#[cfg(all(not(target_arch = "wasm32"), feature = "gui"))]
+pub mod hdl_gui;
 pub mod mmu;
 pub mod sbi;
 pub use devices::{clint, plic, uart};

@@ -30,6 +30,7 @@ const WorkerStepResult = {
   Halted: 1,
   Shutdown: 2,
   Error: 3,
+  Wfi: 4,
 } as const;
 
 // ============================================================================
@@ -166,6 +167,14 @@ function runLoop() {
         self.postMessage({ type: "error", hartId, error: "Execution error" });
         cleanup();
         shouldContinue = false;
+        break;
+
+      case WorkerStepResult.Wfi:
+        try {
+          Atomics.wait(controlView, CTRL_HALT_REQUESTED, 0, 2);
+        } catch {
+          // ignore
+        }
         break;
     }
   }
