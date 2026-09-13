@@ -1,3 +1,13 @@
+## 0.7.8 (2026-09-13)
+
+### 🩹 Fixes
+
+- code Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([dc38787](https://github.com/trust0-project/bavy/commit/dc38787))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.7.7 (2026-09-13)
 
 ### 🩹 Fixes
