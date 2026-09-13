@@ -143,6 +143,12 @@ jobs:
         if: matrix.use_cross
         uses: goto-bus-stop/setup-zig@v2
 
+      # rustc 1.98+ passes --fix-cortex-a53-843419 on aarch64-linux. Zig's
+      # lld rejects it, which broke linux-arm64-gnu and linux-arm64-musl.
+      - name: Wrap Zig to drop Cortex-A53 errata linker flag
+        if: matrix.use_cross
+        run: bash scripts/install-zig-cortex-filter.sh
+
       - name: Install dependencies
         run: corepack enable && yarn install
         working-directory: riscv-vm
