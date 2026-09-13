@@ -1,3 +1,13 @@
+## 0.7.7 (2026-09-13)
+
+### 🩹 Fixes
+
+- optimizations Signed-off-by: Javier Ribó <elribonazo@gmail.com> ([376dc4b](https://github.com/trust0-project/bavy/commit/376dc4b))
+
+### ❤️ Thank You
+
+- Javier Ribó
+
 ## 0.7.6 (2026-09-12)
 
 ### 🩹 Fixes
